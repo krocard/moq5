@@ -1225,6 +1225,10 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         if (s->subs[jsub].state != MOQ_SUB_ESTABLISHED &&
             s->subs[jsub].state != MOQ_SUB_PENDING_SUBSCRIBER)
             return MOQ_ERR_WRONG_STATE;
+        /* A deferred terminal (done_pending) is logically Terminated; the
+         * Joining Location is usable only while Established (§5.1). */
+        if (s->subs[jsub].done_pending)
+            return MOQ_ERR_WRONG_STATE;
         if (s->subs[jsub].filter_type != MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT)
             return MOQ_ERR_INVAL;
         /* The joining start is derived from the subscription's *current* largest
@@ -1482,7 +1486,7 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
     bool stop_data = e->data_stream_started && !e->data_stream_fin;
-    if (action_queue_avail(s) < (size_t)(2 + (stop_data ? 1 : 0)))
+    if (action_queue_avail(s) < (size_t)(1 + (stop_data ? 1 : 0)))
         return MOQ_ERR_WOULD_BLOCK;
     if (e->request_stream_ref._v != 0 &&
         s->drain_ref_count >= s->drain_ref_cap)
@@ -1490,20 +1494,12 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
     moq_stream_ref_t ref = e->request_stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
-    a.u.stop_bidi_stream.stream_ref = ref;
-    a.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED */
+    a.u.abort_bidi_stream.stream_ref = ref;
+    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
     moq_result_t arc = push_action(s, &a);
-    if (arc < 0) return arc;
-    memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    a.borrow_epoch = s->borrow_epoch;
-    a.u.reset_bidi_stream.stream_ref = ref;
-    a.u.reset_bidi_stream.error_code = 0x1;
-    arc = push_action(s, &a);
     if (arc < 0) return arc;
     if (stop_data) {
         memset(&a, 0, sizeof(a));

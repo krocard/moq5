@@ -31,6 +31,21 @@ static bool session_idle_expired(const moq_session_t *s)
            s->last_now_us >= s->idle_deadline_us;
 }
 
+moq_result_t session_scan_dt_props(const moq_session_t *s,
+                                   const uint8_t *data, size_t len,
+                                   bool strict_local, moq_dt_scan_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!data || len == 0) return MOQ_OK;
+    moq_result_t rc = s->profile->scan_delivery_timeouts(data, len,
+                                                         strict_local, out);
+    if (rc < 0)
+        memset(out, 0, sizeof(*out));   /* contract: zeroed on failure (the
+                                         * d18 walk may have filled one type
+                                         * before hitting a later duplicate) */
+    return rc;
+}
+
 void session_begin_advance(moq_session_t *s, uint64_t now_us)
 {
     s->last_now_us = now_us;
@@ -58,10 +73,32 @@ void session_begin_advance(moq_session_t *s, uint64_t now_us)
         s->event_scratch_len = 0;
     }
 
-    /* Retry any deferred PUBLISH_FINISHED whose Stream Count is now satisfied but
-     * whose event could not be queued when its last data stream FIN'd. No-op
-     * unless a subscriber-role PUBLISH_DONE is currently being gated. */
+    /* Drive the deferred-terminal reaps (§9.8): count-satisfied GATED
+     * finalizes, deadline firing, and the EXPIRED scan/stop/rescan/finalize
+     * loop -- for both pools, never aborting the sweep on one blocked
+     * entry. No-op unless a terminal is currently being gated. */
     pub_reap_deferred_dones(s);
+    /* Same retry for a deferred SUBSCRIBE_DONE on an ordinary subscription. */
+    sub_reap_deferred_dones(s);
+    /* §9.8: recompute the ONE session-level expiry retry deadline only
+     * after the COMPLETE two-pool sweep -- armed iff ANY entry remains
+     * EXPIRED with blocked work (an unblocked expired entry finalizes in
+     * its pass), regardless of partial progress; one entry finalizing can
+     * never drop another's wake. */
+    if (s->state == MOQ_SESS_CLOSED) {
+        s->expiry_retry_deadline_us = UINT64_MAX;
+    } else {
+        bool blocked = false;
+        for (size_t i = 0; !blocked && i < s->sub_cap; i++)
+            if (s->subs[i].done_pending && s->subs[i].done_expired)
+                blocked = true;
+        for (size_t i = 0; !blocked && i < s->pub_cap; i++)
+            if (s->publishes[i].done_pending && s->publishes[i].done_expired)
+                blocked = true;
+        s->expiry_retry_deadline_us = blocked
+            ? deadline_add(s->last_now_us, MOQ_DONE_EXPIRY_RETRY_US)
+            : UINT64_MAX;
+    }
 }
 
 /* -- Action resource cleanup --------------------------------------- */
@@ -325,6 +362,16 @@ bool moq_session_uses_uni_control(const moq_session_t *s)
     return s->profile->uses_uni_control_channel;
 }
 
+uint64_t moq_session_event_progress_token(const moq_session_t *s)
+{
+    return s->event_progress_token;
+}
+
+bool moq_session_has_events(const moq_session_t *s)
+{
+    return s->event_head != s->event_tail;
+}
+
 moq_uni_class_t moq_session_classify_peer_uni(const moq_session_t *s,
                                               const uint8_t *data, size_t len)
 {
@@ -382,6 +429,18 @@ moq_result_t push_event(moq_session_t *s, const moq_event_t *e)
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     s->events[s->event_tail % s->event_cap] = *e;
     s->event_tail++;
+    /* Monotonic event-progress token: advances on every enqueue (here) AND every
+     * dequeue (moq_session_poll_events_ex). A caller that services the session on
+     * a pass separate from the one that drains events (the managed adapters'
+     * coalesced doorbell) compares it across a whole pump+service cycle to tell
+     * "progress was made" (the queue was refilled OR drained) from "nothing
+     * moved". Combined with has_events it drives a bounded re-pump that closes
+     * both the small-queue (service refilled) and large-queue (bounded pump left
+     * a residual) cases, without spinning a non-draining app. Never reset
+     * (queue-index resets do not touch it); unsigned wrap is fine — callers only
+     * compare for equality. Surfaced through the private adapter SPI, never the
+     * public API. */
+    s->event_progress_token++;
     return MOQ_OK;
 }
 
@@ -649,7 +708,10 @@ moq_result_t session_core_send_request_goaway(
     bool eligible;
     switch (family) {
     case MOQ_REQUEST_FAMILY_SUBSCRIBE:
-        eligible = s->subs[slot].state == MOQ_SUB_ESTABLISHED;
+        /* A deferred terminal (done_pending) is logically Terminated: no
+         * control (including a per-request GOAWAY) may follow it. */
+        eligible = s->subs[slot].state == MOQ_SUB_ESTABLISHED &&
+                   !s->subs[slot].done_pending;
         ref = s->subs[slot].request_stream_ref;
         sent = &s->subs[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_FETCH:
@@ -657,7 +719,8 @@ moq_result_t session_core_send_request_goaway(
         ref = s->fetches[slot].request_stream_ref;
         sent = &s->fetches[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_PUBLISH:
-        eligible = s->publishes[slot].state == MOQ_PUB_ESTABLISHED;
+        eligible = s->publishes[slot].state == MOQ_PUB_ESTABLISHED &&
+                   !s->publishes[slot].done_pending;
         ref = s->publishes[slot].request_stream_ref;
         sent = &s->publishes[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_ANNOUNCEMENT:
@@ -759,6 +822,7 @@ moq_result_t close_with_error(moq_session_t *s,
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
+    s->expiry_retry_deadline_us = UINT64_MAX;
     decref_queued_data_payloads(s);
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
@@ -1192,6 +1256,15 @@ void moq_event_cleanup(moq_event_t *event)
     }
 }
 
+/* §9.8 pinned append offset: done_wait_timeout_us begins at the first
+ * 8-byte-aligned slot after the pre-append tail. If this moves, the append
+ * broke ABI. */
+_Static_assert(offsetof(moq_session_cfg_t, done_wait_timeout_us) ==
+               ((offsetof(moq_session_cfg_t, max_track_history_records)
+                 + sizeof(uint32_t) + 7u) & ~(size_t)7u),
+               "done_wait_timeout_us must occupy the first aligned slot "
+               "after the pre-append tail");
+
 static size_t cfg_read_u32(const moq_session_cfg_t *cfg, size_t field_offset,
                             size_t field_size)
 {
@@ -1316,6 +1389,27 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         sizeof(cfg->max_track_subscriptions));
     if (!track_sub_cap)  track_sub_cap = MOQ_DEFAULT_MAX_TRACK_SUBS;
     if (track_sub_cap > 0xFFFF) return MOQ_ERR_INVAL;
+
+    /* Track-largest history registry: default covers one record per
+     * subscription + publish + track-status entry (each is a merge source
+     * and reserves a record at establishment). Separately allocated below.
+     * The default sum cannot overflow: each cap is already bounded <=0xFFFF.
+     * A caller-supplied cap is only bounded by the pool byte size fitting in
+     * size_t (checked here); an over-large but representable cap simply fails
+     * the allocation with MOQ_ERR_NOMEM below -- no arbitrary public ceiling. */
+    size_t th_cap = cfg_read_u32(cfg,
+        offsetof(moq_session_cfg_t, max_track_history_records),
+        sizeof(cfg->max_track_history_records));
+    /* §9.8: done_wait_timeout_us (appended; read only when covered). 0 =
+     * the finite library default -- old-size callers, an absent field, and
+     * an explicit zero all select it. */
+    uint64_t done_wait_us = 0;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, done_wait_timeout_us)
+                            + sizeof(cfg->done_wait_timeout_us))
+        done_wait_us = cfg->done_wait_timeout_us;
+    if (done_wait_us == 0) done_wait_us = MOQ_DONE_WAIT_DEFAULT_US;
+    if (!th_cap)      th_cap = sub_cap + pub_cap + ts_cap;
+    if (th_cap > SIZE_MAX / sizeof(moq_track_hist_t)) return MOQ_ERR_INVAL;
 
     moq_version_t version = MOQ_VERSION_DRAFT_16;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, version) +
@@ -1649,6 +1743,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
+    s->done_wait_timeout_us = done_wait_us;
+    s->expiry_retry_deadline_us = UINT64_MAX;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, goaway_timeout_us) +
         sizeof(cfg->goaway_timeout_us))
         s->goaway_timeout_us = cfg->goaway_timeout_us;
@@ -1700,6 +1796,21 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         }
     }
 
+    /* Track-largest history registry: separately allocated (kept out of the
+     * single session block so its cap never disturbs the block layout). */
+    s->th_cap = th_cap;
+    if (th_cap > 0) {
+        size_t th_bytes = th_cap * sizeof(moq_track_hist_t);
+        s->track_hist = (moq_track_hist_t *)s->alloc.alloc(th_bytes, s->alloc.ctx);
+        if (!s->track_hist) {
+            moq_token_cache_free(&s->peer_token_cache);
+            profile->destroy(s->profile_state);
+            s->alloc.free(s, total, s->alloc.ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(s->track_hist, 0, th_bytes);
+    }
+
     *out = s;
     return MOQ_OK;
 }
@@ -1713,11 +1824,33 @@ void moq_session_destroy(moq_session_t *s)
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
     free_staged_datagrams(s);
+    track_hist_destroy(s);
     moq_token_cache_free(&s->peer_token_cache);
     for (size_t i = 0; i < s->sub_cap; i++) {
         if (s->subs[i].track_id_buf)
             s->alloc.free(s->subs[i].track_id_buf, s->subs[i].track_id_len,
                           s->alloc.ctx);
+        /* A deferred done still owns its reason copy (freed in sub_free_entry
+         * on the normal path); release it on teardown. */
+        if (s->subs[i].done_reason_buf)
+            s->alloc.free(s->subs[i].done_reason_buf,
+                          s->subs[i].done_reason_len, s->alloc.ctx);
+    }
+    /* Same for a publication whose gated done never finalized (the normal
+     * path frees it in pub_free_entry). */
+    for (size_t i = 0; i < s->pub_cap; i++) {
+        if (s->publishes[i].done_reason_buf)
+            s->alloc.free(s->publishes[i].done_reason_buf,
+                          s->publishes[i].done_reason_len, s->alloc.ctx);
+    }
+    /* Track-status entries own a canonical track-name key that is
+     * freed in ts_free_entry on the normal path; free any still-live one here on
+     * session teardown (the reserved registry records are freed by
+     * track_hist_destroy above). */
+    for (size_t i = 0; i < s->ts_cap; i++) {
+        if (s->track_statuses[i].track_id_buf)
+            s->alloc.free(s->track_statuses[i].track_id_buf,
+                          s->track_statuses[i].track_id_len, s->alloc.ctx);
     }
     for (size_t i = 0; i < s->ann_cap; i++) {
         if (s->announcements[i].ns_id_buf)
@@ -1985,6 +2118,7 @@ moq_result_t moq_session_on_transport_close(moq_session_t *s,
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
+    s->expiry_retry_deadline_us = UINT64_MAX;
     decref_queued_data_payloads(s);
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
@@ -2233,6 +2367,13 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
         uint64_t epoch = s->borrow_epoch;
         memcpy(dst + offsetof(moq_event_t, borrow_epoch), &epoch, sizeof(epoch));
         s->event_head++;
+        /* Advance the progress token on event TRANSFER too (not only enqueue):
+         * a bounded poll that dequeues events frees queue capacity, which is the
+         * progress an adapter re-drive needs to see when the app drains a
+         * pre-existing backlog that service() did not itself refill (a large
+         * event queue never backpressures, so the enqueue signal alone misses
+         * it). See moq_transport_bridge_event_progress_token. */
+        s->event_progress_token++;
         dst += element_size;
         n++;
     }
@@ -2353,10 +2494,21 @@ static uint64_t reported_subgroup_deadline(const moq_session_t *s)
 
 uint64_t moq_session_next_deadline_us(const moq_session_t *s)
 {
-    if (!s) return UINT64_MAX;
+    if (!s || s->state == MOQ_SESS_CLOSED) return UINT64_MAX;
     uint64_t d = s->goaway_deadline_us;
     uint64_t sg = reported_subgroup_deadline(s);
     if (sg < d) d = sg;
     if (s->idle_deadline_us < d) d = s->idle_deadline_us;
+    /* §9.8: every armed, not-yet-fired terminal deadline; fired entries
+     * contribute only via the bounded retry deadline below. */
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].done_pending && !s->subs[i].done_expired &&
+            s->subs[i].done_deadline_us < d)
+            d = s->subs[i].done_deadline_us;
+    for (size_t i = 0; i < s->pub_cap; i++)
+        if (s->publishes[i].done_pending && !s->publishes[i].done_expired &&
+            s->publishes[i].done_deadline_us < d)
+            d = s->publishes[i].done_deadline_us;
+    if (s->expiry_retry_deadline_us < d) d = s->expiry_retry_deadline_us;
     return d;
 }

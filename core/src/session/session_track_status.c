@@ -31,6 +31,17 @@ void ts_free_entry(moq_session_t *s, int slot)
     /* Stream-correlated profiles also key the entry by its request bidi. */
     if (e->request_stream_ref._v != 0)
         request_registry_remove_by_streamref(s, e->request_stream_ref);
+    /* Release the reserved registry record and free the owned track-name key
+     * exactly once BEFORE the memset. */
+    if (e->hist) {
+        track_hist_release(s, e->hist);
+        e->hist = NULL;
+    }
+    if (e->track_id_buf) {
+        s->alloc.free(e->track_id_buf, e->track_id_len, s->alloc.ctx);
+        e->track_id_buf = NULL;
+        e->track_id_len = 0;
+    }
     uint32_t next_gen = e->generation + 1;
     /* Preserve the co-allocated request-bidi receive buffer across reuse. */
     uint8_t *recv_buf = e->req_recv_buf;
@@ -72,6 +83,11 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
     bool auth_committed = false;
     moq_result_t result = MOQ_OK;
     moq_result_t rc;
+    /* Reserved registry record + retained key, released/freed on any pre-commit
+     * failure via cleanup_all, or stored on the entry at commit. */
+    moq_track_hist_t *tshist = NULL;
+    uint8_t *tskey = NULL;
+    size_t   tskey_len = 0;
     size_t scratch_saved = s->event_scratch_len;
     /* A pre-commit terminal reject (auth / pool-full) on a stream-correlated
      * profile sends REQUEST_ERROR + FIN and frees the staging slot without
@@ -140,6 +156,43 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
         if (rc < 0) { result = rc; goto cleanup_all; }
         if (reject_drain)
             (void)drain_ref_add(s, d->endpoint.stream_ref);  /* slot reserved */
+        s->profile->commit_inbound_request(s, &d->endpoint);
+        auth_committed = true;
+        process_auth_tokens_commit_txn(s, &d->auth_txn);
+        result = MOQ_OK;
+        goto cleanup_all;
+    }
+
+    /* Reserve this track's registry record and retain its canonical key
+     *. A full registry is NOT a session-fatal parser error: reject
+     * with REQUEST_ERROR(INTERNAL_ERROR 0x0) via the same pre-commit pattern as
+     * the pool-full branch above -- nothing is committed until the error is
+     * queued, WOULD_BLOCK leaves it replayable, and the session stays open. */
+    tskey = moq_build_track_key(s, &d->track_namespace, d->track_name,
+                                &tskey_len);
+    if (!tskey && tskey_len > 0) { result = MOQ_ERR_NOMEM; goto cleanup_all; }
+    tshist = track_hist_reserve(s, tskey, tskey_len);
+    if (!tshist) {
+        if (reject_drain && s->drain_ref_count >= s->drain_ref_cap) {
+            result = MOQ_ERR_WOULD_BLOCK;
+            goto cleanup_all;
+        }
+        uint8_t herr_buf[128];
+        moq_buf_writer_t ew;
+        moq_buf_writer_init(&ew, herr_buf, sizeof(herr_buf));
+        rc = s->profile->encode_request_error(s, &ew,
+            &(moq_request_error_encode_args_t){
+                .request_id = d->endpoint.request_id, .error_code = 0x0,
+                .reason = (const uint8_t *)"track history full",
+                .reason_len = 18 });
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        rc = d->endpoint.has_stream_ref
+            ? queue_send_bidi(s, d->endpoint.stream_ref, herr_buf,
+                              moq_buf_writer_offset(&ew), true)
+            : queue_send_control(s, herr_buf, moq_buf_writer_offset(&ew));
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        if (reject_drain)
+            (void)drain_ref_add(s, d->endpoint.stream_ref);
         s->profile->commit_inbound_request(s, &d->endpoint);
         auth_committed = true;
         process_auth_tokens_commit_txn(s, &d->auth_txn);
@@ -243,6 +296,9 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
     entry->role = MOQ_TS_ROLE_PUBLISHER;
     entry->handle = handle;
     entry->request_id = d->endpoint.request_id;
+    entry->track_id_buf = tskey;
+    entry->track_id_len = tskey_len;
+    entry->hist = tshist;
     d->endpoint.kind = MOQ_REQ_TRACK_STATUS;
     d->endpoint.slot = slot;
     if (d->endpoint.has_stream_ref) {
@@ -264,6 +320,10 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
 cleanup_all:
     process_auth_tokens_free_staging(s, d->tokens, d->token_staged,
         d->token_count);
+    /* Release the reserved record + free the key on every failure path (both are
+     * only stored on the entry at the committed return above). */
+    if (tshist) track_hist_release(s, tshist);
+    if (tskey) s->alloc.free(tskey, tskey_len, s->alloc.ctx);
     if (!auth_committed)
         process_auth_tokens_abort_txn(s, &d->auth_txn);
     return result;
@@ -313,6 +373,11 @@ moq_result_t session_core_on_track_status_ok(moq_session_t *s,
         s->event_scratch_len = scratch_saved;
         return rc;
     }
+
+    /* Merge the peer-reported Largest Object into the registry. Observing a largest pins the record, so it persists
+     * past the ts_free_entry below (which only reclaims empty reservations). */
+    if (d->has_largest && e->hist)
+        track_hist_merge(e->hist, d->largest_group, d->largest_object);
 
     /* Stream-correlated profiles keep the request bidi drainable until its FIN
      * (the request-stream handler frees it); draft-16 frees now. */
@@ -435,6 +500,25 @@ moq_result_t moq_session_track_status(moq_session_t *s,
         return MOQ_ERR_WOULD_BLOCK;
     }
 
+    /* Reserve this track's registry record and retain its canonical key
+     *: the inbound TRACK_STATUS response merges its Largest Object
+     * into this record, so the response must be attributable to a track. A full
+     * registry fails the local request with NOMEM (released on the pre-commit
+     * failure paths below and in ts_free_entry). */
+    size_t tskey_len = 0;
+    uint8_t *tskey = moq_build_track_key(s, &cfg->track_namespace,
+                                         cfg->track_name, &tskey_len);
+    if (!tskey && tskey_len > 0) {
+        s->profile->abort_request(s, &req_ep);
+        return MOQ_ERR_NOMEM;
+    }
+    moq_track_hist_t *tshist = track_hist_reserve(s, tskey, tskey_len);
+    if (!tshist) {
+        if (tskey) s->alloc.free(tskey, tskey_len, s->alloc.ctx);
+        s->profile->abort_request(s, &req_ep);
+        return MOQ_ERR_NOMEM;
+    }
+
     moq_track_status_encode_args_t args = {
         .request_id = req_ep.request_id,
         .track_namespace = cfg->track_namespace,
@@ -451,6 +535,8 @@ moq_result_t moq_session_track_status(moq_session_t *s,
                          s->send_cap - s->send_len);
     rc = s->profile->encode_track_status(s, &w, &args);
     if (rc < 0) {
+        track_hist_release(s, tshist);
+        if (tskey) s->alloc.free(tskey, tskey_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return rc;
     }
@@ -479,6 +565,8 @@ moq_result_t moq_session_track_status(moq_session_t *s,
     }
     rc = push_action(s, &act);
     if (rc < 0) {
+        track_hist_release(s, tshist);
+        if (tskey) s->alloc.free(tskey, tskey_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return rc;
     }
@@ -490,6 +578,9 @@ moq_result_t moq_session_track_status(moq_session_t *s,
     e->state = MOQ_TS_PENDING_REQUESTER;
     e->role = MOQ_TS_ROLE_REQUESTER;
     e->request_id = req_ep.request_id;
+    e->track_id_buf = tskey;
+    e->track_id_len = tskey_len;
+    e->hist = tshist;
 
     uint64_t packed = moq_handle_pack(MOQ_HANDLE_POOL_TRACK_STATUS,
                                        s->session_tag, live_gen,

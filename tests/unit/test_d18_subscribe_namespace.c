@@ -272,17 +272,28 @@ static bool action_has_msg(moq_session_t *s, moq_stream_ref_t ref,
     return seen;
 }
 
-/* Count queued RESET/STOP actions on `ref`. */
+/* The profiles must no longer emit the legacy half-action kinds. */
+static int g_legacy_half_actions;
+
+/* Count queued teardown actions on `ref`: cancellation is ONE whole-stream
+ * abort (counted into BOTH out-params so existing expectations of "reset
+ * and stop happened" keep meaning "the request stream was torn down");
+ * the legacy half-action kinds must no longer be emitted at all. */
 static void count_teardown(moq_session_t *s, moq_stream_ref_t ref,
                            int *resets, int *stops)
 {
     *resets = 0; *stops = 0;
     moq_action_t act;
     while (moq_session_poll_actions(s, &act, 1) > 0) {
-        if (act.kind == MOQ_ACTION_RESET_BIDI_STREAM &&
-            act.u.reset_bidi_stream.stream_ref._v == ref._v) (*resets)++;
-        if (act.kind == MOQ_ACTION_STOP_BIDI_STREAM &&
-            act.u.stop_bidi_stream.stream_ref._v == ref._v) (*stops)++;
+        if (act.kind == MOQ_ACTION_ABORT_BIDI_STREAM &&
+            act.u.abort_bidi_stream.stream_ref._v == ref._v) {
+            (*resets)++;
+            (*stops)++;
+        }
+        /* the profiles emit no legacy half-actions anymore */
+        if (act.kind == MOQ_ACTION_RESET_BIDI_STREAM ||
+            act.kind == MOQ_ACTION_STOP_BIDI_STREAM)
+            g_legacy_half_actions++;
         moq_action_cleanup(&act);
     }
 }

@@ -100,6 +100,14 @@ add_executable(test_session_publish unit/test_session_publish.c)
 target_link_libraries(test_session_publish PRIVATE moq-core-test-internals)
 add_test(NAME session_publish COMMAND test_session_publish)
 
+add_executable(test_session_track_hist unit/test_session_track_hist.c)
+target_link_libraries(test_session_track_hist PRIVATE moq-core-test-internals)
+add_test(NAME session_track_hist COMMAND test_session_track_hist)
+
+# test_session_track_hist_lc / _publish_params / _stream_count are SimPair-based
+# (moq::sim) — they live in the sim-gated block below, alongside the other
+# SimPair tests, so a sim-disabled build (e.g. the shared-link lane) configures.
+
 add_executable(test_session_track_status unit/test_session_track_status.c)
 target_link_libraries(test_session_track_status PRIVATE moq-core-test-internals)
 add_test(NAME session_track_status COMMAND test_session_track_status)
@@ -184,6 +192,19 @@ if(TARGET moq::sim)
     add_executable(test_simpair unit/test_simpair.c)
     target_link_libraries(test_simpair PRIVATE moq::sim)
     add_test(NAME simpair COMMAND test_simpair)
+
+    # SimPair-based session tests (moq_simpair_* fixtures over paired sessions).
+    add_executable(test_session_track_hist_lc unit/test_session_track_hist_lc.c)
+    target_link_libraries(test_session_track_hist_lc PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_track_hist_lc COMMAND test_session_track_hist_lc)
+
+    add_executable(test_session_publish_params unit/test_session_publish_params.c)
+    target_link_libraries(test_session_publish_params PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_publish_params COMMAND test_session_publish_params)
+
+    add_executable(test_session_stream_count unit/test_session_stream_count.c)
+    target_link_libraries(test_session_stream_count PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_stream_count COMMAND test_session_stream_count)
 
     add_executable(test_scenario_lifecycle scenario/test_scenario_lifecycle.c)
     target_link_libraries(test_scenario_lifecycle PRIVATE moq::sim)

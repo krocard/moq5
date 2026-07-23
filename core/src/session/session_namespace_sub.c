@@ -646,30 +646,22 @@ moq_result_t moq_session_subscribe_namespace(
 /* Stream-correlated local teardown of a namespace-sub request bidi (§10.9.1): an
  * unexpected message (e.g. a REQUEST_UPDATE, which is not modelled here) on an
  * established/pending publisher-side bidi closes that bidi, not the session.
- * Cancel both directions with STOP + RESET, retire the ref via the drain ring so
+ * Cancel the request stream with ONE whole-stream abort, retire the ref via the drain ring so
  * a late in-flight message is discarded rather than mistaken for a fresh request,
  * and free the entry. Reserves all capacity before mutating (retryable). */
 static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot)
 {
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
     if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = s->ns_subs[slot].stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
-    a.u.stop_bidi_stream.stream_ref = ref;
-    a.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
+    a.u.abort_bidi_stream.stream_ref = ref;
+    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
     moq_result_t rc = push_action(s, &a);
-    if (rc < 0) return rc;
-    memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    a.borrow_epoch = s->borrow_epoch;
-    a.u.reset_bidi_stream.stream_ref = ref;
-    a.u.reset_bidi_stream.error_code = 0x1;
-    rc = push_action(s, &a);
     if (rc < 0) return rc;
     if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
     ns_sub_free_entry(s, slot);

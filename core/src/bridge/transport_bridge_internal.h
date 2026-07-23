@@ -85,6 +85,11 @@ typedef struct {
     uint64_t               pending_reset_code;
     bool                   pending_stop;
     uint64_t               pending_stop_code;
+    /* Whole-stream ABORT discard lifecycle: the entry is kept (its ref
+     * mapping preserved so late peer bytes are DISCARDED, never given a
+     * fresh ref), and retired on the peer's FIN / RESET / stream
+     * terminal. Set by dispatch_abort_bidi. */
+    bool                   aborting;
     /* Inbound peer-uni classification (uni-control-pair mode only). */
     uint8_t                uni_disp;        /* bridge_uni_disp_t */
     uint8_t                classify_len;    /* retained leading bytes (< 9) */
@@ -105,6 +110,9 @@ typedef enum {
     PENDING_CLOSE_BIDI_FIN,
     PENDING_RESET_STREAM,
     PENDING_STOP_SENDING,
+    PENDING_ABORT_STREAM,   /* whole-stream abort not yet applied (or,
+                               in the sequential fallback, its RESET
+                               half not yet accepted) */
     PENDING_CLOSE_TRANSPORT,
 } bridge_pending_kind_t;
 
@@ -181,6 +189,9 @@ bridge_stream_entry_t *bridge_find_by_id(
     moq_transport_bridge_t *b, uint64_t transport_id);
 
 void bridge_deactivate_stream(bridge_stream_entry_t *e);
+/* Retire an aborting entry on any terminal peer signal (FIN/reset/
+ * stream terminal). No-op if the entry is absent or not aborting. */
+void bridge_retire_aborting(moq_transport_bridge_t *b, uint64_t transport_id);
 
 moq_stream_ref_t bridge_assign_inbound_ref(
     moq_transport_bridge_t *b, uint64_t transport_id,

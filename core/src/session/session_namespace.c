@@ -79,30 +79,22 @@ static moq_result_t ann_queue_resp(moq_session_t *s, size_t slot,
 }
 
 /* Stream-correlated local teardown of an announce request bidi (§3.3.2): cancel
- * both still-open directions with STOP + RESET, retire the ref via the drain ring
+ * the request stream with ONE whole-stream abort, retire the ref via the drain ring
  * (so a late in-flight response is discarded rather than mistaken for a fresh
  * request), and free the entry. Reserves all capacity before mutating. */
 static moq_result_t ann_local_teardown(moq_session_t *s, size_t slot)
 {
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
     if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = s->announcements[slot].request_stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
-    a.u.stop_bidi_stream.stream_ref = ref;
-    a.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
+    a.u.abort_bidi_stream.stream_ref = ref;
+    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
     moq_result_t rc = push_action(s, &a);
-    if (rc < 0) return rc;
-    memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    a.borrow_epoch = s->borrow_epoch;
-    a.u.reset_bidi_stream.stream_ref = ref;
-    a.u.reset_bidi_stream.error_code = 0x1;
-    rc = push_action(s, &a);
     if (rc < 0) return rc;
     if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
     ann_free_entry(s, slot);

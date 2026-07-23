@@ -591,8 +591,12 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
 
     case picohttp_callback_reset: {
         if (!stream_ctx) break;
-        uint64_t error_code = picoquic_get_remote_stream_error(
-            cnx, sid);
+        /* Inbound RESET_STREAM code is in the WebTransport application-error
+         * space; map it back to the MoQ code before the bridge/session see
+         * it (symmetric with ep_reset's outbound mapping). A legacy peer's
+         * raw code passes through unchanged. */
+        uint64_t error_code = pico_wt_wt_err_to_moq(
+            picoquic_get_remote_stream_error(cnx, sid));
         if (sid == c->moq_control_stream_id) {
             moq_transport_bridge_on_transport_error(
                 c->bridge, error_code ? error_code : 0x1, now);

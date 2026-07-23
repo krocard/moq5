@@ -195,6 +195,13 @@ void bridge_deactivate_stream(bridge_stream_entry_t *e)
     memset(e, 0, sizeof(*e));
 }
 
+void bridge_retire_aborting(moq_transport_bridge_t *b, uint64_t transport_id)
+{
+    bridge_stream_entry_t *e = bridge_find_by_id(b, transport_id);
+    if (e && e->aborting)
+        bridge_deactivate_stream(e);
+}
+
 moq_stream_ref_t bridge_assign_inbound_ref(
     moq_transport_bridge_t *b, uint64_t transport_id,
     bridge_stream_kind_t kind)
@@ -452,6 +459,19 @@ bool moq_transport_bridge_stream_has_pending(
             return bridge_stream_has_inbound_pending(&b->streams[i]);
     }
     return false;
+}
+
+uint64_t moq_transport_bridge_event_progress_token(
+    const moq_transport_bridge_t *b)
+{
+    if (!b || !b->session) return 0;
+    return moq_session_event_progress_token(b->session);
+}
+
+bool moq_transport_bridge_has_events(const moq_transport_bridge_t *b)
+{
+    if (!b || !b->session) return false;
+    return moq_session_has_events(b->session);
 }
 
 size_t moq_transport_bridge_stream_count(const moq_transport_bridge_t *b)
@@ -889,6 +909,116 @@ static moq_result_t dispatch_stop_data(moq_transport_bridge_t *b,
     return MOQ_OK;
 }
 
+/*
+ * Whole-request teardown: ONE transaction aborting both halves with one
+ * code. Deactivates/tombstones the stream exactly once, then either the
+ * endpoint's native abort_stream, or the sequential reset+stop fallback
+ * with EXPLICIT pending state: a WOULD_BLOCK before the RESET was
+ * accepted retries the whole abort; a WOULD_BLOCK after it retries only
+ * the remaining STOP half. A runtime failure after partial application
+ * is fatal — never rolled back.
+ */
+static moq_result_t bridge_abort_apply(moq_transport_bridge_t *b,
+                                       uint64_t sid, uint64_t error_code,
+                                       bool reset_done);
+
+static moq_result_t dispatch_abort_bidi(moq_transport_bridge_t *b,
+                                        moq_action_t *act)
+{
+    moq_stream_ref_t ref = act->u.abort_bidi_stream.stream_ref;
+    uint64_t error_code = act->u.abort_bidi_stream.error_code;
+    moq_action_cleanup(act);
+
+    bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
+    if (!e) return MOQ_OK;
+
+    uint64_t sid = e->transport_id;
+    /*
+     * KEEP the entry, marked aborting: its ref mapping stays live so late
+     * peer bytes are discarded (not handed a fresh inbound ref), and it
+     * is retired on the peer's FIN / RESET / stream terminal. Clear any
+     * inbound pending state — we are tearing the stream down. */
+    e->aborting = true;
+    e->pending_retry = false;
+    e->pending_fin = false;
+    e->pending_reset = false;
+    e->pending_stop = false;
+    return bridge_abort_apply(b, sid, error_code, false);
+}
+
+static moq_result_t bridge_abort_apply(moq_transport_bridge_t *b,
+                                       uint64_t sid, uint64_t error_code,
+                                       bool reset_done)
+{
+    if (HAS_FIELD(b->ops, abort_stream) && b->ops->abort_stream != NULL &&
+        !reset_done) {
+        moq_transport_result_t r = sanitize_stream_result(
+            b->ops->abort_stream(b->endpoint_ctx, sid, error_code));
+        if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
+            bridge_pending_item_t p;
+            memset(&p, 0, sizeof(p));
+            p.kind = PENDING_ABORT_STREAM;
+            p.stream_id = sid;
+            p.error_code = error_code;
+            if (!bridge_enqueue_pending(b, &p)) {
+                bridge_set_fatal(b, 0x1);
+                return MOQ_ERR_INTERNAL;
+            }
+            return MOQ_OK;
+        }
+        if (r == MOQ_TRANSPORT_ERROR) {
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+        return MOQ_OK;
+    }
+
+    /* sequential fallback */
+    if (!reset_done) {
+        moq_transport_result_t r = sanitize_stream_result(
+            b->ops->reset_stream(b->endpoint_ctx, sid, error_code));
+        if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
+            bridge_pending_item_t p;
+            memset(&p, 0, sizeof(p));
+            p.kind = PENDING_ABORT_STREAM; /* nothing applied yet */
+            p.stream_id = sid;
+            p.error_code = error_code;
+            if (!bridge_enqueue_pending(b, &p)) {
+                bridge_set_fatal(b, 0x1);
+                return MOQ_ERR_INTERNAL;
+            }
+            return MOQ_OK;
+        }
+        if (r == MOQ_TRANSPORT_ERROR) {
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+    }
+    {
+        moq_transport_result_t r = sanitize_stream_result(
+            b->ops->stop_sending(b->endpoint_ctx, sid, error_code));
+        if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
+            /* the RESET half was accepted: retry ONLY the STOP half */
+            bridge_pending_item_t p;
+            memset(&p, 0, sizeof(p));
+            p.kind = PENDING_STOP_SENDING;
+            p.stream_id = sid;
+            p.error_code = error_code;
+            if (!bridge_enqueue_pending(b, &p)) {
+                bridge_set_fatal(b, 0x1);
+                return MOQ_ERR_INTERNAL;
+            }
+            return MOQ_OK;
+        }
+        if (r == MOQ_TRANSPORT_ERROR) {
+            /* partial application (RESET landed, STOP failed): fatal */
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+    }
+    return MOQ_OK;
+}
+
 /* -- Bidi stream dispatch ------------------------------------------- */
 
 static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
@@ -1309,6 +1439,9 @@ static moq_result_t bridge_process_action(moq_transport_bridge_t *b,
     case MOQ_ACTION_STOP_BIDI_STREAM:
         return dispatch_stop_data(b, act);
 
+    case MOQ_ACTION_ABORT_BIDI_STREAM:
+        return dispatch_abort_bidi(b, act);
+
     case MOQ_ACTION_OPEN_BIDI_STREAM:
         return dispatch_open_bidi(b, act);
 
@@ -1482,6 +1615,48 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
             if (r == MOQ_TRANSPORT_WOULD_BLOCK) goto stop;
             if (r == MOQ_TRANSPORT_ERROR) {
                 bridge_set_fatal(b, 0x1);
+                rc = MOQ_ERR_INTERNAL;
+                goto cleanup;
+            }
+            bridge_cleanup_pending_item(&b->alloc, p);
+            break;
+        }
+
+        case PENDING_ABORT_STREAM: {
+            /* whole abort not yet applied (native op, or fallback whose
+             * RESET half has not been accepted) */
+            if (HAS_FIELD(b->ops, abort_stream) &&
+                b->ops->abort_stream != NULL) {
+                moq_transport_result_t r = sanitize_stream_result(
+                    b->ops->abort_stream(b->endpoint_ctx, p->stream_id,
+                                         p->error_code));
+                if (r == MOQ_TRANSPORT_WOULD_BLOCK) goto stop;
+                if (r == MOQ_TRANSPORT_ERROR) {
+                    bridge_set_fatal(b, 0x1);
+                    rc = MOQ_ERR_INTERNAL;
+                    goto cleanup;
+                }
+                bridge_cleanup_pending_item(&b->alloc, p);
+                break;
+            }
+            moq_transport_result_t r = sanitize_stream_result(
+                b->ops->reset_stream(b->endpoint_ctx, p->stream_id,
+                                     p->error_code));
+            if (r == MOQ_TRANSPORT_WOULD_BLOCK) goto stop;
+            if (r == MOQ_TRANSPORT_ERROR) {
+                bridge_set_fatal(b, 0x1);
+                rc = MOQ_ERR_INTERNAL;
+                goto cleanup;
+            }
+            /* RESET accepted: only the STOP half remains. Morph the
+             * item so a later WOULD_BLOCK never re-sends the RESET. */
+            p->kind = PENDING_STOP_SENDING;
+            r = sanitize_stream_result(
+                b->ops->stop_sending(b->endpoint_ctx, p->stream_id,
+                                     p->error_code));
+            if (r == MOQ_TRANSPORT_WOULD_BLOCK) goto stop;
+            if (r == MOQ_TRANSPORT_ERROR) {
+                bridge_set_fatal(b, 0x1); /* partial: fatal, no rollback */
                 rc = MOQ_ERR_INTERNAL;
                 goto cleanup;
             }
@@ -2354,6 +2529,15 @@ moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
 
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
 
+    if (e && e->aborting) {
+        /* Discarding after a whole-stream abort: absorb late bytes
+         * silently, retire on the peer's FIN — never a fresh ref, never
+         * fatal. */
+        if (fin)
+            bridge_deactivate_stream(e);
+        return MOQ_OK;
+    }
+
     if (e && e->pending_retry) {
         if (len > 0) {
             bridge_set_fatal(b, 0x3);
@@ -2414,6 +2598,8 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
     if (!e) return MOQ_OK;
 
+    if (e->aborting) { bridge_deactivate_stream(e); return MOQ_OK; }
+
     /* Uni-control-pair mode: the control channel lives for the session, so
      * a peer RESET of its unidirectional control stream terminates the
      * session -- it must not be swallowed as an unknown data-stream reset.
@@ -2449,6 +2635,17 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     return MOQ_OK;
 }
 
+moq_result_t moq_transport_bridge_on_peer_stream_terminal(
+    moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us)
+{
+    (void)now_us;
+    if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
+    /* Retire a stream we are discarding after a whole-stream abort. Any
+     * other stream: harmless no-op (its own lifecycle already fired). */
+    bridge_retire_aborting(b, stream_id);
+    return MOQ_OK;
+}
+
 moq_result_t moq_transport_bridge_on_peer_stop_sending(
     moq_transport_bridge_t *b, uint64_t stream_id,
     uint64_t error_code, uint64_t now_us)
@@ -2457,6 +2654,13 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
 
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
     if (!e) return MOQ_OK;
+
+    if (e->aborting) {
+        /* STOP_SENDING only asks us to stop our SEND half; the peer may
+         * keep sending on their half. Do NOT retire — keep discarding
+         * (mapping retained) until FIN / RESET / full-stream terminal. */
+        return MOQ_OK;
+    }
 
     /* Uni-control-pair mode: the local-origin control stream carries our control
      * output for the session's lifetime, so a peer STOP_SENDING of it refuses

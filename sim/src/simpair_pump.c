@@ -501,15 +501,27 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                 }
             }
             else if (actions[i].kind == MOQ_ACTION_RESET_BIDI_STREAM ||
-                     actions[i].kind == MOQ_ACTION_STOP_BIDI_STREAM) {
+                     actions[i].kind == MOQ_ACTION_STOP_BIDI_STREAM ||
+                     actions[i].kind == MOQ_ACTION_ABORT_BIDI_STREAM) {
+                /* ABORT is the whole-stream teardown: it reaches the
+                 * peer as BOTH signals. The sim delivers its RESET half
+                 * here and queues the STOP by falling through with
+                 * abort handled as reset + an extra stop below. */
+                bool is_abort =
+                    actions[i].kind == MOQ_ACTION_ABORT_BIDI_STREAM;
                 bool is_reset =
-                    actions[i].kind == MOQ_ACTION_RESET_BIDI_STREAM;
-                uint64_t tref = is_reset
-                    ? actions[i].u.reset_bidi_stream.stream_ref._v
-                    : actions[i].u.stop_bidi_stream.stream_ref._v;
-                uint64_t terr = is_reset
-                    ? actions[i].u.reset_bidi_stream.error_code
-                    : actions[i].u.stop_bidi_stream.error_code;
+                    actions[i].kind == MOQ_ACTION_RESET_BIDI_STREAM ||
+                    is_abort;
+                uint64_t tref = is_abort
+                    ? actions[i].u.abort_bidi_stream.stream_ref._v
+                    : (is_reset
+                           ? actions[i].u.reset_bidi_stream.stream_ref._v
+                           : actions[i].u.stop_bidi_stream.stream_ref._v);
+                uint64_t terr = is_abort
+                    ? actions[i].u.abort_bidi_stream.error_code
+                    : (is_reset
+                           ? actions[i].u.reset_bidi_stream.error_code
+                           : actions[i].u.stop_bidi_stream.error_code);
 
                 /* Resolve which end emitted the teardown, then deliver it to
                  * the peer. RESET_STREAM appears to the peer as a reset of our
@@ -546,6 +558,11 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                         : deliver_or_delay_bidi_stop(
                               sp, peer_session, peer_ref, terr,
                               bslot, from, peer_persp);
+                    if (rc >= 0 && is_abort)
+                        /* the whole abort's second half: STOP_SENDING */
+                        rc = deliver_or_delay_bidi_stop(
+                            sp, peer_session, peer_ref, terr, bslot,
+                            from, peer_persp);
                     if (rc < 0) {
                         moq_action_cleanup(&actions[i]);
                         for (size_t j = i + 1; j < n; j++)

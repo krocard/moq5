@@ -738,6 +738,31 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # draft-18 announce -> accept -> withdraw (publish_namespace_done) over
+        # real WT. The withdrawal aborts the request bidi; the peer must still
+        # see NAMESPACE_DONE, neither side goes fatal, and the subscription's
+        # object still arrives. Genuinely-negotiated peers (RESET_STREAM_AT).
+        add_test(NAME pico_wt_managed_announce_done_18
+            COMMAND test_pico_wt_managed_loopback --mode announce_done_18
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_announce_done_18 PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Same withdrawal against a relay that omits the reset_stream_at
+        # transport parameter (imquic/moqx). The client synthesizes the TP to
+        # unblock CONNECT, so the abort must downgrade to a plain RESET_STREAM;
+        # a RESET_STREAM_AT would be rejected by this no-rsa picoquic server and
+        # tear the WT session down. Seeing NAMESPACE_DONE proves the downgrade.
+        add_test(NAME pico_wt_managed_announce_done_no_rsa
+            COMMAND test_pico_wt_managed_loopback --mode announce_done_no_rsa
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_announce_done_no_rsa PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
         # Plain subscribe + object at draft-18 through the managed pair over
         # real UDP — the d18 request bidi data plane (the sim covers the
         # deterministic ordering; this covers the real-network arrival race).
@@ -842,5 +867,22 @@ endif()\n")
         set_tests_properties(pico_wt_managed_edges PROPERTIES
             TIMEOUT 60
             LABELS "network;pico_wt;managed")
+
+        # cfg init contract + whole-block field test: the pointer init stamps the
+        # full current struct (a current-header caller can set app_deadline); the
+        # sized init honors an explicit (possibly partial) size. Built normally;
+        # the canonical ASan configuration instruments it too.
+        add_executable(test_pico_wt_managed_cfg_abi
+            tests/test_pico_wt_managed_cfg_abi.c)
+        target_link_libraries(test_pico_wt_managed_cfg_abi
+            PRIVATE moq::adapter-pico-wt-managed moq::adapter-picoquic)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_cfg_abi PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_cfg_abi
+            COMMAND test_pico_wt_managed_cfg_abi)
+        set_tests_properties(pico_wt_managed_cfg_abi PROPERTIES TIMEOUT 30)
     endif()
 endif()
