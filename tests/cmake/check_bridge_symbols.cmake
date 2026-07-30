@@ -66,6 +66,7 @@ set(BASE_SYMBOLS
     moq_transport_bridge_stream_has_pending
     moq_transport_bridge_event_progress_token
     moq_transport_bridge_has_events
+    moq_transport_bridge_terminal_facts
     moq_transport_bridge_stream_count
     moq_transport_bridge_tombstone_count
     moq_transport_bridge_find_ref

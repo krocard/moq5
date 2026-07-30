@@ -337,6 +337,50 @@ typedef enum moq_fetch_role {
     MOQ_FETCH_ROLE_PUBLISHER = 2,
 } moq_fetch_role_t;
 
+/*
+ * Advancing-call state machine.
+ *
+ * Stage order is fixed, so a suspended call resumes exactly where it stopped
+ * and in the order it would have run uninterrupted:
+ *
+ *     REAP_SUBGROUPS -> PUB -> SUB -> DONE
+ *
+ * IDLE is the cleared state, not a stage: nothing runs in it and it is never
+ * entered mid-sweep.
+ *
+ * The advance preamble is NOT part of this machine. Borrow-epoch invalidation
+ * and send/scratch reclamation belong to the physical call
+ * (session_call_prepare), because a continuation is a real advancing call and
+ * owes both; logical time is stamped when a FRESH sweep is armed, so an
+ * inherited sweep retires against the epoch it was suspended at rather than the
+ * clock of the call that happened to finish it.
+ *
+ * REAP_SUBGROUPS charges one unit per ELIGIBLE reap (empty slots are free) and
+ * recomputes the subgroup deadline only after the complete scan -- the same
+ * complete-scan discipline expiry_retry_deadline_us follows once both owner
+ * pools retire at DONE.
+ */
+typedef enum moq_sweep_stage {
+    MOQ_SWEEP_STAGE_IDLE          = 0,  /* no sweep in flight */
+    MOQ_SWEEP_STAGE_REAP_SUBGROUPS = 1,
+    MOQ_SWEEP_STAGE_PUB            = 2,
+    MOQ_SWEEP_STAGE_SUB            = 3,
+    MOQ_SWEEP_STAGE_DONE           = 4,
+} moq_sweep_stage_t;
+
+/*
+ * Per-owner phase within a pool.
+ *
+ * Legal transitions:  SELECT -> STOP_STREAMS -> FINALIZE -> SELECT (next owner).
+ * An owner that needs no stream stop goes SELECT -> FINALIZE directly. Any
+ * phase may abort to SELECT of the next owner when the owner is skipped.
+ */
+typedef enum moq_sweep_phase {
+    MOQ_SWEEP_PHASE_SELECT       = 0,  /* choose/qualify the owner at sweep_slot */
+    MOQ_SWEEP_PHASE_STOP_STREAMS = 1,  /* draining its bound streams (sweep_rx_pos) */
+    MOQ_SWEEP_PHASE_FINALIZE     = 2,  /* emit completion and free the entry */
+} moq_sweep_phase_t;
+
 typedef struct moq_fetch_prior_object {
     bool     has_prev;        /* prior Location (group/object) is known */
     /* draft-18: after an End-of-Range marker the prior Location comes from the
@@ -593,6 +637,57 @@ uint8_t *moq_build_track_key(moq_session_t *s,
 /* Find the record for a canonical key, or NULL. */
 moq_track_hist_t *track_hist_find(moq_session_t *s,
                                   const uint8_t *key, size_t key_len);
+
+/*
+ * Allocation-free canonical-identity comparison. Compares a decoded
+ * (namespace parts, track name) identity DIRECTLY against a stored
+ * canonical key blob in its existing layout
+ *   [count u8][u16-be part len, bytes]... [u16-be name len, name bytes]
+ * with checked arithmetic and full bounds validation, so a truncated or
+ * malformed stored key can never match and can never read past its end.
+ * No allocation, no normalization, no second key encoding. Returns true
+ * only for a byte-exact identity match.
+ */
+bool moq_track_key_matches(const uint8_t *key, size_t key_len,
+                           const moq_namespace_t *ns, moq_bytes_t name);
+
+/* Find the record for a decoded identity without building a key. */
+moq_track_hist_t *track_hist_find_id(moq_session_t *s,
+                                     const moq_namespace_t *ns,
+                                     moq_bytes_t name);
+
+/*
+ * Allocation-free selection of what a reservation for this identity WILL
+ * do, evaluated before any funded execution. Distinguishes the three
+ * outcomes track_hist_reserve() collapses into a single NULL:
+ *   EXISTING  a record for this identity is present (take its ref)
+ *   FREE_SLOT the registry has room (allocate + reserve when funded)
+ *   FULL      no pool, or no free slot -- the funded REQUEST_ERROR path
+ * An allocation failure during execution is NOT a selection outcome: it
+ * is reported by track_hist_reserve_selected() as MOQ_ERR_NOMEM.
+ */
+typedef enum moq_track_hist_sel {
+    MOQ_TH_SEL_EXISTING = 0,
+    MOQ_TH_SEL_FREE_SLOT,
+    MOQ_TH_SEL_FULL,
+} moq_track_hist_sel_t;
+
+moq_track_hist_sel_t moq_track_hist_select(moq_session_t *s,
+                                           const moq_namespace_t *ns,
+                                           moq_bytes_t name);
+
+/*
+ * Funded execution of a selection. Returns MOQ_OK with *out set (an
+ * existing record's ref taken, or a new record created and reserved),
+ * or MOQ_ERR_NOMEM with *out NULL and NOTHING mutated when the record's
+ * key copy cannot be allocated. Must not be called for MOQ_TH_SEL_FULL
+ * -- that outcome has its own funded REQUEST_ERROR path. Registry-full
+ * and allocation failure are therefore never conflated.
+ */
+moq_result_t track_hist_reserve_selected(moq_session_t *s,
+                                         const moq_namespace_t *ns,
+                                         moq_bytes_t name,
+                                         moq_track_hist_t **out);
 
 /*
  * Reserve (refcount++) the record for a track, creating an empty one if
@@ -1212,6 +1307,23 @@ struct moq_session {
      * service refilled the queue). See moq_transport_bridge_event_progress_token. */
     uint64_t      event_progress_token;
 
+    /* Independent monotonic terminal facts. They are recorded separately, not
+     * as one ordinal state, because their order is not fixed: a local close
+     * enqueues MOQ_EVENT_SESSION_CLOSED before any transport shutdown, while a
+     * peer-initiated close can complete natively first. Neither becomes false,
+     * and re-notifying either is a no-op.
+     *
+     *   terminal_enqueued  set only when SESSION_CLOSED was actually placed in
+     *                      the event queue (push_event returned MOQ_OK).
+     *   terminal_observed  set only when poll_events_ex transferred that event
+     *                      to a caller -- observation, not mere availability.
+     *
+     * terminal_observed implies terminal_enqueued. Read through the private
+     * lockstep SPI (session_transport.h -> transport bridge -> adapter); never
+     * public API. */
+    bool          terminal_enqueued;
+    bool          terminal_observed;
+
     /* A deferred early-arrival request bidi (§3.3, buffered before setup
      * completed) hit WOULD_BLOCK during its establishment-time refeed (e.g.
      * SETUP_COMPLETE filled a tiny event queue). No bridge retry exists for
@@ -1333,6 +1445,44 @@ struct moq_session {
      * reap sweep, UINT64_MAX when no expired entry has blocked work. */
     uint64_t            done_wait_timeout_us;
     uint64_t            expiry_retry_deadline_us;
+
+    /*
+     * Budgeted deferred-completion sweep.
+     *
+     * The deferred done sweeps scan both pools and,
+     * per owner, can drive session_stop_bound_streams_resumable() -- itself a restart
+     * scan over rx_cap. Under a budget the sweep must suspend and resume, so
+     * the checkpoint is NESTED: pool -> owner slot -> rx scan position ->
+     * finalize phase.
+     *
+     * sweep_now_us is the time the suspended sweep STARTED, and last_now_us is
+     * stamped when a sweep is ARMED rather than per call, so a resumed sweep
+     * retires against its own epoch and no slot -- nor any deadline derived
+     * when it retires -- is evaluated against two clocks. The call that
+     * finishes it then runs ONE fresh sweep at its own now_us regardless of
+     * whether the clock advanced. expiry_retry_deadline_us is recomputed only
+     * once a complete two-pool sweep retires -- never mid-suspension.
+     *
+     * The cursor is session-owned. Bridge service establishes the budgeted
+     * context; ordinary session APIs run unlimited and complete any active
+     * cursor (then catch up) before their own operation. Close/destroy
+     * discards it.
+     */
+    bool                sweep_active;      /* a cursor is mid-sweep */
+    moq_sweep_stage_t    sweep_stage;      /* current stage */
+    size_t              sweep_slot;        /* owner index within that pool */
+    size_t              sweep_rx_pos;      /* rx scan position for this owner */
+    moq_sweep_phase_t   sweep_phase;
+    uint64_t            sweep_now_us;      /* epoch the sweep began at */
+    bool                sweep_reaped_subgroup;  /* a reap occurred this scan */
+    bool                sweep_rx_found;         /* a STOP fired this rx scan */
+
+    /* Budget context, active only inside
+     * moq_transport_bridge_service_budgeted(). The unlimited
+     * moq_transport_bridge_service() enters none, so the advancing entry points
+     * it reaches cannot suspend. */
+    bool                budget_active;
+    uint32_t            budget_remaining;
 
     moq_index_entry_t *idx_req_by_rid;
     size_t              idx_req_mask;
@@ -1479,6 +1629,14 @@ static inline bool session_refuses_new_requests(const moq_session_t *s) {
 
 void session_begin_advance(moq_session_t *s, uint64_t now_us);
 
+/* Advancing-call preamble for the service-reachable entry points. Returns
+ * MOQ_SESSION_SUSPENDED only inside a budget context; the caller must then
+ * return it without refreshing idle or running its own transition. */
+moq_result_t session_advance_entry(moq_session_t *s, uint64_t now_us);
+/* Discard any in-flight completion-sweep cursor (close/destroy). */
+void session_sweep_discard(moq_session_t *s);
+void session_sweep_owner_reset(moq_session_t *s);
+
 void decref_queued_data_payloads(moq_session_t *s);
 void decref_queued_event_payloads(moq_session_t *s);
 void free_rx_stream_bufs(moq_session_t *s);
@@ -1508,6 +1666,35 @@ bool event_scratch_fits_aligned(const moq_session_t *s, size_t count,
                                 size_t elem_size, size_t tail_bytes,
                                 size_t align);
 uint8_t *event_scratch_copy(moq_session_t *s, const uint8_t *data, size_t len);
+/* Transactional namespace copy into event scratch: a zero-part namespace
+ * succeeds as {NULL, 0} with the cursor byte-for-byte unchanged; any failure
+ * restores the cursor exactly and leaves *dst unwritten. Shared by the
+ * aligned-parts-plus-tails producers (subscribe, publish, fetch,
+ * publish-namespace, track-status, subscribe-tracks request + publish-blocked);
+ * specialized suffix/redirect copiers keep their own shapes. */
+bool event_scratch_copy_namespace(moq_session_t *s,
+                                  const moq_namespace_t *src,
+                                  moq_namespace_t *dst);
+/* Verdict for an event's complete event-scratch requirement. */
+typedef enum {
+    MOQ_EVENT_SCRATCH_FITS = 0,   /* copy now                                */
+    MOQ_EVENT_SCRATCH_BLOCKED,    /* fits an empty arena, not the live tail  */
+    MOQ_EVENT_SCRATCH_PERMANENT,  /* cannot fit even an empty arena          */
+} moq_event_scratch_verdict_t;
+/* Classify a single contiguous byte tail. A zero length needs nothing; a
+ * length beyond the whole arena can never be satisfied; anything that fits an
+ * empty arena but not the space left after the live cursor is retryable once
+ * the event queue drains. Pure. */
+moq_event_scratch_verdict_t event_scratch_classify_bytes(
+    const moq_session_t *s, size_t len);
+/* Classify the complete requirement -- token-value tails in order, then the
+ * alignment padding and the aligned token array -- against both an empty arena
+ * and the current cursor, without mutating scratch. BLOCKED is retryable once
+ * the event queue drains and the arena recycles; PERMANENT never becomes
+ * satisfiable, so its caller closes the session. */
+moq_event_scratch_verdict_t setup_event_scratch_classify(
+    const moq_session_t *s, const moq_resolved_token_t *toks,
+    size_t token_count);
 uint8_t *scratch_copy(moq_session_t *s, const uint8_t *data, size_t len);
 
 moq_result_t queue_send_control(moq_session_t *s,
@@ -1563,9 +1750,19 @@ typedef struct moq_decoded_redirect {
 } moq_decoded_redirect_t;
 
 /* Surface MOQ_EVENT_REQUEST_REDIRECT for a redirected request (draft-neutral).
- * Copies the connect URI / namespace / name / reason into output scratch and
- * pushes the event; the caller (the family error handler) performs the terminal
- * free/drain. handle_opaque is the request's public handle value. */
+ * Weighs the connect URI / namespace / name / reason as one requirement, then
+ * copies them into the event-scratch arena and pushes the event.
+ * handle_opaque is the request's public handle value.
+ *
+ * Result contract for the family error handlers that call this:
+ *  - MOQ_OK with the session still open: the event was surfaced; perform the
+ *    terminal free/drain.
+ *  - MOQ_OK with the session CLOSED: a requirement no arena could hold ended
+ *    the session instead. The queues were cleared and the terminal queued, so
+ *    the caller must NOT run its teardown -- return immediately.
+ *  - MOQ_ERR_WOULD_BLOCK: the arena and the request are untouched; retain the
+ *    message and retry once events drain.
+ *  - any other negative: propagate. */
 moq_result_t session_core_emit_request_redirect(
     moq_session_t *s, moq_request_family_t family, uint64_t handle_opaque,
     const moq_decoded_redirect_t *rd, uint64_t error_code,
@@ -1573,7 +1770,7 @@ moq_result_t session_core_emit_request_redirect(
     const uint8_t *reason, size_t reason_len);
 
 void sg_free_entry(size_t slot, moq_sg_entry_t *entries);
-void sg_reap_terminal(moq_session_t *s);
+bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget);
 
 /* -- Inbound data reordering buffer (data before SUBSCRIBE_OK) ------ *
  * The Track Alias is assigned by the publisher in SUBSCRIBE_OK; data and
@@ -2337,7 +2534,7 @@ bool pub_outbound_alias_in_use(moq_session_t *s, uint64_t alias);
  * pub_reap_deferred_dones drives count-satisfied retries, deadline firing,
  * and the EXPIRED scan/stop/rescan/finalize loop. */
 void pub_note_stream_processed(moq_session_t *s, moq_publication_t pub);
-void pub_reap_deferred_dones(moq_session_t *s);
+bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget);
 
 /* Count a completed data stream toward a subscriber-role subscription's
  * Stream Count, finalizing a deferred SUBSCRIBE_DONE when the count is
@@ -2357,14 +2554,18 @@ void sub_note_stream_processed(moq_session_t *s, moq_subscription_t sub);
 
 /* §9.8 EXPIRED sweep (session_receive.c): stop-and-discard all live rx
  * bound to the handle; MOQ_OK = none remain, WOULD_BLOCK = action-blocked. */
-moq_result_t session_stop_bound_streams(moq_session_t *s,
-                                        moq_subscription_t sub,
-                                        moq_publication_t pub);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+extern uint64_t session_stop_scan_entries;
+#endif
+moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
+                                                  moq_subscription_t sub,
+                                                  moq_publication_t pub,
+                                                  uint32_t *budget);
 
 moq_result_t session_scan_dt_props(const moq_session_t *s,
                                    const uint8_t *data, size_t len,
                                    bool strict_local, moq_dt_scan_t *out);
-void sub_reap_deferred_dones(moq_session_t *s);
+bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget);
 
 /* Surface PUBLISH_DONE (the publisher's terminal on the subscriber side).
  * free_now frees the entry immediately (draft-16, control channel); when false

@@ -46,6 +46,7 @@ set(BASE_SYMBOLS
 # the managed facades read the session's event-progress token + pending-event
 # bit through it. Any addition here is a deliberate adapter-SPI change.
 list(APPEND BASE_SYMBOLS moq_wtquic_conn_event_progress)
+list(APPEND BASE_SYMBOLS moq_wtquic_conn_terminal_facts)
 
 set(EXPECTED_SYMBOLS "")
 foreach(base IN LISTS BASE_SYMBOLS)

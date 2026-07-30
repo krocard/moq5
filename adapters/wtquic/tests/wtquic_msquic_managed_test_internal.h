@@ -99,7 +99,7 @@ void moq_wtquic_msquic_managed_test_quiesce_conn(
     moq_wtquic_msquic_managed_t *m, void *conn);
 
 /* Run one explicit pump cycle for a lane (opens the window, runs on_lane_pump,
- * services each adapter, records terminal_pump_seen), as global teardown's final
+ * services each adapter), as global teardown's final
  * pump does. Returns the pump callback's rc. */
 int moq_wtquic_msquic_managed_test_pump_lane(
     moq_wtquic_msquic_managed_t *m, uint32_t lane_index);
@@ -115,10 +115,11 @@ void moq_wtquic_msquic_managed_test_mark_quiesced(
     moq_wtquic_msquic_managed_t *m, void *conn);
 
 /* Read a child's three reap-gate conditions:
- * logical_terminal && transport_quiesced && terminal_pump_seen. */
+ * logical_terminal && transport_quiesced, plus -- for a session-backed child --
+ * terminal observation and acknowledgment. */
 void moq_wtquic_msquic_managed_test_conn_gate(
     void *conn, bool *out_logical_terminal, bool *out_transport_quiesced,
-    bool *out_terminal_pump_seen);
+    bool *out_session_backed);
 
 /* Whether a child currently has a close latched (set by conn_close inside a
  * pump, cleared when the pump executes it). */
@@ -213,6 +214,34 @@ const char *moq_wtquic_msquic_managed_test_proto(
     const moq_wtquic_msquic_managed_t *m, size_t i);
 uint32_t moq_wtquic_msquic_managed_test_lane_count(
     const moq_wtquic_msquic_managed_t *m);
+
+
+
+/* Drive a child's transport-terminal latch directly, so a synthetic child that
+ * was given a session can reach a SESSION-BACKED terminal (the establishment
+ * seam with a non-MoQ protocol produces a pre-session one). */
+void moq_wtquic_msquic_managed_test_mark_logical_terminal(
+    moq_wtquic_msquic_managed_t *m, void *conn);
+
+/* Inject the session-terminal OBSERVED fact for a synthetic child (one with no
+ * real adapter/session behind it), mirroring test_mark_quiesced for the
+ * transport fact. */
+void moq_wtquic_msquic_managed_test_mark_terminal_observed(
+    moq_wtquic_msquic_managed_t *m, void *conn);
+
+/* Read the per-child terminal facts. */
+bool moq_wtquic_msquic_managed_test_conn_terminal_observed(
+    const moq_wtquic_msquic_managed_conn_t *conn);
+bool moq_wtquic_msquic_managed_test_conn_acked(
+    const moq_wtquic_msquic_managed_conn_t *conn);
+/* Snapshot the facade's terminal accounting under its mutex. Each name states
+ * the exact fact counted: a TRANSPORT terminal on a session-backed child is not
+ * "the session terminal was enqueued" and not "it was observed". */
+void moq_wtquic_msquic_managed_test_terminal_counters(
+    moq_wtquic_msquic_managed_t *m,
+    uint64_t *out_transport_terminal_session_backed, uint64_t *out_ack_accepted,
+    uint64_t *out_children_reaped, uint64_t *out_accepts_refused_terminal_held,
+    uint32_t *out_terminal_held_now);
 
 #ifdef __cplusplus
 }

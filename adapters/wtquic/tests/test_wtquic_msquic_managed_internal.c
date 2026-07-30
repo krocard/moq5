@@ -122,6 +122,23 @@ static int pump(moq_wtquic_msquic_managed_t *m,
     return 0;
 }
 
+/* A well-behaved application pump: acknowledges terminal for every connection
+ * it is presented, from that connection's owning lane callback. Tests whose
+ * subject is the transport/traversal side of reaping use this so the session
+ * and acknowledgment axes of the gate are satisfied normally. */
+static int ack_pump(moq_wtquic_msquic_managed_t *m,
+                    moq_wtquic_msquic_managed_lane_t *l, uint64_t t, void *u)
+{
+    (void)m;
+    (void)t;
+    (void)u;
+    for (moq_wtquic_msquic_managed_conn_t *c =
+             moq_wtquic_msquic_lane_next_conn(l, NULL);
+         c != NULL; c = moq_wtquic_msquic_lane_next_conn(l, c))
+        (void)moq_wtquic_msquic_managed_conn_ack_terminal(c);
+    return 0;
+}
+
 /* --- every pthread stage fails cleanly ----------------------------------- */
 static void test_pthread_init_failures(void)
 {
@@ -535,7 +552,7 @@ static void test_server_late_establish_converges(void)
     moq_wtquic_msquic_managed_test_no_listener(false);
 }
 
-/* --- final pump: window access, iterability, terminal_pump_seen ----------- */
+/* --- final pump: window access and iterability ---------------------------- */
 /* A pump callback that records, from INSIDE the window, what it iterated and
  * what the pump-confined accessors returned for each connection. */
 #define REC_MAX 8
@@ -606,7 +623,7 @@ static void test_final_pump_window_and_gate(void)
     moq_wtquic_msquic_managed_t *m = NULL;
     CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
     if (m != NULL) {
-        bool lt, tq, tps;
+        bool lt, tq, sb;
         void *c0 = NULL, *c1 = NULL;
         CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0) && c0 != NULL);
         CHECK(moq_wtquic_msquic_managed_test_accept(m, &c1) && c1 != NULL);
@@ -624,26 +641,27 @@ static void test_final_pump_window_and_gate(void)
         moq_wtquic_msquic_managed_conn_set_user(c0, (void *)0x9); /* no-op */
         CHECK(moq_wtquic_msquic_managed_conn_user(c0) == NULL);
 
-        /* --- ordering A: terminal pump BEFORE quiescence (c0, lane 0) --- */
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(lt && !tq && !tps); /* terminal, not yet quiesced or pumped */
+        /* --- ordering A: pump BEFORE quiescence (c0, lane 0) --- */
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        /* pre-session: establishment failed before a MoQ session existed */
+        CHECK(lt && !tq && !sb);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
         CHECK(rec.calls == 1);
         CHECK(rec_saw(&rec, c0)); /* terminal child is iterable for its pump */
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(lt && !tq && tps); /* pump recorded terminal_pump_seen */
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(lt && !tq && !sb);  /* a pump does not change any gate fact */
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(lt && tq && tps); /* full reap gate satisfied */
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(lt && tq && !sb);   /* pre-session gate now complete */
 
-        /* --- ordering B: quiescence BEFORE terminal pump (c1, lane 1) --- */
+        /* --- ordering B: quiescence BEFORE the pump (c1, lane 1) --- */
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c1);
-        moq_wtquic_msquic_managed_test_conn_gate(c1, &lt, &tq, &tps);
-        CHECK(lt && tq && !tps); /* quiesced but not yet pumped */
+        moq_wtquic_msquic_managed_test_conn_gate(c1, &lt, &tq, &sb);
+        CHECK(lt && tq && !sb);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 1) == 0);
         CHECK(rec_saw(&rec, c1));
-        moq_wtquic_msquic_managed_test_conn_gate(c1, &lt, &tq, &tps);
-        CHECK(lt && tq && tps); /* full reap gate satisfied, either order */
+        moq_wtquic_msquic_managed_test_conn_gate(c1, &lt, &tq, &sb);
+        CHECK(lt && tq && !sb);   /* same facts, either order */
 
         /* teardown runs EXACTLY ONE more pump per lane (the final pump), then
          * reaps: the delta proves the per-lane final pump and that nothing
@@ -696,24 +714,24 @@ static void test_same_pass_terminal(void)
     moq_wtquic_msquic_managed_t *m = NULL;
     CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
     if (m != NULL) {
-        bool lt, tq, tps;
+        bool lt, tq, sb;
         void *c0 = NULL;
         CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0) && c0 != NULL);
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(!lt && !tps); /* not terminal before any pump */
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(!lt && !tq); /* not terminal before any pump */
 
-        /* pump 1: the callback makes c0 terminal mid-pump. Because c0 was NOT
-         * terminal when the snapshot was taken, this pump must NOT record it as
-         * seen. */
+        /* the callback drives c0 terminal mid-pump: the fact latches, and a
+         * pump neither adds nor removes any other gate fact */
         g_stp_conn = c0;
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(lt && !tps); /* terminal now, but not this pump's to record */
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(lt && !tq && !sb);   /* pre-session terminal, not yet quiesced */
 
-        /* pump 2: c0 was terminal BEFORE this callback, so it is seen now */
+        /* a further pump changes nothing while quiescence is missing */
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(lt && tps);
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(lt && !tq && !sb);
+        CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0));
 
         CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
         moq_wtquic_msquic_managed_destroy(m);
@@ -2033,7 +2051,7 @@ static void test_deadline_reap_no_use_after_publish(void)
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.cert_path = "c";
     cfg.key_path = "k";
-    cfg.on_lane_pump = pump; /* no-op pump */
+    cfg.on_lane_pump = ack_pump; /* well-behaved: acknowledges terminal */
     cfg.max_connections = 2;
     cfg.lane_count = 1; /* both children on lane 0 */
     moq_wtquic_msquic_managed_t *m = NULL;
@@ -2050,6 +2068,7 @@ static void test_deadline_reap_no_use_after_publish(void)
         g_dl.reaped = c_reap;
         /* c_reap: fully gated -> reaped this pump. c_surv: a live session. */
         moq_wtquic_msquic_managed_test_deliver_established(m, c_reap, "x-not-moq");
+        moq_wtquic_msquic_managed_test_mark_terminal_observed(m, c_reap);
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c_reap);
         moq_wtquic_msquic_managed_test_set_conn_established(c_surv, ws, sess);
 
@@ -2082,7 +2101,52 @@ static struct {
     uint32_t seen;
     void *conns[REC_MAX];
     void *trigger; /* if set, made terminal mid-callback, then cleared */
+    bool no_ack;   /* model an app that never acknowledges */
 } g_lr;
+/* Drive a synthetic child to "session terminal observed": the real path is a
+ * poll of MOQ_EVENT_SESSION_CLOSED, which a child with no session cannot do. */
+static void mm_test_make_observed(moq_wtquic_msquic_managed_t *m, void *c)
+{
+    moq_wtquic_msquic_managed_test_mark_terminal_observed(m, c);
+}
+
+/*
+ * Three fixtures, one per reachable child shape. They are kept distinct so a
+ * test always exercises the contract it claims: a pre-session child can never
+ * observe or acknowledge anything, so observation is NEVER injected on one.
+ */
+
+/* PRE-SESSION terminal: establishment fails before a MoQ session exists.
+ * Nothing to observe, nothing to acknowledge; reclaims on F1 + F2 alone. */
+static void mm_test_terminal_only(moq_wtquic_msquic_managed_t *m, void *c)
+{
+    bool lt = false, tq = false, sb = false;
+    moq_wtquic_msquic_managed_test_deliver_established(m, c, "x-not-moq");
+    moq_wtquic_msquic_managed_test_conn_gate(c, &lt, &tq, &sb);
+    CHECK(lt && !sb);   /* terminal, and NOT session-backed */
+}
+
+/* SESSION-BACKED, terminal, terminal event NOT observed: the state that must
+ * hold its capacity slot. */
+static void mm_test_session_terminal_unobserved(moq_wtquic_msquic_managed_t *m,
+                                                void *c)
+{
+    bool lt = false, tq = false, sb = false;
+    moq_wtquic_msquic_managed_test_set_conn_established(
+        c, (wtq_session_t *)0x1, (void *)0x2);
+    moq_wtquic_msquic_managed_test_mark_logical_terminal(m, c);
+    moq_wtquic_msquic_managed_test_conn_gate(c, &lt, &tq, &sb);
+    CHECK(lt && sb);    /* the predicate branch under test */
+    CHECK(!moq_wtquic_msquic_managed_test_conn_terminal_observed(c));
+}
+
+/* SESSION-BACKED, terminal, terminal event OBSERVED: ready to acknowledge. */
+static void mm_test_make_terminal(moq_wtquic_msquic_managed_t *m, void *c)
+{
+    mm_test_session_terminal_unobserved(m, c);
+    mm_test_make_observed(m, c);
+    CHECK(moq_wtquic_msquic_managed_test_conn_terminal_observed(c));
+}
 static int lr_pump(moq_wtquic_msquic_managed_t *m,
                    moq_wtquic_msquic_managed_lane_t *lane, uint64_t now_us,
                    void *user)
@@ -2093,11 +2157,20 @@ static int lr_pump(moq_wtquic_msquic_managed_t *m,
     for (moq_wtquic_msquic_managed_conn_t *c =
              moq_wtquic_msquic_lane_next_conn(lane, NULL);
          c != NULL && g_lr.seen < REC_MAX;
-         c = moq_wtquic_msquic_lane_next_conn(lane, c))
+         c = moq_wtquic_msquic_lane_next_conn(lane, c)) {
         g_lr.conns[g_lr.seen++] = c;
+        /* A well-behaved application acknowledges from the owning lane callback
+         * once it has observed the terminal event and finished its terminal
+         * processing for the connection. g_lr.no_ack models an app that never
+         * does, which must hold the slot indefinitely. */
+        if (!g_lr.no_ack)
+            (void)moq_wtquic_msquic_managed_conn_ack_terminal(c);
+    }
     if (g_lr.trigger != NULL) {
-        moq_wtquic_msquic_managed_test_deliver_established(m, g_lr.trigger,
-                                                           "x-not-moq");
+        /* a SESSION-BACKED child going terminal mid-callback: it is subject to
+         * the observe+acknowledge contract, and this callback has already
+         * iterated past it, so it cannot have been acknowledged here */
+        mm_test_make_terminal(m, g_lr.trigger);
         g_lr.trigger = NULL;
     }
     return 0;
@@ -2108,11 +2181,6 @@ static bool lr_saw(const void *c)
         if (g_lr.conns[i] == c)
             return true;
     return false;
-}
-/* make a child terminal (child-local establishment failure) */
-static void lr_make_terminal(moq_wtquic_msquic_managed_t *m, void *c)
-{
-    moq_wtquic_msquic_managed_test_deliver_established(m, c, "x-not-moq");
 }
 static moq_wtquic_msquic_managed_t *lr_make_server(acnt_t *a, moq_alloc_t *alloc,
                                                    uint32_t n)
@@ -2155,11 +2223,11 @@ static void test_live_reap_gates(void)
          *  c1 terminal + pumped, NOT quiesced;
          *  c2 quiesced + pumped, NOT terminal;
          *  c3 terminal + quiesced, NOT pumped. */
-        lr_make_terminal(m, c1);
+        mm_test_make_terminal(m, c1);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 1) == 0);
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c2);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 2) == 0);
-        lr_make_terminal(m, c3);
+        mm_test_make_terminal(m, c3);
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c3);
         CHECK(moq_wtquic_msquic_managed_conn_count(m) == 4); /* none reaped */
         CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c1));
@@ -2169,7 +2237,7 @@ static void test_live_reap_gates(void)
         /* c0: full gate, ordering A (terminal -> quiesce -> pump). The reaping
          * pump still presents it (terminal children stay iterable for it), then
          * reaps it. */
-        lr_make_terminal(m, c0);
+        mm_test_make_terminal(m, c0);
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
         CHECK(lr_saw(c0));                                     /* iterable */
@@ -2185,7 +2253,7 @@ static void test_live_reap_gates(void)
 
         /* c2: ordering B (quiesce -> terminal -> pump) — reaches the gate the
          * other way around */
-        lr_make_terminal(m, c2);
+        mm_test_make_terminal(m, c2);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 2) == 0);
         CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c2));
         CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
@@ -2212,7 +2280,7 @@ static void test_live_reap_reuse(void)
     moq_alloc_t alloc;
     moq_wtquic_msquic_managed_t *m = lr_make_server(&a, &alloc, 2);
     if (m != NULL) {
-        bool lt, tq, tps, qr, cp;
+        bool lt, tq, sb, qr, cp;
         moq_version_t ver;
         void *usr;
         void *c0 = NULL, *reuse = NULL;
@@ -2229,7 +2297,7 @@ static void test_live_reap_reuse(void)
         /* full gate -> reap on the next pump of its lane; the retained ref is
          * released exactly once */
         g_release_count = 0;
-        lr_make_terminal(m, c0);
+        mm_test_make_terminal(m, c0);
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
         CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c0));
@@ -2248,8 +2316,8 @@ static void test_live_reap_reuse(void)
         CHECK(reuse == c0); /* same slot */
         CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
         CHECK(moq_wtquic_msquic_managed_test_conn_in_use(reuse));
-        moq_wtquic_msquic_managed_test_conn_gate(reuse, &lt, &tq, &tps);
-        CHECK(!lt && !tq && !tps); /* terminal / quiesce / pump-seen cleared */
+        moq_wtquic_msquic_managed_test_conn_gate(reuse, &lt, &tq, &sb);
+        CHECK(!lt && !tq && !sb); /* terminal / quiesce / session-backed cleared */
         moq_wtquic_msquic_managed_test_conn_gen_state(reuse, &ver, &usr, &qr, &cp);
         CHECK(ver == 0 && usr == NULL && !qr && !cp); /* version/user/latches */
 
@@ -2265,9 +2333,9 @@ static void test_live_reap_reuse(void)
     moq_wtquic_msquic_managed_test_no_listener(false);
 }
 
-/* the terminal_pump_seen gate blocks reaping a same-pass terminal: a child that
- * is quiesced and becomes terminal DURING a pump is not reaped that pump (the
- * app never observed it), only the next */
+/* a child that is quiesced and becomes terminal DURING a pump is not reaped that
+ * pump -- the callback had already iterated past it, so it could not have
+ * acknowledged -- only the next */
 static void test_live_reap_same_pass(void)
 {
     moq_wtquic_msquic_managed_test_no_listener(true);
@@ -2276,22 +2344,23 @@ static void test_live_reap_same_pass(void)
     moq_alloc_t alloc;
     moq_wtquic_msquic_managed_t *m = lr_make_server(&a, &alloc, 1);
     if (m != NULL) {
-        bool lt, tq, tps;
+        bool lt, tq, sb;
         void *c0 = NULL;
         CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
         moq_wtquic_msquic_managed_test_mark_quiesced(m, c0); /* quiesced first */
 
-        /* pump 1: the callback makes c0 terminal AFTER the snapshot, so this
-         * pump does not record terminal_pump_seen — the gate is incomplete and
-         * c0 is NOT reaped, even though it is now terminal + quiesced */
+        /* pump 1: the callback makes c0 terminal AFTER it had already iterated
+         * past it, so c0 cannot have been acknowledged here -- it is NOT
+         * reaped, even though it is now terminal + quiesced + observed */
         g_lr.trigger = c0;
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
-        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &tps);
-        CHECK(lt && tq && !tps);
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(lt && tq && sb);   /* session-backed: needs observe + ack */
         CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0)); /* not reaped */
         CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
 
-        /* pump 2: c0 was terminal before this callback -> seen -> reaped */
+        /* pump 2: c0 is presented terminal from the start, so the callback
+         * acknowledges it and it is reaped */
         CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
         CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c0));
         CHECK(moq_wtquic_msquic_managed_conn_count(m) == 0);
@@ -2955,6 +3024,555 @@ static void test_app_deadline_fold(void)
     moq_wtquic_msquic_managed_test_no_listener(false);
 }
 
+/* ===================================================================
+ * Independent terminal facts and application acknowledgment
+ * =================================================================== */
+
+/* F5 (acknowledgment) is refused until F4 (the terminal event was actually
+ * POLLED). Transport terminal and quiescence are not enough: the whole point is
+ * that reclamation waits for the application, not for pump timing. */
+static void *g_ack_probe_conn;
+static moq_result_t g_ack_probe_rc;
+static bool g_ack_probe_dup_ok;
+static int ack_probe_pump(moq_wtquic_msquic_managed_t *m,
+                          moq_wtquic_msquic_managed_lane_t *l, uint64_t t,
+                          void *u)
+{
+    (void)m; (void)t; (void)u;
+    for (moq_wtquic_msquic_managed_conn_t *c =
+             moq_wtquic_msquic_lane_next_conn(l, NULL);
+         c != NULL; c = moq_wtquic_msquic_lane_next_conn(l, c)) {
+        if ((void *)c != g_ack_probe_conn) continue;
+        g_ack_probe_rc = moq_wtquic_msquic_managed_conn_ack_terminal(c);
+        /* a repeat in the SAME valid callback is harmless */
+        g_ack_probe_dup_ok =
+            (moq_wtquic_msquic_managed_conn_ack_terminal(c) == MOQ_OK);
+    }
+    return 0;
+}
+
+static moq_wtquic_msquic_managed_t *mm_test_server_n(acnt_t *a,
+                                                moq_alloc_t *alloc,
+                                                uint32_t lanes, uint32_t conns,
+                                                moq_wtquic_msquic_lane_pump_fn p)
+{
+    alloc->ctx = a;
+    alloc->alloc = acnt_alloc;
+    alloc->realloc = acnt_realloc;
+    alloc->free = acnt_free;
+    moq_wtquic_msquic_managed_cfg_t cfg;
+    moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.alloc = alloc;
+    cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    cfg.cert_path = "c";
+    cfg.key_path = "k";
+    cfg.on_lane_pump = p;
+    cfg.max_connections = conns;
+    cfg.lane_count = lanes;
+    moq_wtquic_msquic_managed_t *m = NULL;
+    CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
+    return m;
+}
+static moq_wtquic_msquic_managed_t *mm_test_server(acnt_t *a, moq_alloc_t *alloc,
+                                                uint32_t n,
+                                                moq_wtquic_msquic_lane_pump_fn p)
+{
+    return mm_test_server_n(a, alloc, n, n, p);
+}
+
+/* Acknowledgment before observation is refused; after observation it is
+ * accepted, and a duplicate in the same callback is harmless. */
+static void test_ack_requires_observed(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 1, ack_probe_pump);
+    if (m != NULL) {
+        void *c0 = NULL;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
+        g_ack_probe_conn = c0;
+
+        /* session-backed and fully terminal, but the app has NOT polled the
+         * terminal event -- so acknowledgment must be refused */
+        mm_test_session_terminal_unobserved(m, c0);
+        moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);
+        g_ack_probe_rc = MOQ_OK;
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(g_ack_probe_rc == MOQ_ERR_WRONG_STATE);      /* refused */
+        CHECK(!moq_wtquic_msquic_managed_test_conn_acked(c0));
+        CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0)); /* not reaped */
+
+        /* now the app observes it: acknowledgment is accepted, duplicate is OK */
+        mm_test_make_observed(m, c0);
+        CHECK(moq_wtquic_msquic_managed_test_conn_terminal_observed(c0));
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(g_ack_probe_rc == MOQ_OK);
+        CHECK(g_ack_probe_dup_ok);
+        CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c0)); /* reaped */
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    g_ack_probe_conn = NULL;
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* An application that never polls its events is still presented the child by
+ * repeated pumps -- but it has observed nothing and acknowledged nothing, so a
+ * session-backed child must not be reclaimed. */
+static void test_never_polling_app_does_not_reap(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    /* lr_pump acknowledges, but acknowledgment itself is refused while the
+     * terminal is unobserved -- so a never-polling app cannot reap. */
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 1, lr_pump);
+    if (m != NULL) {
+        void *c0 = NULL;
+        bool lt, tq, sb;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
+        mm_test_session_terminal_unobserved(m, c0);        /* F1, never polled */
+        moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);  /* F2 */
+
+        for (int i = 0; i < 4; i++)
+            CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+
+        moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+        CHECK(lt && tq && sb);        /* the OLD three-condition gate is MET */
+        CHECK(!moq_wtquic_msquic_managed_test_conn_terminal_observed(c0));
+        CHECK(!moq_wtquic_msquic_managed_test_conn_acked(c0));
+        CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0)); /* still held */
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* F1 + F4 + F5 without F2 must not unlink or release the child; injecting F2
+ * then permits reclamation. */
+static void test_no_reap_before_quiesced(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 1, lr_pump);
+    if (m != NULL) {
+        void *c0 = NULL;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
+        /* session-backed, F1 + F4 */
+        mm_test_make_terminal(m, c0);
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0); /* F5 */
+        CHECK(moq_wtquic_msquic_managed_test_conn_acked(c0));
+        {   /* the predicate branch under test really is the session-backed one */
+            bool lt = false, tq = false, sb = false;
+            moq_wtquic_msquic_managed_test_conn_gate(c0, &lt, &tq, &sb);
+            CHECK(lt && sb && !tq);   /* F1 + session-backed, F2 still false */
+        }
+
+        /* F2 is still false: linked, iterable, counted, unreleased */
+        CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0));
+        CHECK(lr_saw(c0));
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0));
+
+        moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);  /* inject F2 */
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c0));
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 0);
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* A held terminal child consumes its capacity slot: accepts are refused while
+ * it is unacknowledged, the refusal is attributed, and capacity returns after
+ * acknowledgment -- with no timeout involved. */
+static void test_unacked_holds_capacity(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 1, lr_pump);
+    if (m != NULL) {
+        uint64_t tterm = 0, acked = 0, reaped = 0, refused = 0;
+        uint32_t held = 0;
+        void *c0 = NULL, *c1 = NULL;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
+
+        /* session-backed, terminal + quiesced, but NOT observed -> cannot be
+         * acknowledged, so the slot stays held */
+        mm_test_session_terminal_unobserved(m, c0);
+        moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(moq_wtquic_msquic_managed_test_conn_in_use(c0));
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1); /* still counted */
+
+        /* The reserve is full so the accept is refused, and because this child
+         * is session-backed and terminal-but-unacknowledged the refusal is
+         * ATTRIBUTED to that contractual hold. */
+        CHECK(!moq_wtquic_msquic_managed_test_accept(m, &c1));
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(tterm == 1 && held == 1);
+        CHECK(refused == 1);
+        CHECK(acked == 0 && reaped == 0);
+
+        /* acknowledge -> reclaimed -> capacity available again */
+        mm_test_make_observed(m, c0);
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c0));
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 0);
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c1));
+
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(acked == 1 && reaped == 1);   /* conservation: reaped <= acked */
+        CHECK(held == 0);
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* Forced stop reclaims a terminal child that was never acknowledged: it is the
+ * documented forced path, not the normal one. */
+static void test_stop_forces_cleanup_without_ack(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 1, lr_pump);
+    if (m != NULL) {
+        void *c0 = NULL;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
+        mm_test_session_terminal_unobserved(m, c0);
+        moq_wtquic_msquic_managed_test_mark_quiesced(m, c0);
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(!moq_wtquic_msquic_managed_test_conn_acked(c0));
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);   /* everything released despite no ack */
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* A pre-session failure (refused/failed before establishment) has no session
+ * terminal to enqueue, observe or acknowledge, so it must not enter the
+ * session-backed conservation counters. */
+/* A server child whose negotiation/setup fails before any MoQ session exists has
+ * no terminal event to observe and nothing to acknowledge. It must therefore
+ * reclaim on transport terminal + quiescence ALONE -- otherwise repeated setup
+ * failures would pin max_connections until facade shutdown. It also stays out of
+ * the session-backed conservation counters. */
+static void test_pre_session_terminal_reclaims_and_frees_capacity(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    /* one slot, so a leaked pre-session child is immediately visible */
+    moq_wtquic_msquic_managed_t *m = mm_test_server_n(&a, &alloc, 1, 1, lr_pump);
+    if (m != NULL) {
+        uint64_t tterm = 0, acked = 0, reaped = 0, refused = 0;
+        uint32_t held = 0;
+
+        for (int round = 0; round < 3; round++) {
+            void *c = NULL;
+            /* capacity must be available on every round -- that is the point */
+            CHECK(moq_wtquic_msquic_managed_test_accept(m, &c));
+            CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
+
+            /* a real pre-session terminal: the offered subprotocol is not one
+             * we recognise, so establishment fails before a session is built */
+            mm_test_terminal_only(m, c);
+            moq_wtquic_msquic_managed_test_mark_quiesced(m, c);
+
+            /* it was never observed and never acknowledged */
+            CHECK(!moq_wtquic_msquic_managed_test_conn_terminal_observed(c));
+            CHECK(!moq_wtquic_msquic_managed_test_conn_acked(c));
+
+            /* one ordinary lane cycle reclaims it */
+            CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+            CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c));
+            CHECK(moq_wtquic_msquic_managed_conn_count(m) == 0);
+        }
+
+        /* three admissions through a single slot: capacity was genuinely
+         * returned each time, not merely on shutdown */
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused,
+                                                          &held);
+        CHECK(tterm == 0);   /* never entered the session-backed relation */
+        CHECK(acked == 0);
+        CHECK(held == 0);
+        CHECK(reaped == 3);  /* reclaimed exactly once per round */
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    /* every slot/resource released exactly once */
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+
+/* Concurrent exercise of the terminal accounting's ownership boundary.
+ *
+ * SCOPE, stated precisely: the concurrency here is CONCURRENT LANE PUMPS. Every
+ * child is admitted up front on one thread; the workers then pump their own
+ * lanes simultaneously, so several lanes publish terminal and acknowledgment
+ * effects into the facade (under m->mu, in lane -> facade order) at the same
+ * time. That is exactly the boundary this change introduced.
+ *
+ * It deliberately does NOT drive admission concurrently. The white-box accept
+ * seam calls mm_accept_prepare directly, bypassing the guard handshake wtquic
+ * performs before delivering callbacks for a new child, so racing it against
+ * pumps exercises the seam rather than the product. See the plan's open items:
+ * whether production admission has the same exposure is a separate audit. */
+#define CML_LANES 4
+#define CML_PER_LANE 6
+struct cml {
+    moq_wtquic_msquic_managed_t *m;
+    uint32_t lane;
+};
+/* Every per-child fact is written HERE, inside the lane callback, because the
+ * lane guard owns them -- mm_pump_lane relies on exactly that ("only mutated
+ * under the lane guard"). */
+static int cml_pump(moq_wtquic_msquic_managed_t *m,
+                    moq_wtquic_msquic_managed_lane_t *l, uint64_t t, void *u)
+{
+    (void)t; (void)u;
+    for (moq_wtquic_msquic_managed_conn_t *c =
+             moq_wtquic_msquic_lane_next_conn(l, NULL);
+         c != NULL; c = moq_wtquic_msquic_lane_next_conn(l, c)) {
+        bool lt = false, tq = false, sb = false;
+        moq_wtquic_msquic_managed_test_conn_gate(c, &lt, &tq, &sb);
+        if (!lt) {
+            moq_wtquic_msquic_managed_test_mark_logical_terminal(m, c);
+            moq_wtquic_msquic_managed_test_mark_terminal_observed(m, c);
+            moq_wtquic_msquic_managed_test_mark_quiesced(m, c);
+        }
+        (void)moq_wtquic_msquic_managed_conn_ack_terminal(c);
+    }
+    return 0;
+}
+static void *cml_lane_worker(void *arg)
+{
+    struct cml *w = arg;
+    for (int r = 0; r < CML_PER_LANE + 2; r++)
+        (void)moq_wtquic_msquic_managed_test_pump_lane(w->m, w->lane);
+    return NULL;
+}
+
+static void test_terminal_accounting_concurrent_lanes(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    const uint32_t total = CML_LANES * CML_PER_LANE;
+    moq_wtquic_msquic_managed_t *m = mm_test_server_n(&a, &alloc, CML_LANES,
+                                                      total, cml_pump);
+    if (m != NULL) {
+        /* admit and make session-backed on ONE thread, before any pump runs */
+        for (uint32_t i = 0; i < total; i++) {
+            void *c = NULL;
+            CHECK(moq_wtquic_msquic_managed_test_accept(m, &c));
+            moq_wtquic_msquic_managed_test_set_conn_established(
+                c, (wtq_session_t *)0x1, (void *)0x2);
+        }
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == total);
+
+        pthread_t th[CML_LANES];
+        struct cml w[CML_LANES];
+        for (int i = 0; i < CML_LANES; i++) {
+            w[i].m = m; w[i].lane = (uint32_t)i;
+            CHECK(pthread_create(&th[i], NULL, cml_lane_worker, &w[i]) == 0);
+        }
+        for (int i = 0; i < CML_LANES; i++)
+            CHECK(pthread_join(th[i], NULL) == 0);
+
+        uint64_t tterm = 0, acked = 0, reaped = 0, refused = 0;
+        uint32_t held = 0;
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused,
+                                                          &held);
+        /* every child went terminal -> observed -> acknowledged -> reaped, and
+         * no lane withdrew a hold belonging to another */
+        CHECK(tterm == total);
+        CHECK(acked == total);
+        CHECK(reaped == total);
+        CHECK(held == 0);
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 0);
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+/* Acknowledgment may legally precede the transport terminal: a locally closed
+ * session enqueues and surfaces its terminal event while the transport is still
+ * winding down. The published-hold accounting must survive that order, and a
+ * child must never withdraw a hold belonging to another child.
+ *
+ * Pins  terminal_held_count == #{server children with terminal && !acknowledged}
+ * at every observable point. */
+static void *g_ord_ack_conn;
+static int ord_pump(moq_wtquic_msquic_managed_t *m,
+                    moq_wtquic_msquic_managed_lane_t *l, uint64_t t, void *u)
+{
+    (void)m; (void)t; (void)u;
+    for (moq_wtquic_msquic_managed_conn_t *c =
+             moq_wtquic_msquic_lane_next_conn(l, NULL);
+         c != NULL; c = moq_wtquic_msquic_lane_next_conn(l, c))
+        if ((void *)c == g_ord_ack_conn)
+            (void)moq_wtquic_msquic_managed_conn_ack_terminal(c);
+    return 0;
+}
+
+static void test_ack_before_transport_terminal(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 2, ord_pump);
+    if (m != NULL) {
+        uint64_t tterm = 0, acked = 0, reaped = 0, refused = 0;
+        uint32_t held = 0;
+        wtq_session_t *const ws = (wtq_session_t *)0x1;
+        void *const sess = (void *)0x2;
+        void *c_ord = NULL, *c_held = NULL;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c_ord));  /* lane 0 */
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c_held)); /* lane 1 */
+        /* both are SESSION-BACKED server children: only those enter the
+         * admission-capacity relation */
+        moq_wtquic_msquic_managed_test_set_conn_established(c_ord, ws, sess);
+        moq_wtquic_msquic_managed_test_set_conn_established(c_held, ws, sess);
+
+        /* c_held reaches its terminal normally and is never acknowledged: it
+         * publishes and keeps exactly one hold for the whole test. */
+        moq_wtquic_msquic_managed_test_mark_logical_terminal(m, c_held);
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(held == 1);
+
+        /* c_ord is acknowledged BEFORE its transport terminal arrives. It has
+         * no hold to withdraw, and it must not consume c_held's. */
+        mm_test_make_observed(m, c_ord);
+        g_ord_ack_conn = c_ord;
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(moq_wtquic_msquic_managed_test_conn_acked(c_ord));
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(acked == 1);
+        CHECK(held == 1);   /* still exactly c_held's hold */
+
+        /* c_ord's transport terminal arrives LAST. It is already acknowledged,
+         * so it must publish no hold -- the count stays at c_held's one. */
+        moq_wtquic_msquic_managed_test_mark_logical_terminal(m, c_ord);
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(held == 1);
+        CHECK(tterm == 2);  /* both reached a session-backed transport terminal */
+
+        /* quiesce c_ord: all four conditions hold, so it reclaims, and c_held's
+         * hold is untouched */
+        moq_wtquic_msquic_managed_test_mark_quiesced(m, c_ord);
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(!moq_wtquic_msquic_managed_test_conn_in_use(c_ord));
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(reaped == 1);
+        CHECK(acked == 1);
+        CHECK(held == 1);   /* c_held still holds its own slot */
+        CHECK(moq_wtquic_msquic_managed_conn_count(m) == 1);
+
+        /* teardown withdraws the surviving hold rather than leaking it */
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_test_terminal_counters(m, &tterm, &acked,
+                                                          &reaped, &refused, &held);
+        CHECK(held == 0);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    g_ord_ack_conn = NULL;
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
+
+/* Argument and context rejection: NULL is invalid input; the client connection
+ * is never reaped per-child so it is a state error; a valid server handle used
+ * outside its owning callback is a state error. */
+static bool g_arg_ran;
+static int arg_pump(moq_wtquic_msquic_managed_t *m,
+                    moq_wtquic_msquic_managed_lane_t *l, uint64_t t, void *u)
+{
+    (void)m; (void)t; (void)u;
+    CHECK(moq_wtquic_msquic_managed_conn_ack_terminal(NULL) == MOQ_ERR_INVAL);
+    for (moq_wtquic_msquic_managed_conn_t *c =
+             moq_wtquic_msquic_lane_next_conn(l, NULL);
+         c != NULL; c = moq_wtquic_msquic_lane_next_conn(l, c)) {
+        /* not terminal-observed yet: a state error, not an argument error */
+        CHECK(moq_wtquic_msquic_managed_conn_ack_terminal(c) ==
+              MOQ_ERR_WRONG_STATE);
+        g_arg_ran = true;
+    }
+    return 0;
+}
+
+static void test_ack_argument_and_context_errors(void)
+{
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    acnt_t a; acnt_init(&a);
+    moq_alloc_t alloc;
+    moq_wtquic_msquic_managed_t *m = mm_test_server(&a, &alloc, 1, arg_pump);
+    if (m != NULL) {
+        void *c0 = NULL;
+        CHECK(moq_wtquic_msquic_managed_test_accept(m, &c0));
+        moq_wtquic_msquic_managed_test_set_conn_established(
+            c0, (wtq_session_t *)0x1, (void *)0x2);
+
+        /* outside any callback: a valid handle is still a context error */
+        CHECK(moq_wtquic_msquic_managed_conn_ack_terminal(c0) ==
+              MOQ_ERR_WRONG_STATE);
+        /* NULL is an argument error in every context */
+        CHECK(moq_wtquic_msquic_managed_conn_ack_terminal(NULL) ==
+              MOQ_ERR_INVAL);
+
+        g_arg_ran = false;
+        CHECK(moq_wtquic_msquic_managed_test_pump_lane(m, 0) == 0);
+        CHECK(g_arg_ran);   /* the in-callback assertions actually ran */
+
+        CHECK(moq_wtquic_msquic_managed_stop(m) == MOQ_OK);
+        moq_wtquic_msquic_managed_destroy(m);
+    }
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
 int main(void)
 {
     /* Route client bring-up through a fake transport by default so the
@@ -2977,6 +3595,15 @@ int main(void)
     test_live_reap_gates();
     test_live_reap_reuse();
     test_live_reap_same_pass();
+    test_ack_requires_observed();
+    test_never_polling_app_does_not_reap();
+    test_no_reap_before_quiesced();
+    test_unacked_holds_capacity();
+    test_stop_forces_cleanup_without_ack();
+    test_pre_session_terminal_reclaims_and_frees_capacity();
+    test_terminal_accounting_concurrent_lanes();
+    test_ack_before_transport_terminal();
+    test_ack_argument_and_context_errors();
     test_doorbell_wake_delivers();
     test_doorbell_coalesce();
     test_doorbell_cross_lane();

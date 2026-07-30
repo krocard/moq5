@@ -859,3 +859,16 @@ uint64_t moq_wtquic_conn_event_progress(const moq_wtquic_conn_t *c,
                           moq_transport_bridge_has_events(c->bridge);
     return c != NULL ? moq_transport_bridge_event_progress_token(c->bridge) : 0;
 }
+
+bool moq_wtquic_conn_terminal_facts(const moq_wtquic_conn_t *c,
+                                     bool *out_observed)
+{
+    /* Straight pass-through of the session's two facts, read together by the
+     * bridge query so the facade never sees two instants -- and never the
+     * bridge pointer. */
+    if (c == NULL) {
+        if (out_observed) *out_observed = false;
+        return false;
+    }
+    return moq_transport_bridge_terminal_facts(c->bridge, out_observed);
+}

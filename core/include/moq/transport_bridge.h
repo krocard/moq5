@@ -472,6 +472,30 @@ MOQ_API uint64_t moq_transport_bridge_event_progress_token(
 MOQ_API bool     moq_transport_bridge_has_events(
     const moq_transport_bridge_t *brg);
 
+/*
+ * The attached session's independent monotonic terminal facts, read together
+ * so an adapter cannot sample them at two different instants.
+ *
+ *   returns        ENQUEUED -- MOQ_EVENT_SESSION_CLOSED was actually placed in
+ *                  the event queue.
+ *   *out_observed  OBSERVED -- moq_session_poll_events_ex TRANSFERRED that
+ *                  event to a caller. A queued-but-unpolled terminal reads
+ *                  false: availability is not observation.
+ *
+ * OBSERVED implies ENQUEUED. Both are monotonic and idempotent, and their
+ * ORDER RELATIVE TO TRANSPORT TERMINAL IS NOT FIXED -- a local close enqueues
+ * before any transport shutdown, a peer close can complete natively first. An
+ * adapter must therefore record its own transport facts separately and never
+ * derive one from the other. Deliberately NOT expressed through
+ * moq_transport_bridge_is_closed/is_fatal, which latch the BRIDGE's terminal on
+ * paths that need not have enqueued a session event.
+ *
+ * out_observed may be NULL. Pure read under caller-provided serialization.
+ * Private, lockstep adapter SPI, NOT application API.
+ */
+MOQ_API bool     moq_transport_bridge_terminal_facts(
+    const moq_transport_bridge_t *brg, bool *out_observed);
+
 MOQ_API size_t   moq_transport_bridge_stream_count(
     const moq_transport_bridge_t *brg);
 MOQ_API size_t   moq_transport_bridge_tombstone_count(

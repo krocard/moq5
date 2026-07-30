@@ -25,4 +25,23 @@
 MOQ_API uint64_t moq_wtquic_conn_event_progress(const moq_wtquic_conn_t *conn,
                                                 bool *out_has_events);
 
+/*
+ * Read the attached session's independent monotonic TERMINAL facts in ONE call
+ * across the DSO boundary (see moq_transport_bridge_terminal_facts):
+ *
+ *   returns        ENQUEUED -- MOQ_EVENT_SESSION_CLOSED was placed in the
+ *                  session's event queue.
+ *   *out_observed  OBSERVED -- a poll actually TRANSFERRED that event to the
+ *                  application. Queued-but-unpolled reads false.
+ *
+ * A managed facade gates reclamation on OBSERVED (plus its own transport facts
+ * and the application's acknowledgment) instead of on pump timing, which only
+ * ever proved that a pump ran. Their order relative to transport terminal is
+ * not fixed, so the facade must record its transport facts separately.
+ * out_observed may be NULL. Caller-serialized. Keeps the bridge pointer out of
+ * the facade exactly as the progress query above does.
+ */
+MOQ_API bool moq_wtquic_conn_terminal_facts(const moq_wtquic_conn_t *conn,
+                                            bool *out_observed);
+
 #endif /* MOQ_WTQUIC_ADAPTER_INTERNAL_H */

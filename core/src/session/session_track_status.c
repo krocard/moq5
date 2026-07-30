@@ -55,26 +55,6 @@ void ts_free_entry(moq_session_t *s, int slot)
 
 /* -- Copy namespace into output scratch ---------------------------- */
 
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* -- Inbound TRACK_STATUS request ---------------------------------- */
 
 moq_result_t session_core_on_track_status_request(moq_session_t *s,
@@ -163,16 +143,33 @@ moq_result_t session_core_on_track_status_request(moq_session_t *s,
         goto cleanup_all;
     }
 
-    /* Reserve this track's registry record and retain its canonical key
-     *. A full registry is NOT a session-fatal parser error: reject
-     * with REQUEST_ERROR(INTERNAL_ERROR 0x0) via the same pre-commit pattern as
-     * the pool-full branch above -- nothing is committed until the error is
-     * queued, WOULD_BLOCK leaves it replayable, and the session stays open. */
-    tskey = moq_build_track_key(s, &d->track_namespace, d->track_name,
-                                &tskey_len);
-    if (!tskey && tskey_len > 0) { result = MOQ_ERR_NOMEM; goto cleanup_all; }
-    tshist = track_hist_reserve(s, tskey, tskey_len);
-    if (!tshist) {
+    /* Reserve this track's registry record and retain its canonical key,
+     * selecting allocation-free first so a full registry and an allocation
+     * failure stay distinct. A full registry is NOT a session-fatal parser
+     * error: reject with REQUEST_ERROR(INTERNAL_ERROR 0x0) via the same
+     * pre-commit pattern as the pool-full branch above -- nothing is
+     * committed until the error is queued, WOULD_BLOCK leaves it
+     * replayable, and the session stays open. */
+    bool tshist_full = moq_track_hist_select(s, &d->track_namespace,
+                                             d->track_name) ==
+                       MOQ_TH_SEL_FULL;
+    if (!tshist_full) {
+        /* This path RETAINS the canonical key on the committed entry, so
+         * it is built here rather than inside the reserve helper. Its
+         * allocation failure is MOQ_ERR_NOMEM with no response queued.
+         * Registry-full was already excluded by the selection above, so a
+         * NULL reservation here can only be the record's key copy failing
+         * -- also MOQ_ERR_NOMEM, never the history-full rejection. */
+        tskey = moq_build_track_key(s, &d->track_namespace, d->track_name,
+                                    &tskey_len);
+        if (!tskey && tskey_len > 0) {
+            result = MOQ_ERR_NOMEM;
+            goto cleanup_all;
+        }
+        tshist = track_hist_reserve(s, tskey, tskey_len);
+        if (!tshist) { result = MOQ_ERR_NOMEM; goto cleanup_all; }
+    }
+    if (tshist_full) {
         if (reject_drain && s->drain_ref_count >= s->drain_ref_cap) {
             result = MOQ_ERR_WOULD_BLOCK;
             goto cleanup_all;
@@ -342,16 +339,27 @@ moq_result_t session_core_on_track_status_ok(moq_session_t *s,
      * a requester/relay can preserve received status metadata. */
     size_t scratch_saved = s->event_scratch_len;
     moq_bytes_t ev_props = {0};
+    /* Weigh the tail before copying: one larger than the whole arena can never
+     * be satisfied and ends the session, while one only the live tail cannot
+     * hold is retryable once the queue drains and the arena recycles. */
+    switch (event_scratch_classify_bytes(s, d->track_properties_len)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1, "event scratch permanently too small");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
     if (d->track_properties_len > 0) {
         ev_props.data = event_scratch_copy(s, d->track_properties,
                                      d->track_properties_len);
         ev_props.len = d->track_properties_len;
         if (!ev_props.data) {
+            /* The preflight said it fits: a failure here is an internal
+             * inconsistency with no unblock edge to wait on. */
             s->event_scratch_len = scratch_saved;
-            if (scratch_saved == 0)
-                return close_with_error(s, 0x1,
-                    "event scratch permanently too small");
-            return MOQ_ERR_BUFFER;
+            return close_with_error(s, 0x1,
+                "internal: event scratch preflight mismatch");
         }
     }
 
@@ -404,18 +412,27 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
         rc = session_core_emit_request_redirect(s,
             MOQ_REQUEST_FAMILY_TRACK_STATUS, e->handle._opaque, redirect,
             error_code, can_retry, retry_after_ms, reason, reason_len);
-        if (rc < 0) return rc;
+        /* The emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     } else {
         moq_bytes_t ev_reason = {0};
+        switch (event_scratch_classify_bytes(s, reason_len)) {
+        case MOQ_EVENT_SCRATCH_PERMANENT:
+            return close_with_error(s, 0x1,
+                "event scratch permanently too small");
+        case MOQ_EVENT_SCRATCH_BLOCKED:
+            return MOQ_ERR_WOULD_BLOCK;
+        case MOQ_EVENT_SCRATCH_FITS:
+            break;
+        }
         if (reason_len > 0) {
             ev_reason.data = event_scratch_copy(s, reason, reason_len);
             ev_reason.len = reason_len;
             if (!ev_reason.data) {
                 s->event_scratch_len = scratch_saved;
-                if (scratch_saved == 0)
-                    return close_with_error(s, 0x1,
-                        "event scratch permanently too small");
-                return MOQ_ERR_BUFFER;
+                return close_with_error(s, 0x1,
+                    "internal: event scratch preflight mismatch");
             }
         }
 

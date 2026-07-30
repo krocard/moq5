@@ -86,8 +86,11 @@ if(MOQ_BUILD_TESTS)
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     )
     target_compile_features(moq-core-test-internals PUBLIC c_std_11)
-    # White-box publisher admission counters for exactly-once retry tests.
-    # Compiled ONLY into this internals-only static lib -- never the shipping
-    # moq-core library/dylib (verified with nm in CI symbol-hygiene checks).
-    target_compile_definitions(moq-core-test-internals PRIVATE MOQ_PUB_TESTING)
+    # White-box instrumentation compiled ONLY into this internals-only static
+    # lib -- never the shipping moq-core library/dylib (verified with nm in CI
+    # symbol-hygiene checks): publisher admission counters for exactly-once
+    # retry tests, and deferred-completion sweep scan counters.
+    target_compile_definitions(moq-core-test-internals PRIVATE
+        MOQ_PUB_TESTING          # publisher admission counters
+        MOQ_SESSION_SWEEP_TESTING)  # sweep + budget-context instrumentation
 endif()

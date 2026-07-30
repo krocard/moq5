@@ -80,6 +80,12 @@ typedef struct {
      * classification and test stream-ID tracking). */
     void (*on_bidi_opened)(void *ctx, uint64_t stream_id);
     void (*on_uni_opened)(void *ctx, uint64_t stream_id);
+    /* Private (adapter-owned) notification: a LOCAL stop_sending cancelled our
+     * receive direction on this stream, so tracked receive state must be
+     * dropped (retained bytes must never be replayed for a stream the
+     * application just stopped). Invoked ONLY after picoquic_stop_sending
+     * returns success; a failed stop leaves receive state untouched. */
+    void (*on_local_stop_sending)(void *ctx, uint64_t stream_id);
     void *cb_ctx;
 
     /* App callback set on locally-created WT data streams so h3zero

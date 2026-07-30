@@ -718,6 +718,15 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                         (moq_bytes_t){ bad_msg, sizeof(bad_msg) }, rc);
 
             (*delivered)++;
+
+            /* Propagate a hard delivery error, exactly as the injected
+             * RESET/STOP faults above do. The malformed envelope's OWN
+             * effect is a protocol close, which the session reports as a
+             * successful transition, so this only surfaces genuine
+             * failures (an allocation failure inside the feed). Both
+             * trace records are emitted first, so the trace is identical
+             * either way. */
+            if (rc < 0) return rc;
         }
     }
 

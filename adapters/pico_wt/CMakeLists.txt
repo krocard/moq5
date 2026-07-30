@@ -367,6 +367,62 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     endif()
     add_test(NAME pico_wt_conformance COMMAND test_pico_wt_conformance)
     set_tests_properties(pico_wt_conformance PROPERTIES TIMEOUT 60)
+
+    # Inbound receive backpressure + capacity invariance. Needs the adapter's
+    # internal header for the per-stream receive state assertions.
+    add_executable(test_pico_wt_backpressure
+        tests/test_pico_wt_backpressure.c
+        tests/pico_wt_harness.c
+    )
+    target_include_directories(test_pico_wt_backpressure PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_backpressure PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+        OpenSSL::SSL OpenSSL::Crypto
+    )
+    target_compile_definitions(test_pico_wt_backpressure PRIVATE
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_backpressure PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_backpressure COMMAND test_pico_wt_backpressure)
+    set_tests_properties(pico_wt_backpressure PROPERTIES TIMEOUT 180)
+
+    # Receive-backpressure lifecycle: what happens to a paused stream on FIN,
+    # RESET, STOP_SENDING, teardown, and before the connection is READY.
+    # Recompiles the adapter sources so the test build can reach the
+    # MOQ_PICO_WT_TESTING dispatch hook. The hook is absent from the shipped
+    # library and no symbol is exported from it.
+    add_executable(test_pico_wt_rx_lifecycle
+        tests/test_pico_wt_rx_lifecycle.c
+        tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_rx_lifecycle PRIVATE
+        MOQ_PICO_WT_TESTING)
+    target_include_directories(test_pico_wt_rx_lifecycle PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_rx_lifecycle PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+        OpenSSL::SSL OpenSSL::Crypto
+    )
+    target_compile_definitions(test_pico_wt_rx_lifecycle PRIVATE
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_rx_lifecycle PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_rx_lifecycle COMMAND test_pico_wt_rx_lifecycle)
+    set_tests_properties(pico_wt_rx_lifecycle PROPERTIES TIMEOUT 180)
 endif()
 
 # -- Managed facade -------------------------------------------------

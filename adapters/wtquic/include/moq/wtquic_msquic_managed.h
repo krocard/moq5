@@ -384,10 +384,20 @@ MOQ_API moq_result_t moq_wtquic_msquic_lane_get_stats(
  * managed_adapter() returns the attach adapter (a moq_wtquic_conn_t), NOT a
  * managed-connection handle.
  *
- * A connection reaches its terminal and is reaped after the pump pass that
- * delivered its final events, so its memory may be reused: DO NOT retain a
- * conn handle, its session, or its adapter across pumps, and never touch a
- * connection from another lane's pump or an external thread. Per-connection
+ * WHEN A TERMINAL CONNECTION IS RECLAIMED depends on whether it ever had a MoQ
+ * session:
+ *   - a SESSION-BACKED server child stays linked and iterable -- possibly
+ *     across many later pumps -- until the application observes its
+ *     MOQ_EVENT_SESSION_CLOSED and then acknowledges it from an owning pump
+ *     callback (moq_wtquic_msquic_managed_conn_ack_terminal). Reclamation may
+ *     happen as soon as that acknowledging callback returns;
+ *   - a PRE-SESSION child (negotiation or setup failed before any session was
+ *     created) has no terminal event to observe and nothing to acknowledge; it
+ *     is reclaimed once its transport is terminal and quiesced.
+ * Either way its memory may then be reused: DO NOT retain a conn handle, its
+ * session, or its adapter across pumps, and never touch a connection from
+ * another lane's pump or an external thread. Acknowledgment does not change
+ * that -- the handles stay borrowed and pump-confined in every case. Per-connection
  * state that must outlive the connection belongs elsewhere (keyed by your own
  * id, not the handle address). The facade-level observations that ARE safe
  * from any thread are called out individually below (conn_count, drain, port,
@@ -416,6 +426,53 @@ MOQ_API void moq_wtquic_msquic_managed_conn_set_user(
     moq_wtquic_msquic_managed_conn_t *conn, void *user);
 MOQ_API void *moq_wtquic_msquic_managed_conn_user(
     const moq_wtquic_msquic_managed_conn_t *conn);
+
+/*
+ * Acknowledge a terminal SERVER child, so it may be reclaimed.
+ *
+ * THE ASSERTION. By calling this the application asserts that its terminal
+ * processing for this connection is COMPLETE, that the child no longer needs to
+ * remain iterable, and that it will not use the borrowed conn/session/adapter
+ * handles after the acknowledging callback returns. Independently owned
+ * application state and any moq_rcbuf_t the application retained are
+ * UNAFFECTED: nothing reference-counted is released by this call, and the
+ * handles above are borrowed views owned by the facade, not possessions. The
+ * assertion is not mechanically verifiable — the library records that it was
+ * made.
+ *
+ * WHEN IT MAY BE CALLED. Only from the owning lane's on_lane_pump, and only for
+ * a connection that callback was presented. The terminal event must ALREADY
+ * have been transferred to the application by a poll of this connection's
+ * session (MOQ_EVENT_SESSION_CLOSED): a queued-but-unpolled terminal is not
+ * enough, and neither is a completed transport shutdown. Because observation is
+ * a durable session fact rather than a queue read, the acknowledging callback
+ * need NOT be the one that polled — a later pump is fine.
+ *
+ * RESULTS.
+ *   MOQ_OK               accepted; also returned for a duplicate call while the
+ *                        handle is still valid in the current callback.
+ *   MOQ_ERR_INVAL        conn == NULL.
+ *   MOQ_ERR_WRONG_STATE  the single client connection (it is not reaped
+ *                        per-child); a different lane's callback; outside any
+ *                        callback; or the terminal has not been observed yet.
+ *
+ * HANDLE LIFETIME. The handle is valid only for the current callback. After a
+ * successful acknowledgment the connection may be reclaimed as soon as that
+ * callback returns — do not retain the pointer. A stale or released handle is
+ * invalid input: no rejection is promised and none is attempted.
+ *
+ * IF IT IS NEVER CALLED. A SESSION-BACKED terminal server child stays linked,
+ * iterable and counted against cfg.max_connections. It is never reclaimed
+ * because time passed, so once the reserve is exhausted new accepts are
+ * refused. A child whose negotiation or setup failed BEFORE any MoQ session was
+ * created is different: it has no terminal event to observe and nothing to
+ * acknowledge, and is reclaimed on native terminal plus quiescence alone. Forced
+ * facade teardown (stop()/destroy()) may still reclaim it without
+ * acknowledgment, behind the documented callback/pump exclusion barrier; that
+ * is the forced path, not the normal one.
+ */
+MOQ_API moq_result_t moq_wtquic_msquic_managed_conn_ack_terminal(
+    moq_wtquic_msquic_managed_conn_t *conn);
 
 /* Shut one connection's transport down (async, orderly); code is the
  * application close code. uint32_t — the WebTransport/wtquic close code is

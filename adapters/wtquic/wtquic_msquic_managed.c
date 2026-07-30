@@ -359,8 +359,33 @@ struct moq_wtquic_msquic_managed_conn {
                                                * converges instead of going live */
     bool logical_terminal;                    /* on_closed/refused/failed seen */
     bool transport_quiesced;                  /* on_transport_quiesced seen */
-    bool terminal_pump_seen;                  /* a pump presented it post-terminal;
-                                               * third condition of the reap gate */
+#if defined(MOQ_WTQ_MM_TESTING)
+    bool test_terminal_observed;              /* injected observation for a
+                                               * synthetic child with no session */
+#endif
+    bool session_backed;                      /* a MoQ session was published for
+                                               * this child. Durable: it stays
+                                               * true after reap nulls `session`,
+                                               * so the reap gate and the
+                                               * accounting cannot disagree about
+                                               * which contract applies. */
+#if defined(MOQ_WTQ_MM_TESTING)
+    bool terminal_hold_counted;               /* THIS child published a hold on
+                                               * the facade's terminal_held_count
+                                               * and has not withdrawn it. Written
+                                               * under the lane guard while m->mu
+                                               * is held, so a child only ever
+                                               * adds or removes its OWN hold. */
+#endif
+    bool app_terminal_acked;                  /* the app asserted, from this
+                                               * conn's owning lane callback, that
+                                               * its terminal processing is done,
+                                               * it no longer needs the child kept
+                                               * iterable, and it will not use the
+                                               * borrowed handles afterwards.
+                                               * Monotonic; libmoq records that the
+                                               * assertion was made, it cannot
+                                               * verify it. */
     bool close_pending;                       /* conn_close latched a close in the
                                                * pump; executed after the callback */
     uint32_t close_pending_code;              /* the app close code to apply */
@@ -368,13 +393,11 @@ struct moq_wtquic_msquic_managed_conn {
 
     /* Per-pump snapshot linkage. The pump captures this lane's live connections
      * into a chain (snap_next) at entry so iteration is stable even if an accept
-     * adds one mid-sweep; snap_terminal records the pre-callback terminal state;
-     * in_window gates the pump-confined accessors in O(1). A connection belongs
+     * adds one mid-sweep; in_window gates the pump-confined accessors in O(1). A connection belongs
      * to exactly one lane, so its own lane's (serialized) worker is the only
      * writer — this holds with lanes pumping concurrently, WITHOUT any per-lane
      * arrays (total O(max_connections), not O(lane_count * max_connections)). */
     struct moq_wtquic_msquic_managed_conn *snap_next;
-    bool snap_terminal;
     bool in_window;
     uint64_t pump_pre_token;                  /* event-progress token snapshot
                                                  taken before on_lane_pump, for
@@ -438,6 +461,30 @@ struct moq_wtquic_msquic_managed {
     uint32_t conn_count;                      /* live admitted (guarded by mu) */
     uint32_t rr_lane;                         /* round-robin cursor */
     bool refuse_admissions;                   /* drain/stop latched */
+
+    /* Terminal accounting. ALL of these are owned by `mu` and are only ever
+     * read or written with it held. The per-child facts they summarise live on
+     * the child and are owned by its lane guard, so the facade must never scan
+     * them: each lane transition publishes its effect here instead, under mu,
+     * in the established lane -> facade order.
+     *
+     * Each name states exactly what it counts -- in particular
+     * `transport_terminal_session_backed` counts a TRANSPORT terminal on a
+     * child that had a session, which is neither "the session terminal was
+     * enqueued" nor "it was observed". */
+#if defined(MOQ_WTQ_MM_TESTING)
+    /* Conservation evidence only. None of these has a production reader: the
+     * shipped facade's capacity behaviour rests on in_use / conn_count and the
+     * reap predicate, and there is no getter in the installed API. */
+    uint32_t terminal_held_count;             /* admitted children that are
+                                               * transport-terminal and not yet
+                                               * acknowledged: they hold their
+                                               * capacity slot by contract */
+    uint64_t st_transport_terminal_session_backed;
+    uint64_t st_ack_accepted;
+    uint64_t st_children_reaped;
+    uint64_t st_accepts_refused_terminal_held;
+#endif
     uint16_t bound_port;                      /* listener's bound port */
 
 
@@ -573,6 +620,66 @@ static bool mm_conn_in_window(const moq_wtquic_msquic_managed_conn_t *conn)
 {
     return mm_pump_win != NULL && conn != NULL &&
            mm_pump_win->lane == conn->lane && conn->in_window;
+}
+
+/* Latch a child's transport-terminal fact exactly once.
+ *
+ * Counted ONLY for a session-backed SERVER child. A pre-session failure has no
+ * session terminal to enqueue, observe or acknowledge, and the single client is
+ * excluded from live reap, so neither belongs in the admission-capacity
+ * relation.
+ *
+ * The facts are unordered: an application that closes the session locally can
+ * reach acknowledgment BEFORE the transport terminal arrives. So the hold is
+ * published only if this child has not already been acknowledged, and it is
+ * recorded per child -- a child never adds or removes a hold belonging to
+ * another. That keeps
+ *     terminal_held_count == #{ server children with terminal && !acknowledged }
+ * true at every observable point, in either order. */
+static void mm_mark_logical_terminal(moq_wtquic_msquic_managed_conn_t *c)
+{
+    if (c->logical_terminal)
+        return;                        /* monotonic: latch once */
+    if (!c->session_backed || c == c->m->client) {
+        c->logical_terminal = true;    /* outside the capacity accounting */
+        return;
+    }
+    /* The fact and its aggregate move together, in ONE m->mu section taken
+     * while the lane guard is already held (lane -> facade order). Publishing
+     * the flag first would let an admission or a snapshot that takes m->mu see
+     * a child that is terminal while terminal_held_count still says otherwise.
+     * Nothing may observe the child fact and the aggregate disagreeing. */
+    pthread_mutex_lock(&c->m->mu);
+    c->logical_terminal = true;
+#if defined(MOQ_WTQ_MM_TESTING)
+    c->m->st_transport_terminal_session_backed++;
+    if (!c->app_terminal_acked) {
+        c->m->terminal_held_count++;
+        c->terminal_hold_counted = true;
+    }
+#endif
+    pthread_mutex_unlock(&c->m->mu);
+}
+
+/* The session-terminal OBSERVED fact for a child, read through the private
+ * adapter SPI so this facade never touches the bridge or the public session API.
+ * A child with no adapter yet (pre-session failure) has no session fact to
+ * observe and reads false — that path reclaims through its own route. */
+static bool mm_conn_terminal_observed(const moq_wtquic_msquic_managed_conn_t *c)
+{
+    bool observed = false;
+    if (c == NULL)
+        return false;
+#if defined(MOQ_WTQ_MM_TESTING)
+    /* Synthetic children in the white-box tests have no adapter/session to poll;
+     * the injected fact stands in for a real observation. */
+    if (c->test_terminal_observed)
+        return true;
+#endif
+    if (c->adapter == NULL)
+        return false;
+    (void)moq_wtquic_conn_terminal_facts(c->adapter, &observed);
+    return observed;
 }
 
 /* True when this thread is inside a lane pump window OR an on_activity callback,
@@ -720,7 +827,7 @@ static void mm_establish_fail(moq_wtquic_msquic_managed_t *m,
                               moq_wtquic_msquic_managed_conn_t *c,
                               wtq_session_t *s)
 {
-    c->logical_terminal = true;
+    mm_mark_logical_terminal(c);
     if (m->perspective == MOQ_PERSPECTIVE_CLIENT)
         mm_latch_fatal(m, 0);
 #if defined(MOQ_WTQ_MM_TESTING)
@@ -743,7 +850,7 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
      * live session the barrier would then have to wait on. The scan closes an
      * already-established child's ws; this closes a late-establishing one. */
     if (c->quiesce_requested) {
-        c->logical_terminal = true;
+        mm_mark_logical_terminal(c);
 #if defined(MOQ_WTQ_MM_TESTING)
         if (g_mm_test_release == NULL)
 #endif
@@ -791,6 +898,7 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
     }
 
     c->session = ms;
+    c->session_backed = true;
     c->adapter = mc;
     c->version = version;
     /* Server: retain + store the backend-owned session so teardown can close it
@@ -827,7 +935,7 @@ static void mm_on_refused(wtq_session_t *s, uint16_t http_status, void *user)
 {
     (void)s;
     moq_wtquic_msquic_managed_conn_t *c = user;
-    c->logical_terminal = true;
+    mm_mark_logical_terminal(c);
     /* refusal happens before establishment: terminal with no MoQ session */
     if (c->m->perspective == MOQ_PERSPECTIVE_CLIENT)
         mm_latch_fatal(c->m, http_status);
@@ -838,7 +946,7 @@ static void mm_on_failed(wtq_session_t *s, wtq_connect_failure_t why,
 {
     (void)s;
     moq_wtquic_msquic_managed_conn_t *c = user;
-    c->logical_terminal = true;
+    mm_mark_logical_terminal(c);
     if (c->m->perspective == MOQ_PERSPECTIVE_CLIENT)
         mm_latch_fatal(c->m, (uint64_t)why);
 }
@@ -858,7 +966,7 @@ static void mm_on_closed(wtq_session_t *s, uint32_t code,
 {
     moq_wtquic_msquic_managed_conn_t *c = user;
     moq_wtquic_msquic_managed_t *m = c->m;
-    c->logical_terminal = true;
+    mm_mark_logical_terminal(c);
     /* forward to the adapter (drives the bridge close) before latching the
      * facade terminal, mirroring the established-session teardown order */
     if (c->adapter != NULL)
@@ -980,6 +1088,20 @@ static void mm_reap_conn(moq_wtquic_msquic_managed_conn_t *c)
 {
     if (c == NULL)
         return;
+    /* Withdraw a still-published hold. Normal reclamation cannot reach here
+     * with one (acknowledgment clears it and is a gate condition), but the
+     * forced stop/destroy path tears down unacknowledged terminal children --
+     * and the count must stay exactly #{server children with terminal && !ack}
+     * at every observable point, including during teardown. */
+#if defined(MOQ_WTQ_MM_TESTING)
+    if (c->terminal_hold_counted) {
+        pthread_mutex_lock(&c->m->mu);
+        c->terminal_hold_counted = false;
+        if (c->m->terminal_held_count > 0)
+            c->m->terminal_held_count--;
+        pthread_mutex_unlock(&c->m->mu);
+    }
+#endif
     if (c->adapter != NULL) {
         moq_wtquic_conn_destroy(c->adapter);
         c->adapter = NULL;
@@ -1203,6 +1325,14 @@ static wtq_result_t mm_accept_prepare(void *luser,
      * and the admission count. */
     pthread_mutex_lock(&m->mu);
     if (m->refuse_admissions || m->conn_count >= m->max_connections) {
+        /* Attribute the refusal when the reserve is consumed by children that
+         * are terminal but not yet acknowledged: that is the intentional
+         * resource hold the acknowledgment contract creates, and it must be
+         * observable rather than looking like ordinary load. */
+#if defined(MOQ_WTQ_MM_TESTING)
+        if (!m->refuse_admissions && m->terminal_held_count > 0)
+            m->st_accepts_refused_terminal_held++;
+#endif
         pthread_mutex_unlock(&m->mu);
         out->accepted = false; /* refuse -> QUIC_STATUS_CONNECTION_REFUSED */
         return WTQ_OK;
@@ -1377,7 +1507,6 @@ static uint64_t mm_service_pass(moq_wtquic_msquic_managed_conn_t *head, int phas
  * pump runs pump → post-service only (the transport that nudged already
  * serviced). Returns the pump callback's rc.
  *
- * terminal_pump_seen is recorded ONLY for connections that were ALREADY terminal
  * when the callback ran — those the app actually observed this pump. A terminal
  * caused DURING the callback or the service pass (e.g. a latched close, or a
  * synchronous on_closed from the service) was not observed and requires another
@@ -1391,7 +1520,7 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
 
     /* Build a stable snapshot CHAIN of this lane's connections, under m->mu (the
      * lane->facade lock order mm_on_quiesced uses). Each conn links via snap_next
-     * and records its pre-callback terminal state (snap_terminal); in_window
+     * in_window
      * gates the accessors. A concurrent accept adds to the pool, not this frozen
      * chain, so the sweep is stable — and there is no per-lane array, so total
      * scratch stays O(max_connections) even with lanes pumping concurrently. */
@@ -1416,7 +1545,6 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
      * logical_terminal is only mutated under the lane guard (held here), so this
      * is stable. */
     for (c = head; c != NULL; c = c->snap_next) {
-        c->snap_terminal = c->logical_terminal;
         c->in_window = true;
         /* Snapshot the event-progress token BEFORE the app pump so the
          * post-service re-drive check spans the whole pump+service cycle. */
@@ -1501,23 +1629,26 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
             mm_lane_arm(lane);
     }
 
-    /* record the third reap-gate condition ONLY for connections the app saw as
-     * terminal this pump (terminal before the callback ran) */
-    for (c = head; c != NULL; c = c->snap_next)
-        if (c->snap_terminal)
-            c->terminal_pump_seen = true;
-
     /*
      * Live reap (SERVER children only — the single client is held for global
-     * teardown). A child is reaped once it satisfies ALL THREE reap-gate
+     * teardown). A child is reaped once it satisfies ALL FOUR reap-gate
      * conditions, which can only be true now, under this lane's guard, AFTER the
-     * callback and the service pass above:
+     * callback and the service pass above. They are INDEPENDENT facts, deliberately
+     * not one ordinal state: the session terminal can be enqueued before or after
+     * the transport reaches its terminal.
      *   logical_terminal   — its transport reached a terminal;
      *   transport_quiesced — SHUTDOWN_COMPLETE fired, so no callback can still
      *                        touch its adapter/session (this is what makes the
      *                        destroy below safe under the guard);
-     *   terminal_pump_seen — a completed pump presented it terminal, so the app
-     *                        observed its final events.
+     *   session terminal OBSERVED — the app actually polled
+     *                        MOQ_EVENT_SESSION_CLOSED, read through the private
+     *                        adapter SPI. A queued-but-unpolled terminal does not
+     *                        count;
+     *   app_terminal_acked — the app asserted its terminal processing is done
+     *                        and it will not use the borrowed handles again.
+     * Reclamation depends on these facts alone. A pump merely having presented
+     * the child while it was terminal proves nothing -- an application that
+     * never polls satisfies that -- so it is not part of the gate.
      * Its adapter/session are destroyed and the retained wtquic ref released
      * BEFORE the slot is published free; the count/in_use are then updated under
      * m->mu in lane->facade order, waking any drain/stop waiter. The slot is
@@ -1533,10 +1664,23 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
     uint64_t next_dl = UINT64_MAX;
     for (c = head; c != NULL;) {
         moq_wtquic_msquic_managed_conn_t *next = c->snap_next;
+        /* Two reclamation contracts, by whether the child ever had a MoQ
+         * session:
+         *   session-backed  F1 && F2 && F4 && F5 -- the application must have
+         *                   observed the terminal event and acknowledged;
+         *   pre-session     F1 && F2 only -- a child whose negotiation or setup
+         *                   failed before any session existed has no terminal
+         *                   event to observe and nothing to acknowledge, so
+         *                   requiring them would strand its capacity slot until
+         *                   facade shutdown. */
         if (c != m->client && c->logical_terminal && c->transport_quiesced &&
-            c->terminal_pump_seen) {
+            (!c->session_backed ||
+             (mm_conn_terminal_observed(c) && c->app_terminal_acked))) {
             mm_reap_conn(c); /* destroy adapter/session, release ws — pre-publish */
             pthread_mutex_lock(&m->mu);
+#if defined(MOQ_WTQ_MM_TESTING)
+            m->st_children_reaped++;
+#endif
             if (m->conn_count > 0)
                 m->conn_count--;
             c->in_use = false; /* slot reusable: do not touch c after this */
@@ -1807,7 +1951,7 @@ static void mm_run_teardown(moq_wtquic_msquic_managed_t *m)
      *   4. run the TRANSPORT BARRIER with no lane guard held (env_close joins
      *      the MsQuic workers — no callback can then hold an adapter).
      *   5. exactly ONE explicit coordinator-owned final pump per lane, so the
-     *      app sees each connection's final events and terminal_pump_seen is
+     *      app sees each connection's final events and acknowledgment is
      *      recorded.
      *   6. REAP the adapters/sessions.
      * This runs BEFORE the coordinator publishes `stopped`, so no pump or
@@ -2372,6 +2516,121 @@ void *moq_wtquic_msquic_managed_conn_user(
     return mm_conn_in_window(conn) ? conn->user : NULL;
 }
 
+/*
+ * Terminal acknowledgment. From this connection's OWNING lane callback the
+ * application asserts that its terminal processing for the connection is
+ * COMPLETE, that it no longer needs the child kept iterable, and that it will
+ * not use the borrowed conn/session/adapter handles after the callback returns.
+ * Those handles are borrowed views owned by the facade, not reference-counted
+ * possessions -- nothing is released here, and independently owned objects the
+ * application obtained earlier are unaffected. libmoq records that the
+ * assertion was made; it cannot verify it.
+ *
+ * NULL is MOQ_ERR_INVAL. The single client connection is not reaped per-child
+ * and is excluded from admission-capacity accounting, so it is
+ * MOQ_ERR_WRONG_STATE. Accepted only for a connection in the caller's own pump window
+ * (mm_conn_in_window), which is exactly "this connection, during its owning
+ * lane callback" -- so no lane-plus-token parameter is needed and the handle
+ * cannot escape the callback. Before the session terminal has been OBSERVED
+ * (polled, not merely queued) this returns MOQ_ERR_WRONG_STATE even when the
+ * transport is fully terminal. A repeat call in the same valid callback is
+ * harmless and returns MOQ_OK. A stale or released handle is invalid input:
+ * no rejection is promised and none is attempted.
+ *
+ * See moq/wtquic_msquic_managed.h for the normative contract.
+ */
+moq_result_t moq_wtquic_msquic_managed_conn_ack_terminal(
+    moq_wtquic_msquic_managed_conn_t *conn)
+{
+    if (conn == NULL)
+        return MOQ_ERR_INVAL;
+    if (!mm_conn_in_window(conn))
+        return MOQ_ERR_WRONG_STATE;
+    if (conn == conn->m->client)
+        return MOQ_ERR_WRONG_STATE;   /* the client is not reaped per-child */
+    if (conn->app_terminal_acked)
+        return MOQ_OK;                 /* idempotent within this callback */
+    if (!mm_conn_terminal_observed(conn))
+        return MOQ_ERR_WRONG_STATE;    /* queued is not observed */
+    /* Same rule as the terminal latch: the flag and the aggregate move in one
+     * m->mu section, so no observer sees an acknowledged child still counted. */
+    pthread_mutex_lock(&conn->m->mu);
+    conn->app_terminal_acked = true;
+#if defined(MOQ_WTQ_MM_TESTING)
+    conn->m->st_ack_accepted++;
+#endif
+    /* Withdraw only THIS child's hold, and only if it published one. An
+     * acknowledgment that arrives before the transport terminal has none to
+     * withdraw; the later terminal then sees the child already acknowledged and
+     * publishes nothing. */
+#if defined(MOQ_WTQ_MM_TESTING)
+    if (conn->terminal_hold_counted) {
+        conn->terminal_hold_counted = false;
+        if (conn->m->terminal_held_count > 0)
+            conn->m->terminal_held_count--;
+    }
+#endif
+    pthread_mutex_unlock(&conn->m->mu);
+    return MOQ_OK;
+}
+
+#if defined(MOQ_WTQ_MM_TESTING)
+void moq_wtquic_msquic_managed_test_mark_logical_terminal(
+    moq_wtquic_msquic_managed_t *m, void *conn)
+{
+    (void)m;
+    if (conn != NULL)
+        mm_mark_logical_terminal((moq_wtquic_msquic_managed_conn_t *)conn);
+}
+
+void moq_wtquic_msquic_managed_test_mark_terminal_observed(
+    moq_wtquic_msquic_managed_t *m, void *conn)
+{
+    (void)m;
+    if (conn != NULL)
+        ((moq_wtquic_msquic_managed_conn_t *)conn)->test_terminal_observed = true;
+}
+
+bool moq_wtquic_msquic_managed_test_conn_terminal_observed(
+    const moq_wtquic_msquic_managed_conn_t *conn)
+{
+    return mm_conn_terminal_observed(conn);
+}
+
+bool moq_wtquic_msquic_managed_test_conn_acked(
+    const moq_wtquic_msquic_managed_conn_t *conn)
+{
+    return conn != NULL && conn->app_terminal_acked;
+}
+
+void moq_wtquic_msquic_managed_test_terminal_counters(
+    moq_wtquic_msquic_managed_t *m,
+    uint64_t *out_transport_terminal_session_backed, uint64_t *out_ack_accepted,
+    uint64_t *out_children_reaped, uint64_t *out_accepts_refused_terminal_held,
+    uint32_t *out_terminal_held_now)
+{
+    uint64_t tt = 0, ack = 0, reap = 0, refused = 0;
+    uint32_t held = 0;
+    if (m != NULL) {
+        /* every one of these is owned by mu: take it, exactly as the
+         * admission path and the lane transitions do */
+        pthread_mutex_lock(&m->mu);
+        tt = m->st_transport_terminal_session_backed;
+        ack = m->st_ack_accepted;
+        reap = m->st_children_reaped;
+        refused = m->st_accepts_refused_terminal_held;
+        held = m->terminal_held_count;
+        pthread_mutex_unlock(&m->mu);
+    }
+    if (out_transport_terminal_session_backed)
+        *out_transport_terminal_session_backed = tt;
+    if (out_ack_accepted) *out_ack_accepted = ack;
+    if (out_children_reaped) *out_children_reaped = reap;
+    if (out_accepts_refused_terminal_held) *out_accepts_refused_terminal_held = refused;
+    if (out_terminal_held_now) *out_terminal_held_now = held;
+}
+#endif /* MOQ_WTQ_MM_TESTING */
+
 void moq_wtquic_msquic_managed_conn_close(
     moq_wtquic_msquic_managed_conn_t *conn, uint32_t code)
 {
@@ -2733,18 +2992,20 @@ void moq_wtquic_msquic_managed_test_mark_quiesced(
     mm_on_quiesced(NULL, conn);
 }
 
-/* Read a child's three reap-gate conditions. */
+/* Read a child's reap-gate facts: the two transport facts plus whether it is
+ * session-backed (which selects the session-backed or pre-session contract).
+ * Observation and acknowledgment have their own accessors. */
 void moq_wtquic_msquic_managed_test_conn_gate(
     void *conn, bool *out_logical_terminal, bool *out_transport_quiesced,
-    bool *out_terminal_pump_seen)
+    bool *out_session_backed)
 {
     const moq_wtquic_msquic_managed_conn_t *c = conn;
     if (out_logical_terminal != NULL)
         *out_logical_terminal = c != NULL && c->logical_terminal;
     if (out_transport_quiesced != NULL)
         *out_transport_quiesced = c != NULL && c->transport_quiesced;
-    if (out_terminal_pump_seen != NULL)
-        *out_terminal_pump_seen = c != NULL && c->terminal_pump_seen;
+    if (out_session_backed != NULL)
+        *out_session_backed = c != NULL && c->session_backed;
 }
 
 /* Whether a child has a close latched but not yet executed by a pump. */
@@ -2808,6 +3069,7 @@ void moq_wtquic_msquic_managed_test_set_conn_established(
         return;
     c->ws = ws;
     c->session = session;
+    c->session_backed = (session != NULL);
 }
 
 /* A connection's published wtquic handle, read from the connection directly

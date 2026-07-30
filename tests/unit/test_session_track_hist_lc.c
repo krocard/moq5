@@ -1658,12 +1658,826 @@ static void test_inbound_cap_exhaustion(moq_version_t ver)
     MOQ_TEST_CHECK(as.balance == 0);
 }
 
+/* -- Track-history tri-state reservation --------------------------- */
+
+/* Fail the Nth allocation (1-indexed), pass everything else. */
+typedef struct { int64_t balance; int count; int fail_at; } th_alloc_state_t;
+
+static void *th_alloc(size_t n, void *ctx)
+{
+    th_alloc_state_t *s = (th_alloc_state_t *)ctx;
+    s->count++;
+    if (s->fail_at && s->count == s->fail_at) return NULL;
+    void *p = malloc(n);
+    if (p) s->balance++;
+    return p;
+}
+static void *th_realloc(void *p, size_t o, size_t n, void *ctx)
+{
+    th_alloc_state_t *s = (th_alloc_state_t *)ctx;
+    (void)o;
+    if (n == 0) { if (p) { s->balance--; free(p); } return NULL; }
+    s->count++;
+    if (s->fail_at && s->count == s->fail_at) return NULL;
+    void *q = realloc(p, n);
+    if (q && !p) s->balance++;
+    return q;
+}
+static void th_free(void *p, size_t n, void *ctx)
+{
+    th_alloc_state_t *s = (th_alloc_state_t *)ctx;
+    (void)n;
+    if (p) { s->balance--; free(p); }
+}
+static moq_alloc_t th_allocator(th_alloc_state_t *s)
+{ moq_alloc_t a = { s, th_alloc, th_realloc, th_free }; return a; }
+
+/* Count SEND_BIDI_STREAM actions on `ref` carrying a d18 REQUEST_ERROR,
+ * plus the TOTAL number of actions drained -- so "exactly one
+ * REQUEST_ERROR and nothing else" is actually measured. */
+static void th_count_request_errors(moq_session_t *s, moq_stream_ref_t ref,
+                                    int *out_errs, int *out_total)
+{
+    int errs = 0, total = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) == 1) {
+        total++;
+        if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+            a.u.send_bidi_stream.stream_ref._v == ref._v) {
+            moq_buf_reader_t rr;
+            moq_buf_reader_init(&rr, a.u.send_bidi_stream.data,
+                                a.u.send_bidi_stream.len);
+            moq_control_envelope_t env;
+            if (moq_d18_decode_envelope(&rr, &env) == MOQ_OK &&
+                env.msg_type == MOQ_D18_REQUEST_ERROR)
+                errs++;
+        }
+        moq_action_cleanup(&a);
+    }
+    if (out_errs) *out_errs = errs;
+    if (out_total) *out_total = total;
+}
+
+/* After a hard failure on a draft-18 request-stream family, the request
+ * owner must be fully retired: the stream ref resolves to nothing and no
+ * subscription / publication / track-status slot is left occupied.
+ * Retirement is enforced by the request-stream handler, which frees a
+ * still-receiving staging slot on ANY hard failure
+ * (session_subscribe.c's `if (rc < 0) { if (receiving) sub_free_entry }`),
+ * so this pins the invariant across the whole inbound path rather than a
+ * single core handler's cleanup label. Returns the failed-check count. */
+static int th_owner_retired(moq_session_t *s, moq_stream_ref_t ref)
+{
+    int failures = 0;
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    MOQ_TEST_CHECK_EQ_INT((int)ep.kind, (int)MOQ_REQ_NONE);
+    for (size_t i = 0; i < s->sub_cap; i++)
+        MOQ_TEST_CHECK(s->subs[i].state == MOQ_SUB_FREE);
+    for (size_t i = 0; i < s->pub_cap; i++)
+        MOQ_TEST_CHECK(s->publishes[i].state == MOQ_PUB_FREE);
+    for (size_t i = 0; i < s->ts_cap; i++)
+        MOQ_TEST_CHECK(s->track_statuses[i].state == MOQ_TS_FREE);
+    return failures;
+}
+
+/* A FRAGMENTED draft-18 SUBSCRIBE: the head arrives without FIN (creating
+ * a real staging owner registered by stream ref), then the tail completes
+ * it. Returns the tail feed's result. */
+static moq_result_t feed_d18_subscribe_split(moq_session_t *s,
+                                             moq_stream_ref_t ref,
+                                             const char *track,
+                                             th_alloc_state_t *as,
+                                             int fail_ordinal_after_head)
+{
+    uint8_t buf[128]; moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_bytes_t tn = { (const uint8_t *)track, strlen(track) };
+    moq_d18_msg_params_t mp = {0};
+    if (moq_d18_encode_subscribe(&w, 0, &ns, tn, &mp) < 0)
+        return MOQ_ERR_INTERNAL;
+    size_t total = moq_buf_writer_offset(&w);
+    size_t head = total / 2;
+    moq_result_t rc = moq_session_on_bidi_stream_bytes(s, ref, buf, head,
+                                                       false, 0);
+    if (rc < 0) return rc;
+
+    /* The head must have created a REAL staging owner, otherwise the
+     * post-failure retirement check would pass without any owner
+     * transition having occurred: the stream ref resolves to a
+     * SUBSCRIPTION endpoint, its slot is valid and RECVING_REQUEST, and
+     * the head bytes are retained on that entry. */
+    {
+        moq_request_endpoint_t ep =
+            request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep.kind, (int)MOQ_REQ_SUBSCRIPTION);
+        MOQ_TEST_CHECK(ep.slot >= 0 && (size_t)ep.slot < s->sub_cap);
+        if (ep.kind == MOQ_REQ_SUBSCRIPTION && ep.slot >= 0 &&
+            (size_t)ep.slot < s->sub_cap) {
+            moq_sub_entry_t *e = &s->subs[ep.slot];
+            MOQ_TEST_CHECK_EQ_INT((int)e->state,
+                                  (int)MOQ_SUB_RECVING_REQUEST);
+            MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, head);
+            MOQ_TEST_CHECK(e->req_recv_buf != NULL &&
+                           memcmp(e->req_recv_buf, buf, head) == 0);
+        }
+    }
+
+    if (as && fail_ordinal_after_head > 0)
+        as->fail_at = as->count + fail_ordinal_after_head;
+    rc = moq_session_on_bidi_stream_bytes(s, ref, buf + head, total - head,
+                                          true, 0);
+    if (as) as->fail_at = 0;
+    return rc;
+}
+
+/* Count occupied registry slots. */
+static size_t th_used(moq_session_t *s)
+{
+    size_t n = 0;
+    if (!s->track_hist) return 0;
+    for (size_t i = 0; i < s->th_cap; i++)
+        if (s->track_hist[i].in_use) n++;
+    return n;
+}
+
+/* Total refs held across the registry. */
+static uint32_t th_refs(moq_session_t *s)
+{
+    uint32_t r = 0;
+    if (!s->track_hist) return 0;
+    for (size_t i = 0; i < s->th_cap; i++)
+        if (s->track_hist[i].in_use) r += s->track_hist[i].refs;
+    return r;
+}
+
+/* Count queued REQUEST_ERROR responses (bidi or control) and any events. */
+static void th_drain_counts(moq_session_t *s, int *out_actions, int *out_events)
+{
+    int na = 0, ne = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) == 1) { na++; moq_action_cleanup(&a); }
+    moq_event_t e;
+    while (moq_session_poll_events(s, &e, 1) == 1) { ne++; moq_event_cleanup(&e); }
+    if (out_actions) *out_actions = na;
+    if (out_events) *out_events = ne;
+}
+
+/* The pure comparator agrees with the built-key path, validates bounds, and
+ * never over-reads a truncated or malformed stored key. */
+static void test_track_key_pure_comparator(void)
+{
+    th_alloc_state_t as = {0};
+    moq_alloc_t alloc = th_allocator(&as);
+    moq_session_t *s = d18_server_ex(&alloc, 4, 0, true);
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) return;
+
+    /* Multi-part namespace with an EMPTY component and an empty name. */
+    moq_bytes_t parts[3] = {
+        MOQ_BYTES_LITERAL("live"),
+        { NULL, 0 },
+        MOQ_BYTES_LITERAL("cam2"),
+    };
+    moq_namespace_t ns = { parts, 3 };
+    moq_bytes_t name = MOQ_BYTES_LITERAL("hi");
+
+    size_t klen = 0;
+    uint8_t *key = moq_build_track_key(s, &ns, name, &klen);
+    MOQ_TEST_CHECK(key != NULL);
+    if (!key) { moq_session_destroy(s); return; }
+
+    /* Agreement with the built-key representation. */
+    MOQ_TEST_CHECK(moq_track_key_matches(key, klen, &ns, name));
+
+    /* Every single-field perturbation fails to match. */
+    moq_bytes_t other_name = MOQ_BYTES_LITERAL("h");
+    MOQ_TEST_CHECK(!moq_track_key_matches(key, klen, &ns, other_name));
+    moq_namespace_t short_ns = { parts, 2 };
+    MOQ_TEST_CHECK(!moq_track_key_matches(key, klen, &short_ns, name));
+    moq_bytes_t alt_parts[3] = { MOQ_BYTES_LITERAL("live"),
+                                 { NULL, 0 },
+                                 MOQ_BYTES_LITERAL("cam3") };
+    moq_namespace_t alt_ns = { alt_parts, 3 };
+    MOQ_TEST_CHECK(!moq_track_key_matches(key, klen, &alt_ns, name));
+
+    /* TRUNCATION at every length: never matches, never over-reads (ASan
+     * would trap a read past the shortened copy). */
+    for (size_t cut = 0; cut < klen; cut++) {
+        uint8_t *frag = (uint8_t *)malloc(cut ? cut : 1);
+        MOQ_TEST_CHECK(frag != NULL);
+        if (!frag) break;
+        if (cut) memcpy(frag, key, cut);
+        MOQ_TEST_CHECK(!moq_track_key_matches(frag, cut, &ns, name));
+        free(frag);
+    }
+    /* A trailing byte past the exact encoding never matches either. */
+    {
+        uint8_t *longer = (uint8_t *)malloc(klen + 1);
+        MOQ_TEST_CHECK(longer != NULL);
+        if (longer) {
+            memcpy(longer, key, klen);
+            longer[klen] = 0x00;
+            MOQ_TEST_CHECK(!moq_track_key_matches(longer, klen + 1, &ns, name));
+            free(longer);
+        }
+    }
+    /* A malformed stored key whose declared part length exceeds the blob. */
+    {
+        uint8_t bad[8] = { 1, 0xFF, 0xFF, 'a', 'b', 0, 0, 0 };
+        moq_bytes_t bp = MOQ_BYTES_LITERAL("ab");
+        moq_namespace_t bns = { &bp, 1 };
+        MOQ_TEST_CHECK(!moq_track_key_matches(bad, sizeof(bad), &bns,
+                                              MOQ_BYTES_LITERAL("")));
+    }
+    /* The empty identity matches only its CANONICAL encoding -- three
+     * bytes: [count 0][u16-be name length 0]. A NULL/zero-length blob is
+     * not that encoding and must never match. */
+    {
+        moq_namespace_t empty_ns = { NULL, 0 };
+        moq_bytes_t empty_name = { NULL, 0 };
+        size_t eklen = 0;
+        uint8_t *ekey = moq_build_track_key(s, &empty_ns, empty_name, &eklen);
+        MOQ_TEST_CHECK(ekey != NULL);
+        MOQ_TEST_CHECK_EQ_SIZE(eklen, (size_t)3);
+        if (ekey) {
+            MOQ_TEST_CHECK(moq_track_key_matches(ekey, eklen, &empty_ns,
+                                                 empty_name));
+            s->alloc.free(ekey, eklen, s->alloc.ctx);
+        }
+        MOQ_TEST_CHECK(!moq_track_key_matches(NULL, 0, &empty_ns, empty_name));
+        MOQ_TEST_CHECK(!moq_track_key_matches(key, klen, &empty_ns,
+                                              empty_name));
+    }
+
+    /* Selector agreement with moq_build_track_key + track_hist_find for a
+     * live record. */
+    MOQ_TEST_CHECK(moq_track_hist_select(s, &ns, name) ==
+                   MOQ_TH_SEL_FREE_SLOT);
+    MOQ_TEST_CHECK(track_hist_find(s, key, klen) == NULL);
+    moq_track_hist_t *rec = NULL;
+    MOQ_TEST_CHECK(track_hist_reserve_selected(s, &ns, name, &rec) == MOQ_OK);
+    MOQ_TEST_CHECK(rec != NULL);
+    MOQ_TEST_CHECK(track_hist_find(s, key, klen) == rec);
+    MOQ_TEST_CHECK(track_hist_find_id(s, &ns, name) == rec);
+    MOQ_TEST_CHECK(moq_track_hist_select(s, &ns, name) ==
+                   MOQ_TH_SEL_EXISTING);
+    /* An existing record's reservation takes a ref rather than a slot. */
+    size_t used_before = th_used(s);
+    moq_track_hist_t *again = NULL;
+    MOQ_TEST_CHECK(track_hist_reserve_selected(s, &ns, name, &again) == MOQ_OK);
+    MOQ_TEST_CHECK(again == rec);
+    MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used_before);
+    MOQ_TEST_CHECK_EQ_INT((int)rec->refs, 2);
+    track_hist_release(s, rec);
+    track_hist_release(s, rec);
+
+    s->alloc.free(key, klen, s->alloc.ctx);
+    moq_session_destroy(s);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+/*
+ * The registry-full rejection and an allocation failure are DISTINCT on all
+ * three inbound paths: a full registry emits exactly one REQUEST_ERROR and
+ * keeps the session open; a failed record key copy returns exact
+ * MOQ_ERR_NOMEM with no response queued and nothing mutated.
+ */
+static void test_track_hist_tristate_subscribe(void)
+{
+    /* Full registry: one REQUEST_ERROR, session open, no history change. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 1);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        moq_bytes_t p; moq_namespace_t ns = ns1(&p, "live");
+        MOQ_TEST_CHECK(moq_session_note_object_published(
+            s, &ns, MOQ_BYTES_LITERAL("seed"), 1, 0) == MOQ_OK);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        th_drain_counts(s, NULL, NULL);
+
+        MOQ_TEST_CHECK(feed_d18_subscribe(
+            s, moq_stream_ref_from_u64(4), "x", /*fin*/true) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int errs = 0, total = 0;
+        th_count_request_errors(s, moq_stream_ref_from_u64(4), &errs, &total);
+        MOQ_TEST_CHECK_EQ_INT(errs, 1);      /* exactly one REQUEST_ERROR */
+        MOQ_TEST_CHECK_EQ_INT(total, 1);     /* and no other action */
+        { int ne = 0; moq_event_t e;
+          while (moq_session_poll_events(s, &e, 1) == 1) { ne++;
+              moq_event_cleanup(&e); }
+          MOQ_TEST_CHECK_EQ_INT(ne, 0); }
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* Funded ordinal 1 -- the entry's RETAINED identity key -- fails:
+     * exact NOMEM, no response, nothing mutated, owner retired. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        size_t scratch = s->event_scratch_len;
+        int64_t bal = as.balance;
+
+        as.fail_at = as.count + 1;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)feed_d18_subscribe(s, moq_stream_ref_from_u64(4), "x",
+                                    /*fin*/true),
+            (int)MOQ_ERR_NOMEM);
+        as.fail_at = 0;
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int na1 = 0, ne1 = 0;
+        th_drain_counts(s, &na1, &ne1);
+        MOQ_TEST_CHECK_EQ_INT(na1, 0);
+        MOQ_TEST_CHECK_EQ_INT(ne1, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);   /* no record created */
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs);
+        MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, scratch);
+        MOQ_TEST_CHECK(as.balance == bal);
+        MOQ_TEST_CHECK(th_owner_retired(s, moq_stream_ref_from_u64(4)) == 0);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* FRAGMENTED feed: the head creates a real staging owner registered by
+     * stream ref; the tail's funded allocation then fails. The owner must
+     * be fully retired -- no registry key, no staging slot left behind. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(4);
+
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)feed_d18_subscribe_split(s, ref, "x", &as, 1),
+            (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int nas = 0, nes = 0;
+        th_drain_counts(s, &nas, &nes);
+        MOQ_TEST_CHECK_EQ_INT(nas, 0);
+        MOQ_TEST_CHECK_EQ_INT(nes, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK(th_owner_retired(s, ref) == 0);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* Record key failure (ordinal 2): exact NOMEM, no response, nothing
+     * mutated. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        size_t scratch = s->event_scratch_len;
+        int64_t bal = as.balance;
+
+        /* Funded execution allocates exactly twice: ordinal 1 is the
+         * entry's RETAINED identity key, ordinal 2 is the REGISTRY
+         * RECORD's key -- the allocation that used to be reported as
+         * "track history full". Arm ordinal 2. */
+        as.fail_at = as.count + 2;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)feed_d18_subscribe(s, moq_stream_ref_from_u64(4), "x",
+                                    /*fin*/true),
+            (int)MOQ_ERR_NOMEM);
+        as.fail_at = 0;
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int na = 0, ne = 0;
+        th_drain_counts(s, &na, &ne);
+        MOQ_TEST_CHECK_EQ_INT(na, 0);              /* no response queued */
+        MOQ_TEST_CHECK_EQ_INT(ne, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);  /* registry unchanged */
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs);
+        MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, scratch);
+        MOQ_TEST_CHECK(as.balance == bal);
+        MOQ_TEST_CHECK(th_owner_retired(s, moq_stream_ref_from_u64(4)) == 0);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+}
+
+/* Feed a raw draft-18 PUBLISH on a fresh request bidi. */
+static moq_result_t feed_d18_publish_id(moq_session_t *s, moq_stream_ref_t ref,
+                                        const char *track, uint64_t alias,
+                                        uint64_t request_id, bool fin)
+{
+    uint8_t buf[160]; moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_d18_publish_t pm = {0};
+    pm.request_id = request_id;
+    pm.track_namespace = (moq_namespace_t){ parts, 1 };
+    pm.track_name = (moq_bytes_t){ (const uint8_t *)track, strlen(track) };
+    pm.track_alias = alias;
+    if (moq_d18_encode_publish(&w, &pm) < 0) return MOQ_ERR_INTERNAL;
+    return moq_session_on_bidi_stream_bytes(s, ref, buf,
+                                            moq_buf_writer_offset(&w), fin, 0);
+}
+
+static moq_result_t feed_d18_publish(moq_session_t *s, moq_stream_ref_t ref,
+                                     const char *track, uint64_t alias,
+                                     bool fin)
+{ return feed_d18_publish_id(s, ref, track, alias, 0, fin); }
+
+/* Feed a raw draft-18 TRACK_STATUS request on a fresh request bidi. */
+static moq_result_t feed_d18_track_status(moq_session_t *s,
+                                          moq_stream_ref_t ref,
+                                          const char *track, bool fin)
+{
+    uint8_t buf[160]; moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_bytes_t tn = { (const uint8_t *)track, strlen(track) };
+    moq_d18_msg_params_t mp = {0};
+    if (moq_d18_encode_track_status(&w, 0, &ns, tn, &mp) < 0)
+        return MOQ_ERR_INTERNAL;
+    return moq_session_on_bidi_stream_bytes(s, ref, buf,
+                                            moq_buf_writer_offset(&w), fin, 0);
+}
+
+/* Feed a draft-18 SUBSCRIBE with an explicit request id (client ids are
+ * even and must arrive in sequence). */
+static moq_result_t feed_d18_subscribe_id(moq_session_t *s,
+                                          moq_stream_ref_t ref,
+                                          const char *track,
+                                          uint64_t request_id, bool fin)
+{
+    uint8_t buf[128]; moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_bytes_t tn = { (const uint8_t *)track, strlen(track) };
+    moq_d18_msg_params_t mp = {0};
+    if (moq_d18_encode_subscribe(&w, request_id, &ns, tn, &mp) < 0)
+        return MOQ_ERR_INTERNAL;
+    return moq_session_on_bidi_stream_bytes(s, ref, buf,
+                                            moq_buf_writer_offset(&w), fin, 0);
+}
+
+/* SUBSCRIBE selection is allocation-free: neither the duplicate rejection
+ * nor the history-full rejection performs a single allocator call. (Both
+ * are selected REJECTIONS, so each still commits its inbound request id
+ * and auth transaction and queues one REQUEST_ERROR -- what they never do
+ * is allocate.) */
+static void test_track_hist_selection_allocation_free(void)
+{
+    /* Duplicate rejection: a live publisher-role subscription for the same
+     * identity already exists, so the second SUBSCRIBE is refused -- with
+     * zero allocations. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        MOQ_TEST_CHECK(feed_d18_subscribe(s, moq_stream_ref_from_u64(4), "x",
+                                          /*fin*/true) == MOQ_OK);
+        th_drain_counts(s, NULL, NULL);
+        int calls = as.count;
+        int64_t bal = as.balance;
+
+        /* A second SUBSCRIBE for the SAME track (next client request id):
+         * duplicate. */
+        MOQ_TEST_CHECK(feed_d18_subscribe_id(s, moq_stream_ref_from_u64(8),
+                                             "x", 2, /*fin*/true) == MOQ_OK);
+        int errs = 0, total = 0;
+        th_count_request_errors(s, moq_stream_ref_from_u64(8), &errs, &total);
+        MOQ_TEST_CHECK_EQ_INT(errs, 1);
+        MOQ_TEST_CHECK_EQ_INT(as.count, calls);   /* zero allocator calls */
+        MOQ_TEST_CHECK(as.balance == bal);
+        th_drain_counts(s, NULL, NULL);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* History-full rejection: the registry is full, so the request is
+     * refused before the identity key is ever built -- zero allocations. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 1);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        moq_bytes_t p; moq_namespace_t ns = ns1(&p, "live");
+        MOQ_TEST_CHECK(moq_session_note_object_published(
+            s, &ns, MOQ_BYTES_LITERAL("seed"), 1, 0) == MOQ_OK);
+        th_drain_counts(s, NULL, NULL);
+        int calls = as.count;
+        int64_t bal = as.balance;
+
+        MOQ_TEST_CHECK(feed_d18_subscribe(s, moq_stream_ref_from_u64(4), "x",
+                                          /*fin*/true) == MOQ_OK);
+        int errs = 0, total = 0;
+        th_count_request_errors(s, moq_stream_ref_from_u64(4), &errs, &total);
+        MOQ_TEST_CHECK_EQ_INT(errs, 1);
+        MOQ_TEST_CHECK_EQ_INT(as.count, calls);   /* zero allocator calls */
+        MOQ_TEST_CHECK(as.balance == bal);
+        th_drain_counts(s, NULL, NULL);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+}
+
+/* PUBLISH: history-full rejects with exactly one REQUEST_ERROR and stays
+ * AHEAD of the later duplicate-alias close; a record key-copy failure is
+ * exact NOMEM with no response. */
+static void test_track_hist_tristate_publish(void)
+{
+    /* Full registry AND a genuine duplicate track alias: the history-full
+     * rejection must win, keeping the session open. A first PUBLISH takes
+     * registry slot 1 and OWNS alias 7; a seeded record fills slot 2; the
+     * second PUBLISH then collides on alias 7 with a full registry.
+     * Moving the duplicate-alias close ahead of the history decision
+     * closes the session and fails this. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 2);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        MOQ_TEST_CHECK(feed_d18_publish(s, moq_stream_ref_from_u64(4), "a",
+                                        7, /*fin*/true) == MOQ_OK);
+        /* The first PUBLISH surfaced a request event and owns alias 7. */
+        {   int npub = 0; moq_event_t e;
+            while (moq_session_poll_events(s, &e, 1) == 1) {
+                if (e.kind == MOQ_EVENT_PUBLISH_REQUEST) npub++;
+                moq_event_cleanup(&e); }
+            MOQ_TEST_CHECK_EQ_INT(npub, 1); }
+        moq_bytes_t p; moq_namespace_t ns = ns1(&p, "live");
+        MOQ_TEST_CHECK(moq_session_note_object_published(
+            s, &ns, MOQ_BYTES_LITERAL("seed"), 1, 0) == MOQ_OK);
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        MOQ_TEST_CHECK_EQ_SIZE(used, (size_t)2);   /* registry now full */
+
+        MOQ_TEST_CHECK(feed_d18_publish_id(s, moq_stream_ref_from_u64(8), "x",
+                                           7, 2, /*fin*/true) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int errs = 0, total = 0;
+        th_count_request_errors(s, moq_stream_ref_from_u64(8), &errs, &total);
+        MOQ_TEST_CHECK_EQ_INT(errs, 1);      /* exactly one REQUEST_ERROR */
+        MOQ_TEST_CHECK_EQ_INT(total, 1);     /* and no other action */
+        { int ne = 0; moq_event_t e;
+          while (moq_session_poll_events(s, &e, 1) == 1) { ne++;
+              moq_event_cleanup(&e); }
+          MOQ_TEST_CHECK_EQ_INT(ne, 0); }
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* An EXISTING record's reservation performs NO allocation at all: with
+     * the same track already in the registry, arming the next allocation
+     * cannot turn the reservation into a failure. (The collapsed form built
+     * a throwaway canonical key here, so this ordinal used to fail.) */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        moq_bytes_t p; moq_namespace_t ns = ns1(&p, "live");
+        MOQ_TEST_CHECK(moq_session_note_object_published(
+            s, &ns, MOQ_BYTES_LITERAL("x"), 3, 1) == MOQ_OK);
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        int64_t bal = as.balance;
+        int calls = as.count;
+
+        moq_result_t rc = feed_d18_publish(s, moq_stream_ref_from_u64(4),
+                                           "x", 7, /*fin*/true);
+        MOQ_TEST_CHECK(rc != MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        /* EXISTING: exactly ZERO allocator attempts for the whole
+         * reservation -- the record-owned key is built only when a slot
+         * is actually filled. */
+        MOQ_TEST_CHECK_EQ_INT(as.count, calls);
+        MOQ_TEST_CHECK(as.balance == bal + 0);
+        /* The existing record gained exactly one ref and no slot. */
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs + 1);
+        th_drain_counts(s, NULL, NULL);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* Record key-copy failure -> exact NOMEM, no response, nothing mutated. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        size_t scratch = s->event_scratch_len;
+        int64_t bal = as.balance;
+
+        /* FREE_SLOT: the reservation performs exactly ONE allocator
+         * attempt -- the record-owned canonical key, built directly (no
+         * temporary-key-plus-copy pair). Arming it is therefore the
+         * complete NOMEM case for this path. */
+        int calls0 = as.count;
+        as.fail_at = as.count + 1;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)feed_d18_publish(s, moq_stream_ref_from_u64(4), "x", 7,
+                                  /*fin*/true),
+            (int)MOQ_ERR_NOMEM);
+        as.fail_at = 0;
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int na = 0, ne = 0;
+        th_drain_counts(s, &na, &ne);
+        MOQ_TEST_CHECK_EQ_INT(na, 0);
+        MOQ_TEST_CHECK_EQ_INT(ne, 0);
+        MOQ_TEST_CHECK_EQ_INT(as.count, calls0 + 1);   /* exactly one */
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs);
+        MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, scratch);
+        MOQ_TEST_CHECK(as.balance == bal);
+        MOQ_TEST_CHECK(th_owner_retired(s, moq_stream_ref_from_u64(4)) == 0);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+}
+
+/* TRACK_STATUS: history-full rejects with one REQUEST_ERROR; the retained
+ * canonical key and the record ref are released exactly once when a later
+ * event-scratch copy blocks. */
+static void test_track_hist_tristate_track_status(void)
+{
+    /* Full registry -> REQUEST_ERROR, session open. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 1);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        moq_bytes_t p; moq_namespace_t ns = ns1(&p, "live");
+        MOQ_TEST_CHECK(moq_session_note_object_published(
+            s, &ns, MOQ_BYTES_LITERAL("seed"), 1, 0) == MOQ_OK);
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+
+        MOQ_TEST_CHECK(feed_d18_track_status(s, moq_stream_ref_from_u64(4),
+                                             "x", /*fin*/true) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int errs = 0, total = 0;
+        th_count_request_errors(s, moq_stream_ref_from_u64(4), &errs, &total);
+        MOQ_TEST_CHECK_EQ_INT(errs, 1);      /* exactly one REQUEST_ERROR */
+        MOQ_TEST_CHECK_EQ_INT(total, 1);     /* and no other action */
+        { int ne = 0; moq_event_t e;
+          while (moq_session_poll_events(s, &e, 1) == 1) { ne++;
+              moq_event_cleanup(&e); }
+          MOQ_TEST_CHECK_EQ_INT(ne, 0); }
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* Canonical-key allocation failure -> exact NOMEM, no response. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        int64_t bal = as.balance;
+
+        as.fail_at = as.count + 1;      /* the retained canonical key */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)feed_d18_track_status(s, moq_stream_ref_from_u64(4), "x",
+                                       /*fin*/true),
+            (int)MOQ_ERR_NOMEM);
+        as.fail_at = 0;
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int na = 0, ne = 0;
+        th_drain_counts(s, &na, &ne);
+        MOQ_TEST_CHECK_EQ_INT(na, 0);
+        MOQ_TEST_CHECK_EQ_INT(ne, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK(as.balance == bal);
+        MOQ_TEST_CHECK(th_owner_retired(s, moq_stream_ref_from_u64(4)) == 0);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* Record key-copy failure (ordinal 2) -> exact NOMEM, no response,
+     * and the retained canonical key from ordinal 1 is released exactly
+     * once (allocator balance returns to its pre-call value). */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_t *s = d18_server_established(&alloc, 4);
+        MOQ_TEST_CHECK(s != NULL);
+        if (!s) return;
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        int64_t bal = as.balance;
+
+        as.fail_at = as.count + 2;      /* the record's key copy */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)feed_d18_track_status(s, moq_stream_ref_from_u64(4), "x",
+                                       /*fin*/true),
+            (int)MOQ_ERR_NOMEM);
+        as.fail_at = 0;
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        int na = 0, ne = 0;
+        th_drain_counts(s, &na, &ne);
+        MOQ_TEST_CHECK_EQ_INT(na, 0);
+        MOQ_TEST_CHECK_EQ_INT(ne, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs);
+        MOQ_TEST_CHECK(as.balance == bal);   /* key released exactly once */
+        MOQ_TEST_CHECK(th_owner_retired(s, moq_stream_ref_from_u64(4)) == 0);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* A later event-scratch block releases the ref AND the retained key
+     * exactly once: a tiny scratch arena makes the namespace copy fail
+     * after the reservation succeeded. */
+    {
+        th_alloc_state_t as = {0};
+        moq_alloc_t alloc = th_allocator(&as);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        cfg.version = MOQ_VERSION_DRAFT_18;
+        cfg.max_track_history_records = 4;
+        cfg.output_scratch_size = 8;     /* too small for the event copies */
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+        if (!s) return;
+        moq_session_start(s, 0);
+        { moq_action_t a;
+          while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+        { uint8_t setup[32]; moq_buf_writer_t w;
+          moq_buf_writer_init(&w, setup, sizeof(setup));
+          moq_d18_encode_setup(&w);
+          moq_session_on_control_bytes(s, setup, moq_buf_writer_offset(&w), 0); }
+        th_drain_counts(s, NULL, NULL);
+        size_t used = th_used(s);
+        uint32_t refs = th_refs(s);
+        int64_t bal = as.balance;
+
+        int calls_before = as.count;
+        moq_result_t rc = feed_d18_track_status(s, moq_stream_ref_from_u64(4),
+                                                "trackname", /*fin*/true);
+        /* BOTH key allocations ran before the scratch copy failed: the
+         * retained canonical key and the registry record's key copy. */
+        MOQ_TEST_CHECK_EQ_INT(as.count - calls_before, 2);
+        /* The reservation succeeded, so the scratch shortfall is the
+         * PERMANENT one against an empty arena: a funded terminal close,
+         * reported as MOQ_OK, releasing both the ref and the key. */
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK_EQ_SIZE(th_used(s), used);
+        MOQ_TEST_CHECK_EQ_INT((int)th_refs(s), (int)refs);
+        MOQ_TEST_CHECK(as.balance == bal);   /* both keys released once */
+        th_drain_counts(s, NULL, NULL);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+}
+
 int main(void)
 {
     /* Static ABI assertions for the two new public event details. */
     MOQ_TEST_CHECK(sizeof(moq_subscription_update_ok_event_t) <= MOQ_EVENT_DETAIL_MAX);
     MOQ_TEST_CHECK(sizeof(moq_publication_update_ok_event_t) <= MOQ_EVENT_DETAIL_MAX);
 
+    test_track_key_pure_comparator();
+    test_track_hist_tristate_subscribe();
+    test_track_hist_selection_allocation_free();
+    test_track_hist_tristate_publish();
+    test_track_hist_tristate_track_status();
     test_varint_boundary();
     test_d18_subscribe_reject_fin_accounting();
     test_d18_subscribe_pool_exhaustion();

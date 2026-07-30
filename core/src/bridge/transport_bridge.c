@@ -474,6 +474,19 @@ bool moq_transport_bridge_has_events(const moq_transport_bridge_t *b)
     return moq_session_has_events(b->session);
 }
 
+bool moq_transport_bridge_terminal_facts(const moq_transport_bridge_t *b,
+                                          bool *out_observed)
+{
+    /* Both facts come from the session in one call so an adapter cannot sample
+     * them at two different instants. A bridge with no session has neither. */
+    bool enqueued = b != NULL && b->session != NULL &&
+                    moq_session_terminal_enqueued(b->session);
+    if (out_observed)
+        *out_observed = b != NULL && b->session != NULL &&
+                        moq_session_terminal_observed(b->session);
+    return enqueued;
+}
+
 size_t moq_transport_bridge_stream_count(const moq_transport_bridge_t *b)
 {
     if (!b) return 0;
@@ -1866,19 +1879,38 @@ done:
 
 /* -- Inbound: retry ------------------------------------------------- */
 
-static bool bridge_retry_inbound_pending(moq_transport_bridge_t *b,
-                                          uint64_t now_us)
+/*
+ * Outcome of one inbound-retry pass.
+ *
+ * `progress` and `rc` are separate because they answer different questions and
+ * a single value cannot carry both: a pass can make durable progress AND then
+ * suspend, and a suspension is neither progress nor an error. Collapsing them
+ * would force suspension to masquerade as one of MOQ_OK, MOQ_ERR_WOULD_BLOCK
+ * (which the caller reads as retained inbound backpressure) or a fatal.
+ */
+typedef struct {
+    bool         progress;   /* at least one durable advance this pass */
+    moq_result_t rc;         /* MOQ_OK, or MOQ_SESSION_SUSPENDED */
+} bridge_inbound_outcome_t;
+
+static bridge_inbound_outcome_t bridge_retry_inbound_pending(
+    moq_transport_bridge_t *b, uint64_t now_us)
 {
     bool progress = false;
 
     if (b->pending_control) {
         moq_result_t rc = moq_session_process_pending(b->session, now_us);
+        /* Tested before both the WOULD_BLOCK and the negative branches: this is
+         * neither retained backpressure nor an error, and every field below
+         * must keep the value it had so the retry survives to the next pass. */
+        if (rc == MOQ_SESSION_SUSPENDED)
+            return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
         if (rc != MOQ_ERR_WOULD_BLOCK) {
             b->pending_control = false;
             progress = true;
             if (rc < 0) {
                 bridge_set_fatal(b, 0x1);
-                return progress;
+                return (bridge_inbound_outcome_t){ progress, MOQ_OK };
             }
             if (b->pending_control_fin) {
                 b->pending_control_fin = false;
@@ -1908,12 +1940,17 @@ static bool bridge_retry_inbound_pending(moq_transport_bridge_t *b,
                 rc = moq_session_on_data_bytes(
                     b->session, e->ref, NULL, 0, false, now_us);
 
+            /* Leaves pending_retry set and the scan stopped: a spent budget
+             * makes every later owner suspend too, so continuing would only
+             * repeat the work. */
+            if (rc == MOQ_SESSION_SUSPENDED)
+                return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
             if (rc != MOQ_ERR_WOULD_BLOCK) {
                 e->pending_retry = false;
                 progress = true;
                 if (rc < 0) {
                     bridge_set_fatal(b, 0x1);
-                    return progress;
+                    return (bridge_inbound_outcome_t){ progress, MOQ_OK };
                 }
                 /* If the drain dropped the stream (binding gone) and no FIN is
                  * pending, discard further inbound bytes rather than reopen a
@@ -1954,6 +1991,10 @@ static bool bridge_retry_inbound_pending(moq_transport_bridge_t *b,
             else
                 rc = moq_session_on_data_reset(
                     b->session, e->ref, e->pending_reset_code, now_us);
+            /* pending_reset and its code stay intact, and the entry stays
+             * active: the reset has not been delivered. */
+            if (rc == MOQ_SESSION_SUSPENDED)
+                return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
             if (rc != MOQ_ERR_WOULD_BLOCK) {
                 e->pending_reset = false;
                 progress = true;
@@ -1973,6 +2014,9 @@ static bool bridge_retry_inbound_pending(moq_transport_bridge_t *b,
                       b->session, e->ref, e->pending_stop_code, now_us)
                 : moq_session_on_data_stop(
                       b->session, e->ref, e->pending_stop_code, now_us);
+            /* pending_stop and its code stay intact. */
+            if (rc == MOQ_SESSION_SUSPENDED)
+                return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
             if (rc != MOQ_ERR_WOULD_BLOCK) {
                 e->pending_stop = false;
                 progress = true;
@@ -1982,18 +2026,18 @@ static bool bridge_retry_inbound_pending(moq_transport_bridge_t *b,
         }
     }
 
-    return progress;
+    return (bridge_inbound_outcome_t){ progress, MOQ_OK };
 }
 
 /* -- Service -------------------------------------------------------- */
 
-moq_result_t moq_transport_bridge_service(
-    moq_transport_bridge_t *b, uint64_t now_us)
+/* The service pass itself. Kept separate from the public entry point so the
+ * budgeted-advance context is entered and left exactly once, no matter which of
+ * this function's several returns is taken. */
+static moq_result_t bridge_service_pass(
+    moq_transport_bridge_t *b, uint64_t now_us, bool *suspended)
 {
-    if (!b) return MOQ_ERR_INVAL;
-    if (b->fatal) return MOQ_ERR_INTERNAL;
-    if (b->closed) return MOQ_OK;
-
+    *suspended = false;
     for (;;) {
         /* Deferred close has priority — runs even if writes are blocked.
          * Session has already been notified; this closes the transport. */
@@ -2039,8 +2083,16 @@ moq_result_t moq_transport_bridge_service(
 
         /* Step 3: retry inbound pending */
         if (!b->fatal && !b->closed) {
-            bool inbound_progress = bridge_retry_inbound_pending(b, now_us);
-            if (inbound_progress && !b->fatal && !b->closed)
+            bridge_inbound_outcome_t in = bridge_retry_inbound_pending(b, now_us);
+            /* Suspension is neither progress nor an error: it ends the pass
+             * with every pending flag left intact for the continuation. The
+             * flag is what distinguishes this exit from a drained pass, which
+             * leaves by the same break. */
+            if (in.rc == MOQ_SESSION_SUSPENDED) {
+                *suspended = true;
+                break;
+            }
+            if (in.progress && !b->fatal && !b->closed)
                 continue;
         }
 
@@ -2049,6 +2101,13 @@ moq_result_t moq_transport_bridge_service(
             uint64_t dl = moq_session_next_deadline_us(b->session);
             if (dl != UINT64_MAX && dl <= now_us) {
                 moq_result_t trc = moq_session_tick(b->session, now_us);
+                /* A suspended tick is not fatal. The deadline stays due, so
+                 * the obligation survives as session state and a later pass
+                 * runs it exactly once. */
+                if (trc == MOQ_SESSION_SUSPENDED) {
+                    *suspended = true;
+                    break;
+                }
                 if (trc < 0 && trc != MOQ_ERR_WOULD_BLOCK) {
                     bridge_set_fatal(b, 0x1);
                     return MOQ_ERR_INTERNAL;
@@ -2062,6 +2121,45 @@ moq_result_t moq_transport_bridge_service(
     }
 
     return b->fatal ? MOQ_ERR_INTERNAL : MOQ_OK;
+}
+
+moq_result_t moq_transport_bridge_service(
+    moq_transport_bridge_t *b, uint64_t now_us)
+{
+    if (!b) return MOQ_ERR_INVAL;
+    if (b->fatal) return MOQ_ERR_INTERNAL;
+    if (b->closed) return MOQ_OK;
+
+    /* No budget context: the wired session entry points take the unlimited
+     * advance, which drives the sweep to completion and cannot suspend. A
+     * UINT32_MAX context would still be a FINITE budget and would route them
+     * through the budgeted path, so this entry would gain a suspension it has
+     * no way to report. */
+    bool suspended = false;
+    return bridge_service_pass(b, now_us, &suspended);
+}
+
+moq_result_t moq_transport_bridge_service_budgeted(
+    moq_transport_bridge_t *b, uint64_t now_us, uint32_t sweep_budget,
+    moq_bridge_budgeted_result_t *out)
+{
+    if (!out) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    if (!b) return MOQ_ERR_INVAL;
+    if (b->fatal) return MOQ_ERR_INTERNAL;
+    if (b->closed) return MOQ_OK;
+
+    /* Paired by construction: one enter, one leave, whichever return the pass
+     * takes. Leaving the context is what keeps a later ordinary session call
+     * from inheriting the budget and observing the suspension sentinel. */
+    session_budget_enter(b->session, sweep_budget);
+    bool suspended = false;
+    moq_result_t rc = bridge_service_pass(b, now_us, &suspended);
+    /* Read before leaving: leave zeroes the remaining budget. */
+    out->sweep_spent = sweep_budget - session_budget_remaining(b->session);
+    out->suspended = suspended;
+    session_budget_leave(b->session);
+    return rc;
 }
 
 /* -- Inbound: control bytes ----------------------------------------- */

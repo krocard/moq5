@@ -126,28 +126,6 @@ void fetch_on_request_goaway_release(moq_session_t *s, int slot)
     e->generation++;
 }
 
-/* -- Copy namespace parts into output scratch ---------------------- */
-
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* -- Inbound FETCH handler ----------------------------------------- */
 
 /* Emit a core-generated FETCH REQUEST_ERROR, routed like the auth-reject path: on
@@ -218,7 +196,17 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
         return close_with_error(s, 0x3, "fetch pool full");
 
     /* Build entry-owned token storage in temporaries first, so a copy failure
-     * leaves the fetch slot untouched (still FREE) and the request fully retryable. */
+     * leaves the fetch slot untouched (still FREE) and commits nothing: no
+     * entry, no registry re-key, no request id, no event.
+     *
+     * That failure is MOQ_ERR_NOMEM -- a hard error, since no drain makes memory
+     * appear -- and the request-stream handler frees the still-receiving staging
+     * slot on any hard failure, so the request's buffered bytes go with it. An
+     * empty re-feed therefore has nothing to resume; recovery is re-delivery of
+     * the whole request, which admits cleanly because no request id was
+     * committed. A caller driving the session through the transport bridge gets
+     * a connection fatal instead, deliberately: only MOQ_ERR_WOULD_BLOCK is a
+     * wait there. */
     size_t n = d->token_count;
     moq_resolved_token_t tmp[MOQ_DECODED_MAX_TOKENS];
     bool tmp_staged[MOQ_DECODED_MAX_TOKENS];
@@ -245,7 +233,10 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
                     if (tmp_staged[j] && !took_from_d[j])
                         s->alloc.free((void *)(uintptr_t)tmp[j].token_value.data,
                                       tmp[j].token_value.len, s->alloc.ctx);
-                return MOQ_ERR_WOULD_BLOCK;   /* nothing mutated: retryable */
+                /* Every copy taken so far is released and no entry, registry key
+                 * or event exists yet -- but no drain makes memory appear, so
+                 * this is an error rather than a wait. */
+                return MOQ_ERR_NOMEM;
             }
             memcpy(copy, d->tokens[i].token_value.data, len);
             tmp[i].token_value.data = copy;
@@ -798,7 +789,9 @@ moq_result_t session_core_on_fetch_error(moq_session_t *s, int slot,
         rc = session_core_emit_request_redirect(s, MOQ_REQUEST_FAMILY_FETCH,
             s->fetches[slot].handle._opaque, redirect, error_code,
             can_retry, retry_after_ms, reason, reason_len);
-        if (rc < 0) return rc;
+        /* The emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     } else {
         moq_bytes_t ev_reason = {0};
         if (reason_len > 0) {

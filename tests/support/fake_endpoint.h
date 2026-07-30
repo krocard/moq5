@@ -59,6 +59,7 @@ typedef struct {
     bool      block_reset;        /* reset_stream -> WOULD_BLOCK        */
     bool      block_stop;         /* stop_sending -> WOULD_BLOCK        */
     bool      fail_stop;          /* stop_sending -> ERROR (partial)    */
+    bool      fail_write;         /* write -> ERROR                     */
     bool      drop_datagram;
     int       block_count;
 
@@ -100,6 +101,7 @@ static moq_transport_result_t fake_write(void *ctx, uint64_t stream_id,
                                           bool fin)
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
+    if (ep->fail_write) return MOQ_TRANSPORT_ERROR;
     if (ep->block_write) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     if (ep->count < FAKE_EP_MAX_OPS) {
         fake_op_t *o = &ep->ops[ep->count++];

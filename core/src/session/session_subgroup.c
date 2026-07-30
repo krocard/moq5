@@ -119,17 +119,34 @@ void sg_recompute_deadline(moq_session_t *s)
     s->subgroup_deadline_us = d;
 }
 
-void sg_reap_terminal(moq_session_t *s)
+/*
+ * Reap CLOSING/RESETTING subgroups, resumably.
+ *
+ * Resumes at s->sweep_slot and charges one unit per ELIGIBLE reap; slots in
+ * any other state cost nothing and never suspend the scan. Returns true when
+ * the pool retired. The subgroup deadline is recomputed only after the
+ * COMPLETE scan -- recomputing from a partial scan could drop a wake that a
+ * not-yet-visited entry still needs.
+ */
+bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
 {
-    bool reaped = false;
-    for (size_t i = 0; i < s->sg_cap; i++) {
-        if (s->subgroups[i].state == MOQ_SG_CLOSING ||
-            s->subgroups[i].state == MOQ_SG_RESETTING) {
-            sg_free_entry(i, s->subgroups);
-            reaped = true;
+    for (; s->sweep_slot < s->sg_cap; s->sweep_slot++) {
+        size_t i = s->sweep_slot;
+        if (s->subgroups[i].state != MOQ_SG_CLOSING &&
+            s->subgroups[i].state != MOQ_SG_RESETTING)
+            continue;                      /* costs nothing; never suspends */
+        if (budget) {
+            if (*budget == 0) return false;
+            (*budget)--;
         }
+        sg_free_entry(i, s->subgroups);
+        s->sweep_reaped_subgroup = true;
     }
-    if (reaped) sg_recompute_deadline(s);
+    if (s->sweep_reaped_subgroup) {
+        sg_recompute_deadline(s);
+        s->sweep_reaped_subgroup = false;
+    }
+    return true;
 }
 
 /* -- Subgroup handle helpers --------------------------------------- */
@@ -1226,7 +1243,8 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_find_by_stream_ref(s, stream_ref);

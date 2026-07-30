@@ -129,13 +129,35 @@ static moq_result_t rx_try_stop(moq_session_t *s, int slot);
  * sweep terminates with a clean scan. Returns MOQ_OK when no live bound
  * stream remains; MOQ_ERR_WOULD_BLOCK when action capacity ran out (the
  * remaining streams are taken up by the next reap pass). */
-moq_result_t session_stop_bound_streams(moq_session_t *s,
-                                        moq_subscription_t sub,
-                                        moq_publication_t pub)
+
+/*
+ * Resumable form: each STOP attempt costs one budget unit and the scan position
+ * persists in s->sweep_rx_pos, so a suspended sweep resumes mid-pool instead of
+ * re-attempting streams it already stopped. Non-matching and inactive slots are
+ * free and never suspend.
+ *
+ * Returns MOQ_SESSION_SUSPENDED when the budget ran out with matching streams
+ * still live. That is distinct from MOQ_ERR_WOULD_BLOCK, which continues to
+ * mean action capacity was exhausted and the remaining streams pass to the next
+ * reap.
+ */
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* Counts entries into the bound-stream scan. Present only in the test-internals
+ * archive; the shipped library has no such symbol. */
+uint64_t session_stop_scan_entries;
+#endif
+
+moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
+                                                  moq_subscription_t sub,
+                                                  moq_publication_t pub,
+                                                  uint32_t *budget)
 {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    session_stop_scan_entries++;
+#endif
     for (;;) {
-        bool found = false;
-        for (size_t i = 0; i < s->rx_cap; i++) {
+        for (; s->sweep_rx_pos < s->rx_cap; s->sweep_rx_pos++) {
+            size_t i = s->sweep_rx_pos;
             moq_rx_stream_t *rx = &s->rx_streams[i];
             if (!rx->active) continue;
             bool match = false;
@@ -148,10 +170,21 @@ moq_result_t session_stop_bound_streams(moq_session_t *s,
                 moq_publication_eq(rx->pub_handle, pub))
                 match = true;
             if (!match) continue;
-            found = true;
+
+            if (budget) {
+                if (*budget == 0) return MOQ_SESSION_SUSPENDED;
+                (*budget)--;
+            }
+            s->sweep_rx_found = true;
             moq_result_t rc = rx_try_stop(s, (int)i);
             if (rc < 0) return rc;
         }
+        /* A completed scan that stopped nothing means no bound stream remains.
+         * Otherwise rescan from zero: stopping frees entries, so the pool must
+         * settle to a clean pass before the owner may finalize. */
+        bool found = s->sweep_rx_found;
+        s->sweep_rx_pos = 0;
+        s->sweep_rx_found = false;
         if (!found) return MOQ_OK;
     }
 }

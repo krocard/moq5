@@ -71,6 +71,112 @@ moq_track_hist_t *track_hist_find(moq_session_t *s,
     return NULL;
 }
 
+/*
+ * Compare a decoded identity against a stored canonical key in place.
+ * Every field length is validated against the remaining bytes before it
+ * is read, and the total must be consumed exactly, so a truncated or
+ * malformed stored key fails to match instead of over-reading.
+ */
+bool moq_track_key_matches(const uint8_t *key, size_t key_len,
+                           const moq_namespace_t *ns, moq_bytes_t name)
+{
+    /* Only the canonical encoding matches: the empty identity is three
+     * bytes ([count 0][u16 name len 0]), never a NULL/zero-length blob. */
+    if (!key || key_len < 1) return false;
+
+    size_t off = 0;
+    if (key[off++] != (uint8_t)ns->count) return false;
+    /* A count that cannot round-trip the stored u8 never matches. */
+    if (ns->count > 0xFF) return false;
+
+    for (size_t i = 0; i < ns->count; i++) {
+        if (key_len - off < 2) return false;
+        size_t flen = ((size_t)key[off] << 8) | (size_t)key[off + 1];
+        off += 2;
+        if (flen != ns->parts[i].len) return false;
+        if (key_len - off < flen) return false;
+        if (flen > 0 &&
+            memcmp(key + off, ns->parts[i].data, flen) != 0) return false;
+        off += flen;
+    }
+
+    if (key_len - off < 2) return false;
+    size_t nlen = ((size_t)key[off] << 8) | (size_t)key[off + 1];
+    off += 2;
+    if (nlen != name.len) return false;
+    if (key_len - off < nlen) return false;
+    if (nlen > 0 && memcmp(key + off, name.data, nlen) != 0) return false;
+    off += nlen;
+
+    return off == key_len;
+}
+
+moq_track_hist_t *track_hist_find_id(moq_session_t *s,
+                                     const moq_namespace_t *ns,
+                                     moq_bytes_t name)
+{
+    if (!s->track_hist) return NULL;
+    for (size_t i = 0; i < s->th_cap; i++) {
+        moq_track_hist_t *r = &s->track_hist[i];
+        if (r->in_use && moq_track_key_matches(r->key, r->key_len, ns, name))
+            return r;
+    }
+    return NULL;
+}
+
+moq_track_hist_sel_t moq_track_hist_select(moq_session_t *s,
+                                           const moq_namespace_t *ns,
+                                           moq_bytes_t name)
+{
+    if (track_hist_find_id(s, ns, name)) return MOQ_TH_SEL_EXISTING;
+    if (!s->track_hist) return MOQ_TH_SEL_FULL;
+    for (size_t i = 0; i < s->th_cap; i++)
+        if (!s->track_hist[i].in_use) return MOQ_TH_SEL_FREE_SLOT;
+    return MOQ_TH_SEL_FULL;
+}
+
+moq_result_t track_hist_reserve_selected(moq_session_t *s,
+                                         const moq_namespace_t *ns,
+                                         moq_bytes_t name,
+                                         moq_track_hist_t **out)
+{
+    *out = NULL;
+
+    moq_track_hist_t *rec = track_hist_find_id(s, ns, name);
+    if (rec) {
+        rec->refs++;
+        *out = rec;
+        return MOQ_OK;
+    }
+
+    moq_track_hist_t *slot = NULL;
+    if (s->track_hist) {
+        for (size_t i = 0; i < s->th_cap; i++) {
+            if (!s->track_hist[i].in_use) { slot = &s->track_hist[i]; break; }
+        }
+    }
+    /* Callers select first and route MOQ_TH_SEL_FULL to its own funded
+     * REQUEST_ERROR path, so reaching here without a slot means the
+     * registry filled between selection and execution -- impossible on a
+     * single-threaded advancing call, and reported distinctly rather than
+     * as an allocation failure. */
+    if (!slot) return MOQ_ERR_INTERNAL;
+
+    size_t key_len = 0;
+    uint8_t *kcopy = moq_build_track_key(s, ns, name, &key_len);
+    if (!kcopy && key_len > 0) return MOQ_ERR_NOMEM;   /* nothing mutated */
+
+    slot->in_use = true;
+    slot->has_largest = false;
+    slot->refs = 1;
+    slot->key = kcopy;
+    slot->key_len = key_len;
+    slot->largest_group = 0;
+    slot->largest_object = 0;
+    *out = slot;
+    return MOQ_OK;
+}
+
 moq_track_hist_t *track_hist_reserve(moq_session_t *s,
                                      const uint8_t *key, size_t key_len)
 {

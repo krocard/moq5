@@ -31,6 +31,10 @@ void moq_wtquic_msquic_managed_public_probe_cxx(void)
     /* pin the exact close-code width (uint32_t); a regression fails to build. */
     void (*f_conn_close)(moq_wtquic_msquic_managed_conn_t *, uint32_t) =
         moq_wtquic_msquic_managed_conn_close;
+    /* pin the acknowledgment entry: exactly one conn argument, moq_result_t
+     * result -- no lane, token, or size parameter may creep in */
+    moq_result_t (*f_ack)(moq_wtquic_msquic_managed_conn_t *) =
+        moq_wtquic_msquic_managed_conn_ack_terminal;
 
     volatile moq_result_t r;
     volatile bool b;
@@ -91,6 +95,6 @@ void moq_wtquic_msquic_managed_public_probe_cxx(void)
 
     (void)r; (void)b; (void)u64; (void)u32; (void)u16; (void)sz;
     (void)ver; (void)sess; (void)adap; (void)ai; (void)cl; (void)lp;
-    (void)ac; (void)conn; (void)lane; (void)m; (void)f_conn_close;
+    (void)ac; (void)conn; (void)lane; (void)m; (void)f_conn_close; (void)f_ack;
     (void)prof;
 }

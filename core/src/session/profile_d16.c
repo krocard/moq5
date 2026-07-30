@@ -377,11 +377,32 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
      * a duplicate stale SERVER_SETUP, which is what queuing it before these
      * allocations risked).
      */
+    /* The completion event's whole token requirement is classified before any
+     * of it is copied: a shortfall an empty arena could satisfy is transient
+     * (the arena recycles once events drain), while one no empty arena could
+     * satisfy can never be retried into success. */
+    size_t scratch_saved = s->event_scratch_len;
+    switch (setup_event_scratch_classify(s, resolved, token_count)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1, "event scratch permanently too small");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+
     for (size_t i = 0; i < token_count; i++) {
         if (resolved[i].token_value.len > 0) {
             uint8_t *copy = event_scratch_copy(s, resolved[i].token_value.data,
                                           resolved[i].token_value.len);
-            if (!copy) return MOQ_ERR_BUFFER;
+            if (!copy) {
+                /* The preflight said the whole requirement fits: a failure
+                 * here is an internal inconsistency, not arena pressure, and
+                 * has no unblock edge to wait on. */
+                s->event_scratch_len = scratch_saved;
+                return close_with_error(s, 0x1,
+                    "internal: setup scratch preflight mismatch");
+            }
             resolved[i].token_value.data = copy;
         }
     }
@@ -392,7 +413,11 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
     if (token_count > 0) {
         moq_resolved_token_t *tok_copy = (moq_resolved_token_t *)event_scratch_alloc_aligned(
             s, token_count * sizeof(moq_resolved_token_t), _Alignof(moq_resolved_token_t));
-        if (!tok_copy) return MOQ_ERR_BUFFER;
+        if (!tok_copy) {
+            s->event_scratch_len = scratch_saved;
+            return close_with_error(s, 0x1,
+                "internal: setup scratch preflight mismatch");
+        }
         memcpy(tok_copy, resolved, token_count * sizeof(moq_resolved_token_t));
         e.u.setup_complete.tokens = tok_copy;
         e.u.setup_complete.token_count = token_count;
@@ -405,6 +430,7 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
                                                      s->alloc.ctx);
             if (!p) {
                 moq_ov_free_preowned(&ov, &s->alloc);
+                s->event_scratch_len = scratch_saved;
                 return MOQ_ERR_NOMEM;
             }
             memcpy(p, ov.entries[i].value, ov.entries[i].value_len);
@@ -416,17 +442,21 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
      * Phase 3: Commit. All retryable allocation has succeeded and the event
      * slot was reserved at entry (the event_queue_full check above, with
      * nothing pushing an event before here). The only operation that can
-     * still fail is queuing SERVER_SETUP on a full action queue, and it is
-     * the FIRST observable mutation -- a WOULD_BLOCK there leaves nothing
-     * queued/pushed/committed, so the retry is clean. push_event cannot
-     * fail (slot reserved), and the cache commit allocates nothing.
+     * still fail is queuing SERVER_SETUP, which needs both an action slot and
+     * room in the send buffer, and it is the FIRST observable mutation -- a
+     * failure there leaves nothing queued/pushed/committed and restores the
+     * scratch cursor, so the retry is clean. push_event cannot fail (slot
+     * reserved), and the cache commit allocates nothing.
      */
     moq_setup_params_t local_tmp;
     d16_build_local_setup(s, &local_tmp);
 
     rc = d16_encode_and_queue_setup(s, &local_tmp, false);
     if (rc < 0) {
+        /* Nothing was queued, so the staged event bytes are unreferenced: the
+         * arena returns to its entry state for the retry. */
         moq_ov_free_preowned(&ov, &s->alloc);
+        s->event_scratch_len = scratch_saved;
         return rc;
     }
 
@@ -595,11 +625,31 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
      * Pre-allocate cache-value copies for pending REGISTERs so Phase 3
      * commits without allocation.
      */
+    /* Classify the completion event's whole token requirement before copying
+     * any of it: a shortfall an empty arena could satisfy is transient, while
+     * one no empty arena could satisfy can never be retried into success. */
+    size_t scratch_saved = s->event_scratch_len;
+    switch (setup_event_scratch_classify(s, resolved, token_count)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1, "event scratch permanently too small");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+
     for (size_t i = 0; i < token_count; i++) {
         if (resolved[i].token_value.len > 0) {
             uint8_t *copy = event_scratch_copy(s, resolved[i].token_value.data,
                                           resolved[i].token_value.len);
-            if (!copy) return MOQ_ERR_BUFFER;
+            if (!copy) {
+                /* The preflight said the whole requirement fits: a failure
+                 * here is an internal inconsistency, not arena pressure, and
+                 * has no unblock edge to wait on. */
+                s->event_scratch_len = scratch_saved;
+                return close_with_error(s, 0x1,
+                    "internal: setup scratch preflight mismatch");
+            }
             resolved[i].token_value.data = copy;
         }
     }
@@ -610,7 +660,11 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
     if (token_count > 0) {
         moq_resolved_token_t *tok_copy = (moq_resolved_token_t *)event_scratch_alloc_aligned(
             s, token_count * sizeof(moq_resolved_token_t), _Alignof(moq_resolved_token_t));
-        if (!tok_copy) return MOQ_ERR_BUFFER;
+        if (!tok_copy) {
+            s->event_scratch_len = scratch_saved;
+            return close_with_error(s, 0x1,
+                "internal: setup scratch preflight mismatch");
+        }
         memcpy(tok_copy, resolved, token_count * sizeof(moq_resolved_token_t));
         e.u.setup_complete.tokens = tok_copy;
         e.u.setup_complete.token_count = token_count;
@@ -623,6 +677,7 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
                                                      s->alloc.ctx);
             if (!p) {
                 moq_ov_free_preowned(&ov, &s->alloc);
+                s->event_scratch_len = scratch_saved;
                 return MOQ_ERR_NOMEM;
             }
             memcpy(p, ov.entries[i].value, ov.entries[i].value_len);
@@ -633,6 +688,7 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
     rc = push_event(s, &e);
     if (rc < 0) {
         moq_ov_free_preowned(&ov, &s->alloc);
+        s->event_scratch_len = scratch_saved;
         return rc;
     }
 

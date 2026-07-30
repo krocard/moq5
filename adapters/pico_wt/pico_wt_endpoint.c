@@ -176,7 +176,16 @@ static moq_transport_result_t ep_stop_sending(void *ctx,
     if (!pico_wt_moq_err_to_wt(error_code, &wt_code))
         return MOQ_TRANSPORT_ERROR;
     int rc = picoquic_stop_sending(ep->cnx, stream_id, wt_code);
-    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    if (rc != 0)
+        return MOQ_TRANSPORT_ERROR;   /* nothing sent: receive state untouched */
+    /* STOP_SENDING accepted: our receive direction on this stream is cancelled,
+     * so the adapter must drop its tracked receive state. Otherwise a later
+     * sweep could replay retained bytes, or grant credit, for a stream the
+     * application just stopped -- which is exactly what libmoq emits when it
+     * cancels a peer-origin fetch data stream. */
+    if (ep->on_local_stop_sending)
+        ep->on_local_stop_sending(ep->cb_ctx, stream_id);
+    return MOQ_TRANSPORT_OK;
 }
 
 static moq_transport_result_t ep_send_datagram(void *ctx,

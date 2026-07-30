@@ -19,6 +19,28 @@ int sub_find_by_request_id(moq_session_t *s, uint64_t request_id)
     return ep.slot;
 }
 
+/*
+ * Allocation-free duplicate detection: compare the DECODED identity
+ * against each live entry's stored canonical key in place, so selection
+ * never allocates. The key-blob form below serves the outbound paths,
+ * which already hold a built key.
+ */
+static bool sub_is_duplicate_track_id(moq_session_t *s,
+                                       const moq_namespace_t *ns,
+                                       moq_bytes_t name,
+                                       moq_sub_role_t role)
+{
+    for (size_t i = 0; i < s->sub_cap; i++) {
+        moq_sub_entry_t *e = &s->subs[i];
+        if (e->state == MOQ_SUB_FREE || e->state == MOQ_SUB_TERMINATED)
+            continue;
+        if (e->role != role) continue;
+        if (moq_track_key_matches(e->track_id_buf, e->track_id_len, ns, name))
+            return true;
+    }
+    return false;
+}
+
 static bool sub_is_duplicate_track(moq_session_t *s,
                                     const uint8_t *track_id, size_t track_id_len,
                                     moq_sub_role_t role)
@@ -292,35 +314,92 @@ void sub_note_stream_processed(moq_session_t *s, moq_subscription_t sub)
         (void)sub_finalize_done(s, slot);
 }
 
-void sub_reap_deferred_dones(moq_session_t *s)
+/* Subscription-pool half of the deferred-completion sweep. Same resumption
+ * contract as pub_reap_deferred_dones_resumable(): resumes at s->sweep_slot,
+ * evaluates against s->sweep_now_us, skips non-runnable owners UNCHARGED, charges
+ * the due-mark / stop / finalize transitions separately, and
+ * returns false when it suspended with sweep_slot left on the pending owner. */
+bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
 {
-    for (size_t i = 0; i < s->sub_cap; i++) {
-        if (s->state == MOQ_SESS_CLOSED) return;  /* finalize may close (scratch) */
+    for (; s->sweep_slot < s->sub_cap; s->sweep_slot++) {
+        if (s->state == MOQ_SESS_CLOSED) return true;  /* finalize may close */
+
+        size_t i = s->sweep_slot;
         moq_sub_entry_t *e = &s->subs[i];
-        if (!e->done_pending) continue;
-        if (!e->done_expired) {
-            /* GATED: count satisfaction finalizes exactly as before; a
-             * blocked finalize never aborts the sweep. */
-            if (e->done_stream_count != MOQ_QUIC_VARINT_MAX &&
-                e->processed_stream_count >= e->done_stream_count) {
+        if (!e->done_pending) continue;    /* costs nothing; never suspends */
+
+        /* A suspension inside STOP_STREAMS or FINALIZE resumes in that phase:
+         * SELECT already qualified this owner, and re-running it could reach a
+         * different verdict now that earlier transitions have committed. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT) {
+            /* SELECT: an owner with an unsatisfied count and a future deadline has
+             * no runnable work and skips UNCHARGED, so a pool of future owners
+             * cannot exhaust the budget and suspend an idle pass. */
+            bool count_satisfied =
+                (e->done_stream_count != MOQ_QUIC_VARINT_MAX &&
+                 e->processed_stream_count >= e->done_stream_count);
+            bool due = (s->sweep_now_us >= e->done_deadline_us);
+            if (!e->done_expired && !count_satisfied && !due)
+                continue;
+
+            if (count_satisfied && !e->done_expired) {
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
                 (void)sub_finalize_done(s, (int)i);
                 continue;
             }
-            if (s->last_now_us >= e->done_deadline_us)
-                e->done_expired = true;   /* fire once; state drives on */
-            else
-                continue;
+
+            if (!e->done_expired) {
+                /* Durable due-mark: its own charged transition, fired once. */
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
+                e->done_expired = true;
+            }
         }
-        /* EXPIRED: scan, stop, rescan-to-zero, then finalize in the SAME
-         * pass. Action backpressure leaves the entry EXPIRED (blocked work
-         * -> the post-sweep retry deadline); an event-blocked finalize
-         * likewise -- the next pass re-enters at the scan. */
-        if (session_stop_bound_streams(s, e->handle,
-                                       MOQ_PUBLICATION_INVALID) < 0)
-            continue;
+
+        /* EXPIRED: scan, stop, rescan-to-zero, then finalize. Action
+         * backpressure leaves the entry EXPIRED (blocked work -> the post-sweep
+         * retry deadline); an event-blocked finalize likewise -- the next pass
+         * re-enters at the scan. Each STOP attempt is one unit, tracked by
+         * s->sweep_rx_pos so a suspended scan resumes mid-pool. */
+
+        /* STOP_STREAMS: branch on the PERSISTED phase. Assigning it here
+         * unconditionally would make a suspension at the finalize check rescan
+         * the rx pool on re-entry instead of finalizing. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT ||
+            s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS) {
+            s->sweep_phase = MOQ_SWEEP_PHASE_STOP_STREAMS;
+            moq_result_t src = session_stop_bound_streams_resumable(s, e->handle,
+                                                     MOQ_PUBLICATION_INVALID, budget);
+            if (src == MOQ_SESSION_SUSPENDED)
+                return false;              /* rx cursor stays: we resume here */
+            if (src < 0) {
+                /* Action capacity: this owner is abandoned for now, so its rx
+                 * cursor must NOT leak into the next owner's scan. */
+                session_sweep_owner_reset(s);
+                continue;
+            }
+            /* Owner's rx scan is complete; the next phase owns a clean cursor. */
+            s->sweep_rx_pos = 0;
+            s->sweep_rx_found = false;
+            s->sweep_phase = MOQ_SWEEP_PHASE_FINALIZE;
+        }
+
+        if (budget) {
+            if (*budget == 0) return false;   /* resume AT finalize */
+            (*budget)--;
+        }
         (void)sub_finalize_done(s, (int)i);
+        session_sweep_owner_reset(s);
     }
+    s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    return true;
 }
+
 
 /* The canonical full-track-name key builder lives in session_track_hist.c
  * (moq_build_track_key) and is shared so subscription request identities and
@@ -335,26 +414,6 @@ static uint8_t *build_track_id(moq_session_t *s,
 }
 
 /* -- Message parameter validation ---------------------------------- */
-
-/* Copy namespace parts into output scratch. */
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
 
 /* -- Subscribe handlers -------------------------------------------- */
 
@@ -442,14 +501,12 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
         goto cleanup_all;
     }
 
-    tid = build_track_id(s, &d->track_namespace, d->track_name, &tid_len);
-    if (tid_len > 0 && !tid) {
-        result = MOQ_ERR_NOMEM;
-        goto cleanup_all;
-    }
-
-    if (sub_is_duplicate_track(s, tid, tid_len, MOQ_SUB_ROLE_PUBLISHER)) {
-        if (tid) { s->alloc.free(tid, tid_len, s->alloc.ctx); tid = NULL; }
+    /* Selection is allocation-free: duplicate detection and the history
+     * decision both compare the decoded identity against stored canonical
+     * keys in place. The request's own identity key is built only in
+     * funded execution below, once every selected rejection is behind us. */
+    if (sub_is_duplicate_track_id(s, &d->track_namespace, d->track_name,
+                                  MOQ_SUB_ROLE_PUBLISHER)) {
         result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
                                      0x19, "duplicate subscription", 22);
         if (result == MOQ_OK) auth_committed = true;
@@ -458,25 +515,41 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
 
     int slot = reserved_slot >= 0 ? reserved_slot : sub_find_free(s);
     if (slot < 0) {
-        if (tid) { s->alloc.free(tid, tid_len, s->alloc.ctx); tid = NULL; }
         result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
                                      0x0, "subscription pool full", 22);
         if (result == MOQ_OK) auth_committed = true;
         goto cleanup_all;
     }
 
-    /* Reserve this track's registry record. A full registry is NOT a
-     * session-fatal parser error: reject the well-formed request with
-     * REQUEST_ERROR(INTERNAL_ERROR 0x0) via the shared terminal-reject path --
-     * nothing (no event, entry, or history) is committed until the error is
-     * queued; the bidi stays drainable so the session survives the trailing FIN;
-     * WOULD_BLOCK leaves the whole reject replayable. */
-    hist = track_hist_reserve(s, tid, tid_len);
-    if (!hist) {
+    /* Reserve this track's registry record. Select first (allocation-free,
+     * comparing the decoded identity against stored canonical keys), so a
+     * genuinely full registry and an allocation failure stay distinct: a
+     * full registry is NOT a session-fatal parser error and rejects the
+     * well-formed request with REQUEST_ERROR(INTERNAL_ERROR 0x0) via the
+     * shared terminal-reject path -- nothing (no event, entry, or history)
+     * is committed until the error is queued, the bidi stays drainable so
+     * the session survives the trailing FIN, and WOULD_BLOCK leaves the
+     * whole reject replayable -- while a failed record-key copy reports
+     * MOQ_ERR_NOMEM and queues no response at all. */
+    if (moq_track_hist_select(s, &d->track_namespace, d->track_name) ==
+            MOQ_TH_SEL_FULL) {
         result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
                                      0x0, "track history full", 18);
         if (result == MOQ_OK) auth_committed = true;
         goto cleanup_all;
+    }
+    /* Funded execution: the entry's retained identity key, then the
+     * registry reservation. Both allocation failures are MOQ_ERR_NOMEM
+     * with no response queued. */
+    tid = build_track_id(s, &d->track_namespace, d->track_name, &tid_len);
+    if (tid_len > 0 && !tid) {
+        result = MOQ_ERR_NOMEM;
+        goto cleanup_all;
+    }
+    {
+        moq_result_t hrc = track_hist_reserve_selected(
+            s, &d->track_namespace, d->track_name, &hist);
+        if (hrc < 0) { result = hrc; goto cleanup_all; }
     }
 
     moq_namespace_t ev_ns;
@@ -1401,19 +1474,38 @@ moq_result_t request_stream_teardown(moq_session_t *s,
 
     if (ep.kind == MOQ_REQ_FETCH) {
         moq_fetch_entry_t *fe = &s->fetches[ep.slot];
-        bool need_reset = fe->data_stream_started && !fe->data_stream_fin;
-        /* Reserve everything before mutating: the data-reset MUST be queued, so
+        bool need_data_abort = fe->data_stream_started && !fe->data_stream_fin;
+        /* The abort direction follows stream ownership, not the request.
+         *
+         * A fetch data stream is unidirectional and always flows publisher ->
+         * fetcher, so only the publisher holds a sending half on it. The
+         * fetcher, which merely receives, must abort with STOP_DATA; issuing
+         * RESET_DATA there asks the transport to reset a direction this
+         * endpoint does not own, which the transport rejects and the bridge
+         * escalates to a connection fatal. This mirrors
+         * fetch_request_bidi_cancel(), which already stops the incoming
+         * response stream for the fetcher role. */
+        bool fetcher = (fe->role == MOQ_FETCH_ROLE_FETCHER);
+        /* Reserve everything before mutating: the data abort MUST be queued, so
          * a full action queue defers the whole teardown for a later retry. */
         if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-        if (need_reset && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-        if (need_reset) {
+        if (need_data_abort && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        if (need_data_abort) {
             moq_action_t a;
             memset(&a, 0, sizeof(a));
-            a.kind = MOQ_ACTION_RESET_DATA;
-            a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
-            a.borrow_epoch = s->borrow_epoch;
-            a.u.reset_data.stream_ref = fe->data_stream_ref;
-            a.u.reset_data.error_code = 0x1;   /* CANCELLED */
+            if (fetcher) {
+                a.kind = MOQ_ACTION_STOP_DATA;
+                a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
+                a.borrow_epoch = s->borrow_epoch;
+                a.u.stop_data.stream_ref = fe->data_stream_ref;
+                a.u.stop_data.error_code = 0x1;   /* CANCELLED */
+            } else {
+                a.kind = MOQ_ACTION_RESET_DATA;
+                a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+                a.borrow_epoch = s->borrow_epoch;
+                a.u.reset_data.stream_ref = fe->data_stream_ref;
+                a.u.reset_data.error_code = 0x1;   /* CANCELLED */
+            }
             (void)push_action(s, &a);
         }
         moq_event_t e;
@@ -1423,6 +1515,12 @@ moq_result_t request_stream_teardown(moq_session_t *s,
         e.borrow_epoch = s->borrow_epoch;
         e.u.fetch_cancelled.fetch = fe->handle;
         (void)push_event(s, &e);
+        /* A fetcher's data uni may not have presented its FETCH_HEADER yet.
+         * Tombstone the request id so late data is absorbed and stopped instead
+         * of resolving against a freed request -- the same protection
+         * fetch_request_bidi_cancel() applies on its cancel path. */
+        if (fetcher)
+            fetch_cancel_tomb_add(s, fe->request_id);
         fetch_free_entry(s, ep.slot);
         return MOQ_OK;
     }
@@ -1843,7 +1941,9 @@ moq_result_t session_core_on_subscribe_error(moq_session_t *s,
         rc = session_core_emit_request_redirect(s, MOQ_REQUEST_FAMILY_SUBSCRIBE,
             s->subs[d->target_slot].handle._opaque, redirect, d->error_code,
             d->can_retry, d->retry_after_ms, d->reason, d->reason_len);
-        if (rc < 0) return rc;
+        /* The emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     } else {
         moq_bytes_t reason = {0};
         if (d->reason_len > 0) {

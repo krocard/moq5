@@ -207,29 +207,98 @@ void pub_note_stream_processed(moq_session_t *s, moq_publication_t pub)
 /* Drive deferred publication terminals (§9.8): GATED count-satisfied
  * retries, deadline firing, and the EXPIRED scan/stop/rescan/finalize
  * loop; one blocked entry never aborts the sweep. */
-void pub_reap_deferred_dones(moq_session_t *s)
+/*
+ * Sweep the publication pool for deferred completions, resumably.
+ *
+ * Starts at s->sweep_slot. SELECT classifies readiness first: an owner with no
+ * runnable work skips UNCHARGED. Charged separately thereafter are the durable
+ * due-mark, the stream-stop attempt, and the finalize attempt. With a
+ * budget, it stops the moment the budget is exhausted and leaves sweep_slot on
+ * the owner still to be processed, so the caller can resume exactly there.
+ * Returns true when the pool retired, false when it suspended.
+ *
+ * Owners are evaluated against s->sweep_now_us -- the epoch the sweep began --
+ * so a suspended sweep never mixes two clocks. Slots that become due later are
+ * picked up by the caller's catch-up sweep, not by this one.
+ */
+bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
 {
-    for (size_t i = 0; i < s->pub_cap; i++) {
-        if (s->state == MOQ_SESS_CLOSED) return;  /* finalize may close (scratch) */
+    for (; s->sweep_slot < s->pub_cap; s->sweep_slot++) {
+        if (s->state == MOQ_SESS_CLOSED) return true;  /* finalize may close */
+
+        size_t i = s->sweep_slot;
         moq_pub_entry_t *pe = &s->publishes[i];
-        if (!pe->done_pending) continue;
-        if (!pe->done_expired) {
-            if (pe->done_stream_count != MOQ_QUIC_VARINT_MAX &&
-                pe->processed_stream_count >= pe->done_stream_count) {
+        if (!pe->done_pending) continue;   /* costs nothing; never suspends */
+
+        /* A suspension inside STOP_STREAMS or FINALIZE resumes in that phase:
+         * SELECT already qualified this owner, and re-running it could reach a
+         * different verdict now that earlier transitions have committed. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT) {
+            /* SELECT: classify readiness BEFORE spending anything. An owner whose
+             * count is unsatisfied and whose deadline is still in the future has no
+             * runnable work, so it must skip uncharged -- otherwise a pool of
+             * future owners could exhaust the budget and suspend a pass that had
+             * nothing to do. */
+            bool count_satisfied =
+                (pe->done_stream_count != MOQ_QUIC_VARINT_MAX &&
+                 pe->processed_stream_count >= pe->done_stream_count);
+            bool due = (s->sweep_now_us >= pe->done_deadline_us);
+            if (!pe->done_expired && !count_satisfied && !due)
+                continue;                      /* not runnable: uncharged skip */
+
+            if (count_satisfied && !pe->done_expired) {
+                /* FINALIZE attempt: one unit. */
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
                 (void)pub_finalize_done(s, (int)i);
                 continue;
             }
-            if (s->last_now_us >= pe->done_deadline_us)
+
+            if (!pe->done_expired) {
+                /* The durable due-mark is its own charged transition. */
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
                 pe->done_expired = true;
-            else
-                continue;
+            }
         }
-        if (session_stop_bound_streams(s, MOQ_SUBSCRIPTION_INVALID,
-                                       pe->handle) < 0)
-            continue;
+
+        /* STOP_STREAMS: branch on the PERSISTED phase. Assigning it here
+         * unconditionally would make a suspension at the finalize check rescan
+         * the rx pool on re-entry instead of finalizing. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT ||
+            s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS) {
+            s->sweep_phase = MOQ_SWEEP_PHASE_STOP_STREAMS;
+            moq_result_t src = session_stop_bound_streams_resumable(s, MOQ_SUBSCRIPTION_INVALID,
+                                                     pe->handle, budget);
+            if (src == MOQ_SESSION_SUSPENDED)
+                return false;              /* rx cursor stays: we resume here */
+            if (src < 0) {
+                /* Action capacity: this owner is abandoned for now, so its rx
+                 * cursor must NOT leak into the next owner's scan. */
+                session_sweep_owner_reset(s);
+                continue;
+            }
+            /* Owner's rx scan is complete; the next phase owns a clean cursor. */
+            s->sweep_rx_pos = 0;
+            s->sweep_rx_found = false;
+            s->sweep_phase = MOQ_SWEEP_PHASE_FINALIZE;
+        }
+
+        if (budget) {
+            if (*budget == 0) return false;   /* resume AT finalize */
+            (*budget)--;
+        }
         (void)pub_finalize_done(s, (int)i);
+        session_sweep_owner_reset(s);
     }
+    s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    return true;
 }
+
 
 bool pub_track_alias_in_use(moq_session_t *s, uint64_t alias)
 {
@@ -273,26 +342,6 @@ static moq_result_t queue_publish_response(moq_session_t *s, size_t slot,
         return queue_send_bidi(s, s->publishes[slot].request_stream_ref,
                                data, len, fin);
     return queue_send_control(s, data, len);
-}
-
-/* -- Copy namespace parts into output scratch ---------------------- */
-
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
 }
 
 /* -- Inbound PUBLISH handler --------------------------------------- */
@@ -426,20 +475,27 @@ moq_result_t session_core_on_publish(moq_session_t *s,
         goto cleanup_all;
     }
 
-    /* Reserve this track's registry record. A full registry is NOT a
-     * session-fatal parser error: reject with REQUEST_ERROR(INTERNAL_ERROR 0x0)
-     * via the same pre-commit pattern as the pool-full branch above -- no event,
-     * entry, or history is committed until the error is queued, and WOULD_BLOCK
-     * leaves it replayable. The session stays open. */
-    {
-        size_t pklen = 0;
-        uint8_t *pkey = moq_build_track_key(s, &d->track_namespace,
-                                            d->track_name, &pklen);
-        if (!pkey && pklen > 0) { result = MOQ_ERR_NOMEM; goto cleanup_all; }
-        phist = track_hist_reserve(s, pkey, pklen);
-        if (pkey) s->alloc.free(pkey, pklen, s->alloc.ctx);
+    /* Reserve this track's registry record, selecting allocation-free
+     * first so a full registry and an allocation failure stay distinct.
+     * A full registry is NOT a session-fatal parser error: reject with
+     * REQUEST_ERROR(INTERNAL_ERROR 0x0) via the same pre-commit pattern as
+     * the pool-full branch above -- no event, entry, or history is committed
+     * until the error is queued, and WOULD_BLOCK leaves it replayable. The
+     * session stays open. This rejection stays AHEAD of the later
+     * duplicate-alias close, as recorded. */
+    bool phist_full = moq_track_hist_select(s, &d->track_namespace,
+                                            d->track_name) ==
+                      MOQ_TH_SEL_FULL;
+    if (!phist_full) {
+        /* Funded execution: an existing record takes a ref, a free slot
+         * creates one. A failed key copy is MOQ_ERR_NOMEM with nothing
+         * mutated and no response queued -- never the history-full
+         * rejection below. */
+        moq_result_t hrc = track_hist_reserve_selected(
+            s, &d->track_namespace, d->track_name, &phist);
+        if (hrc < 0) { result = hrc; goto cleanup_all; }
     }
-    if (!phist) {
+    if (phist_full) {
         if (action_queue_full(s) ||
             (reject_drain && s->drain_ref_count >= s->drain_ref_cap)) {
             result = MOQ_ERR_WOULD_BLOCK;

@@ -214,9 +214,26 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
         return close_with_error(s, 0x6, "invalid auth token in SETUP");
     }
 
+    /* Classify the completion event's whole token requirement before copying
+     * any of it: a shortfall an empty arena could satisfy is transient (the
+     * arena recycles once events drain), while one no empty arena could
+     * satisfy can never be retried into success. */
+    size_t scratch_saved = s->event_scratch_len;
+    {
+        moq_event_scratch_verdict_t v =
+            setup_event_scratch_classify(s, resolved, token_count);
+        if (v != MOQ_EVENT_SCRATCH_FITS) {
+            process_auth_tokens_free_staging(s, resolved, staged, token_count);
+            process_auth_tokens_abort_txn(s, &txn);
+            if (v == MOQ_EVENT_SCRATCH_PERMANENT)
+                return close_with_error(s, 0x1,
+                    "event scratch permanently too small");
+            return MOQ_ERR_WOULD_BLOCK;
+        }
+    }
+
     /* Scratch-copy the resolved token values for the SETUP_COMPLETE event,
      * freeing any staged heap values (mirrors the request paths). */
-    size_t scratch_saved = s->event_scratch_len;
     moq_resolved_token_t *ev_tokens = NULL;
     for (size_t i = 0; i < token_count; i++) {
         if (resolved[i].token_value.len > 0) {
@@ -227,13 +244,13 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
                 s->alloc.free((void *)(uintptr_t)src, slen, s->alloc.ctx);
             staged[i] = false;
             if (!copy) {
+                /* The preflight said the whole requirement fits: a failure
+                 * here is an internal inconsistency, not arena pressure. */
                 s->event_scratch_len = scratch_saved;
                 process_auth_tokens_free_staging(s, resolved, staged, token_count);
                 process_auth_tokens_abort_txn(s, &txn);
-                if (scratch_saved == 0)
-                    return close_with_error(s, 0x1,
-                        "event scratch permanently too small");
-                return MOQ_ERR_BUFFER;
+                return close_with_error(s, 0x1,
+                    "internal: setup scratch preflight mismatch");
             }
             resolved[i].token_value.data = copy;
         } else {
@@ -247,10 +264,8 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
         if (!ev_tokens) {
             s->event_scratch_len = scratch_saved;
             process_auth_tokens_abort_txn(s, &txn);
-            if (scratch_saved == 0)
-                return close_with_error(s, 0x1,
-                    "event scratch permanently too small");
-            return MOQ_ERR_BUFFER;
+            return close_with_error(s, 0x1,
+                "internal: setup scratch preflight mismatch");
         }
         memcpy(ev_tokens, resolved, token_count * sizeof(moq_resolved_token_t));
     }

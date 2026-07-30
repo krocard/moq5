@@ -240,4 +240,50 @@ bool bridge_stream_has_inbound_pending(
 bridge_uni_route_t bridge_route_peer_uni(
     moq_transport_bridge_t *b, moq_uni_class_t cls, uint64_t stream_id);
 
+/*
+ * Outcome of a budgeted service pass.
+ *
+ * suspended    a deferred-completion sweep could not finish within the budget.
+ *              The session cursor holds the resume point; a later pass
+ *              continues from there. The operation that OBSERVED the
+ *              suspension retains its retry/deferred state, while earlier work
+ *              in the same pass remains committed -- a pass may legitimately
+ *              commit several owners and then suspend on the next.
+ * sweep_spent  sweep steps charged by this call.
+ */
+typedef struct moq_bridge_budgeted_result {
+    bool     suspended;
+    uint32_t sweep_spent;
+} moq_bridge_budgeted_result_t;
+
+/*
+ * Service the bridge with a bounded deferred-completion sweep.
+ *
+ * WHAT sweep_budget METERS, precisely: steps of the session's deferred
+ * completion stage machine (REAP_SUBGROUPS / PUB / SUB). It does NOT
+ * meter outbound pending items retried, actions dispatched, control messages
+ * handled, or rx parse units -- so this is not an invocation-wide work bound,
+ * and must not be described as one.
+ *
+ * A budget of 0 is legal and useful: a pool that is idle, or holds only
+ * future/count-unsatisfied owners, has no runnable work and completes anyway.
+ * Only runnable work that cannot be afforded suspends.
+ *
+ * out is REQUIRED. A finite budget that can suspend, paired with a discarded
+ * outcome, would report a drained pass while a cursor is still live -- the
+ * hidden stall this exists to prevent. Returns MOQ_ERR_INVAL when out is NULL;
+ * *out is zeroed before any other argument is validated.
+ *
+ * moq_transport_bridge_service() is the unlimited path and does NOT route
+ * through here: it enters no budget context at all, which is what makes it
+ * structurally incapable of suspending.
+ *
+ * Not exported. Callable within moq-core and from white-box tests linking
+ * moq-core-test-internals; promotion to MOQ_API belongs with the first
+ * out-of-library caller.
+ */
+moq_result_t moq_transport_bridge_service_budgeted(
+    moq_transport_bridge_t *b, uint64_t now_us, uint32_t sweep_budget,
+    moq_bridge_budgeted_result_t *out);
+
 #endif /* MOQ_TRANSPORT_BRIDGE_INTERNAL_H */

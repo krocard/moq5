@@ -47,4 +47,77 @@ uint64_t moq_session_event_progress_token(const moq_session_t *s);
  */
 bool moq_session_has_events(const moq_session_t *s);
 
+/*
+ * Independent monotonic terminal facts. Recorded separately -- never derived
+ * from each other or from a bridge latch -- because their order is not fixed:
+ * a local close enqueues MOQ_EVENT_SESSION_CLOSED before any transport
+ * shutdown, while a peer close can complete natively first.
+ *
+ *   enqueued  the terminal event was actually placed in the event queue.
+ *   observed  poll_events_ex TRANSFERRED that event to a caller. Availability
+ *             is not observation: a queued-but-unpolled terminal reads false.
+ *
+ * observed implies enqueued. Both are monotonic and idempotent. A managed
+ * adapter reads them to gate reclamation on real application observation
+ * instead of pump timing. Not public API.
+ */
+bool moq_session_terminal_enqueued(const moq_session_t *s);
+bool moq_session_terminal_observed(const moq_session_t *s);
+
+
+/*
+ * Private suspension sentinel.
+ *
+ * Returned INTERNALLY when a budgeted advance could not complete its deferred
+ * completion sweep within the caller's remaining work budget. moq_result_t is
+ * an int whose negative values are errors by convention, so this is not outside
+ * that space; it is a value distinct from every currently assigned public
+ * result code, chosen far from them so that a boundary which forgets to handle
+ * it fails loudly rather than aliasing a real error. Declared only here, in a
+ * non-installed header: no application observes it, and unlimited-mode callers
+ * complete the sweep before returning.
+ *
+ * It is NOT MOQ_ERR_WOULD_BLOCK: bridge inbound handlers read that value as
+ * retained inbound backpressure and set pending flags, which would manufacture
+ * a pending owner for a stream that never blocked. It is NOT an ordinary
+ * negative either: every other negative at the bridge/session boundary reaches
+ * bridge_set_fatal(). Boundaries must test for it BEFORE both branches, and
+ * must leave retryable bridge state intact when they see it.
+ */
+#define MOQ_SESSION_SUSPENDED (-1000)
+
+/*
+ * Budgeted-advance context.
+ *
+ * Bridge service brackets its pass with these so a deferred-completion sweep
+ * can suspend inside it. They MUST be structurally paired: every exit from the
+ * bracketed region leaves the context, or a later ordinary session call would
+ * inherit the budget and could observe MOQ_SESSION_SUSPENDED, which no
+ * application-facing caller may ever see.
+ *
+ * Ordinary session APIs run with no context: they complete any active sweep at
+ * its own epoch, then run one fresh sweep of their own at their now_us -- equal
+ * timestamps included -- then their own operation.
+ */
+/*
+ * Budgeted advancing-call preamble. Requires an active budget context and
+ * spends it directly. Returns MOQ_SESSION_SUSPENDED only when runnable work
+ * could not be afforded; the cursor then holds the resume point.
+ */
+moq_result_t session_begin_advance_budgeted(moq_session_t *s, uint64_t now_us);
+
+void session_budget_enter(moq_session_t *s, uint32_t budget);
+void session_budget_leave(moq_session_t *s);
+
+/* Budget left in the active context. Read before session_budget_leave(), which
+ * zeroes it, to report what a budgeted pass actually spent. */
+uint32_t session_budget_remaining(const moq_session_t *s);
+
+#if defined(MOQ_SESSION_SWEEP_TESTING)
+/* Gated counters, compiled only into moq-core-test-internals. Tests assert
+ * DELTAS across a call: several tests in one binary accumulate into them. */
+extern uint64_t session_budget_enter_count;    /* budget contexts entered */
+extern uint64_t session_budget_suspend_count;  /* budgeted advances suspended */
+#endif
+
 #endif /* MOQ_SESSION_TRANSPORT_H */
