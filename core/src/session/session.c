@@ -2615,13 +2615,12 @@ moq_result_t moq_session_on_data_reset(moq_session_t *s,
                                         uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    (void)error_code;
     moq_result_t arc = session_advance_entry(s, now_us);
     if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
-    return handle_data_reset(s, stream_ref);
+    return handle_data_reset(s, error_code, stream_ref);
 }
 
 moq_result_t moq_session_on_bidi_stream_bytes(moq_session_t *s,

@@ -2107,23 +2107,88 @@ static int test_progress_then_suspension_in_one_pass(void)
     MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
-    /* Entry i committed. */
+    /* Entry i could NOT commit: the abnormal-subgroup event is bounded, and the
+     * event queue is full, so the reset is retained rather than lost. */
+    MOQ_TEST_CHECK(ei->pending_reset);
+    MOQ_TEST_CHECK(ei->pending_reset_code == 0x9);
+    MOQ_TEST_CHECK(ei->active);
+    MOQ_TEST_CHECK(tp.client->rx_streams[rx_slot].active);
+    MOQ_TEST_CHECK(se->processed_stream_count == 0);
+
+    /* A blocked reset is not progress and does not gate the pass: entry j is
+     * free to run. WOULD_BLOCK here means only that THIS stream's reset event
+     * could not be delivered yet -- it is not MOQ_SESSION_SUSPENDED. */
+    MOQ_TEST_CHECK(!ej->pending_retry);
+
+    /* The pass stops on the retained reset, not on a budget suspension: the
+     * old row suspended during entry i's eager finalization, which cannot be
+     * reached while the reset itself is still owed. */
+    MOQ_TEST_CHECK(!out.suspended);
+    MOQ_TEST_CHECK(out.sweep_spent == 0);
+    MOQ_TEST_CHECK(session_budget_suspend_count == suspends);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
+
+    /* Drain EXACTLY the one blocking event, and classify it: silently
+     * discarding setup or reset output would hide a wrong-event bug. */
+    {
+        moq_event_t bev;
+        MOQ_TEST_CHECK(moq_session_poll_events(tp.client, &bev, 1) == 1);
+        MOQ_TEST_CHECK(bev.kind != MOQ_EVENT_SUBGROUP_RESET);
+        moq_event_cleanup(&bev);
+    }
+
+    /* Second service pass: the retained reset retries and retires the entry. */
+    uint64_t suspends2 = session_budget_suspend_count;
+    moq_bridge_budgeted_result_t out2;
+    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+                       tp.client_bridge, 0, 0, &out2) == MOQ_OK);
+
+    /* Exactly one SUBGROUP_RESET, carrying the retained code and identity. */
+    {
+        moq_event_t rev;
+        int n_reset = 0;
+        while (moq_session_poll_events(tp.client, &rev, 1) == 1) {
+            if (rev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                n_reset++;
+                /* Exact image, not just shape: the retained code AND the
+                 * identity this fixture declared (subscriber-role stream on
+                 * csub, group/subgroup 0, no end-of-group). */
+                MOQ_TEST_CHECK(rev.u.subgroup_reset.error_code == 0x9);
+                MOQ_TEST_CHECK(rev.u.subgroup_reset.sub._opaque == csub._opaque);
+                MOQ_TEST_CHECK(!moq_publication_is_valid(rev.u.subgroup_reset.pub));
+                MOQ_TEST_CHECK(rev.u.subgroup_reset.group_id == 0);
+                MOQ_TEST_CHECK(rev.u.subgroup_reset.subgroup_id == 0);
+                MOQ_TEST_CHECK(!rev.u.subgroup_reset.end_of_group);
+                MOQ_TEST_CHECK(rev.detail_size ==
+                    (uint32_t)sizeof(moq_subgroup_reset_event_t));
+            }
+            moq_event_cleanup(&rev);
+        }
+        MOQ_TEST_CHECK(n_reset == 1);
+    }
+
+    /* Entry i committed now. */
     MOQ_TEST_CHECK(!ei->pending_reset);
     MOQ_TEST_CHECK(!ei->active);
     MOQ_TEST_CHECK(!tp.client->rx_streams[rx_slot].active);
     MOQ_TEST_CHECK(se->processed_stream_count == 1);
-    /* ...and its eager finalization blocked, leaving runnable sweep work. */
-    MOQ_TEST_CHECK(se->done_pending);
     MOQ_TEST_CHECK(se->processed_stream_count >= se->done_stream_count);
+    (void)suspends2;
 
-    /* Entry j did not run. */
-    MOQ_TEST_CHECK(ej->active);
-    MOQ_TEST_CHECK(ej->pending_retry);
-
-    MOQ_TEST_CHECK(out.suspended);
-    MOQ_TEST_CHECK(out.sweep_spent == 0);
-    MOQ_TEST_CHECK(session_budget_suspend_count - suspends == 1);
-    MOQ_TEST_CHECK(tp.client->sweep_active);
+    /* A further pass neither duplicates the reset nor resurrects the entry. */
+    {
+        moq_bridge_budgeted_result_t out3;
+        MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+                           tp.client_bridge, 0, 0, &out3) == MOQ_OK);
+        moq_event_t xev;
+        int extra = 0;
+        while (moq_session_poll_events(tp.client, &xev, 1) == 1) {
+            if (xev.kind == MOQ_EVENT_SUBGROUP_RESET) extra++;
+            moq_event_cleanup(&xev);
+        }
+        MOQ_TEST_CHECK(extra == 0);
+        MOQ_TEST_CHECK(!ei->active);
+    }
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(tp.client) != MOQ_SESS_CLOSED);

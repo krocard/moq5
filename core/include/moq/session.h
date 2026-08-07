@@ -758,6 +758,7 @@ typedef uint32_t moq_event_kind_t;
  */
 #define MOQ_EVENT_SUBSCRIPTION_UPDATE_OK     47u
 #define MOQ_EVENT_PUBLICATION_UPDATE_OK      48u
+#define MOQ_EVENT_SUBGROUP_RESET             49u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -915,6 +916,34 @@ typedef struct moq_subgroup_finished_event {
     bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
     uint8_t            _pad[7];
 } moq_subgroup_finished_event_t;
+
+/*
+ * A subgroup data stream ended abnormally with a RESET_STREAM. The abnormal
+ * counterpart of SUBGROUP_FINISHED: emitted in whole-object mode
+ * (streaming_objects=false), where a reset mid-object drops the partial object
+ * and would otherwise leave no trace of the stream ending. Lets a
+ * receiver/relay close its per-subgroup state on an abnormal end.
+ *
+ * Exactly one of `sub` / `pub` is valid, matching the OBJECT_RECEIVED events of
+ * the same subgroup. `error_code` is the RESET_STREAM application error code.
+ * Not emitted for FETCH streams, for gracefully FINed streams (those emit
+ * SUBGROUP_FINISHED), or for streams reset before a usable subgroup ID was
+ * resolved -- a FIRST_OBJECT-mode header that never carried an object has only
+ * the decoder default, and reporting it would let a relay seal subgroup 0 by
+ * mistake. In streaming mode (streaming_objects=true) a reset is instead
+ * surfaced as a terminal OBJECT_CHUNK with terminal=MOQ_OBJECT_TERMINAL_RESET
+ * and this event is not emitted. Owns no resources (moq_event_cleanup is a
+ * no-op).
+ */
+typedef struct moq_subgroup_reset_event {
+    moq_subscription_t sub;
+    moq_publication_t  pub;
+    uint64_t           group_id;
+    uint64_t           subgroup_id;
+    uint64_t           error_code;    /* RESET_STREAM application error code */
+    bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
+    uint8_t            _pad[7];
+} moq_subgroup_reset_event_t;
 
 /* -- Namespace event detail structs -------------------------------- */
 
@@ -1488,6 +1517,7 @@ typedef struct moq_event {
         moq_publish_blocked_event_t            publish_blocked;
         moq_subscribe_tracks_cancelled_event_t subscribe_tracks_cancelled;
         moq_subgroup_finished_event_t          subgroup_finished;
+        moq_subgroup_reset_event_t             subgroup_reset;
         uint8_t                     _reserved[MOQ_EVENT_DETAIL_MAX];
     } u;
 } moq_event_t;

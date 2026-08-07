@@ -211,6 +211,52 @@ static bool rx_is_finished(moq_session_t *s, uint64_t ref_v)
  * returned WITHOUT recording/freeing. The retry (a re-driven FIN delivery)
  * re-enters here and re-attempts only the SUBGROUP_FINISHED push -- never any
  * prior object/chunk, whose ownership has already transferred. */
+/*
+ * Emit SUBGROUP_RESET for an abnormally terminated subgroup stream. Mirrors
+ * rx_finish_stream(): same binding/resolution guard, same parking discipline
+ * when the event queue is full. The caller frees the entry on MOQ_OK.
+ */
+static moq_result_t rx_emit_subgroup_reset(moq_session_t *s, int slot,
+                                           uint64_t error_code)
+{
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+
+    bool bound = moq_subscription_is_valid(rx->sub) !=
+                 moq_publication_is_valid(rx->pub_handle);
+    /* Same guard as the clean-FIN path: a FIRST_OBJECT-mode header whose
+     * stream never carried an object holds only the decoder's default (0),
+     * not a real subgroup ID -- reporting it would let a relay seal subgroup
+     * 0 by mistake. */
+    if (rx->stream_kind != MOQ_STREAM_KIND_SUBGROUP || !bound ||
+        !rx->subgroup_id_resolved)
+        return MOQ_OK;
+
+    if (event_queue_full(s)) {
+        rx->reset_error_code = error_code;
+        rx->parse_state = MOQ_RX_PENDING_RESET;
+        return MOQ_ERR_WOULD_BLOCK;
+    }
+
+    moq_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.kind = MOQ_EVENT_SUBGROUP_RESET;
+    e.detail_size = (uint32_t)sizeof(moq_subgroup_reset_event_t);
+    e.borrow_epoch = s->borrow_epoch;
+    e.u.subgroup_reset.sub = rx->sub;
+    e.u.subgroup_reset.pub = rx->pub_handle;
+    e.u.subgroup_reset.group_id = rx->group_id;
+    e.u.subgroup_reset.subgroup_id = rx->subgroup_id;
+    e.u.subgroup_reset.error_code = error_code;
+    e.u.subgroup_reset.end_of_group = rx->end_of_group;
+    moq_result_t rc = push_event(s, &e);
+    if (rc < 0) {
+        rx->reset_error_code = error_code;
+        rx->parse_state = MOQ_RX_PENDING_RESET;
+        return rc;
+    }
+    return MOQ_OK;
+}
+
 static moq_result_t rx_finish_stream(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
@@ -1580,6 +1626,7 @@ moq_result_t handle_data_bytes_rcbuf(moq_session_t *s,
 }
 
 moq_result_t handle_data_reset(moq_session_t *s,
+                                uint64_t error_code,
                                 moq_stream_ref_t stream_ref)
 {
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1589,9 +1636,28 @@ moq_result_t handle_data_reset(moq_session_t *s,
 
     moq_rx_stream_t *rx = &s->rx_streams[slot];
 
+    /* A parked SUBGROUP_RESET is owed with the code the peer originally sent:
+     * re-drives retry that emit rather than restating the reset. */
+    if (rx->parse_state == MOQ_RX_PENDING_RESET) {
+        moq_result_t prc = rx_emit_subgroup_reset(s, slot,
+                                                  rx->reset_error_code);
+        if (prc < 0) return prc;
+        rx_record_reset_processed(s, slot);
+        rx_free_entry(s, (size_t)slot);
+        return MOQ_OK;
+    }
+
     if (!s->streaming_objects ||
         (rx->parse_state != MOQ_RX_STREAMING_PAYLOAD &&
          rx->parse_state != MOQ_RX_PENDING_CHUNK)) {
+        /* Whole-object mode buffers until an object completes, so a reset
+         * mid-object drops the partial and would otherwise leave the stream's
+         * end invisible. Streaming mode already surfaces the reset as a
+         * terminal OBJECT_CHUNK and needs no second event. */
+        if (!s->streaming_objects) {
+            moq_result_t erc = rx_emit_subgroup_reset(s, slot, error_code);
+            if (erc < 0) return erc;
+        }
         rx_record_reset_processed(s, slot);
         rx_free_entry(s, (size_t)slot);
         return MOQ_OK;

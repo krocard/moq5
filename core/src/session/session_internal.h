@@ -1148,10 +1148,18 @@ typedef enum moq_rx_parse_state {
      * pending_fin set; rx_finish_stream is retried on the next drive until the
      * event is queued, then the entry is recorded-finished and freed. */
     MOQ_RX_PENDING_FINISHED = 8,
+    /* RESET_STREAM seen in whole-object mode with the subgroup resolved, but
+     * the SUBGROUP_RESET event could not be queued (event queue full). The
+     * stream stays live with reset_error_code retained; the emit is retried on
+     * the next drive until it lands, then the entry is freed. */
+    MOQ_RX_PENDING_RESET    = 9,
 } moq_rx_parse_state_t;
 
 typedef struct moq_rx_stream {
     bool                   active;
+    /* RESET_STREAM code retained while a SUBGROUP_RESET emit is parked, so a
+     * re-drive cannot overwrite or lose the code the peer actually sent. */
+    uint64_t               reset_error_code;
     /* Frozen per-object suppression decision (Forward State 0 prohibits
      * Objects): stamped ONCE at object-header admission and retained
      * through all chunks, retries, FIN and terminal RESET, so a Forward
@@ -2895,6 +2903,7 @@ moq_result_t handle_data_bytes_rcbuf(moq_session_t *s,
                                       moq_rcbuf_t *input_rcbuf,
                                       bool fin);
 moq_result_t handle_data_reset(moq_session_t *s,
+                                uint64_t error_code,
                                 moq_stream_ref_t stream_ref);
 
 /* -- Namespace-sub handlers (session_namespace_sub.c) --------------- */
