@@ -252,6 +252,37 @@ int main()
     }
 #endif
 
+    // -- 7. batched poll surface, from an out-of-tree consumer --------
+    // Exercises BOTH new templates through installed headers only, so the
+    // public source usability of the batching surface is covered.
+    {
+        moq::session_config cfg;
+        cfg.perspective = moq::perspective::client;
+        auto s = moq::session::create(cfg, 0);
+        CHECK(static_cast<bool>(s), 70);
+        if (s) {
+            std::size_t acts = s->poll_actions<8>([](moq::polled_action &a) {
+                (void)a.kind();
+            });
+            CHECK(acts == 0, 71);              // nothing queued before start
+            std::size_t evts = s->poll_events<8>([](moq::polled_event &e) {
+                (void)e.kind();
+            });
+            CHECK(evts == 0, 72);
+            // default-N forms, both families
+            std::size_t da = s->poll_actions([](moq::polled_action &) {});
+            CHECK(da == 0, 73);
+            std::size_t de = s->poll_events([](moq::polled_event &) {});
+            CHECK(de == 0, 74);
+            // member-pointer callables: valid std::invocable values that only
+            // compile if the implementation uses std::invoke
+            std::size_t ma = s->poll_actions<4>(&moq::polled_action::kind);
+            CHECK(ma == 0, 75);
+            std::size_t me = s->poll_events<4>(&moq::polled_event::kind);
+            CHECK(me == 0, 76);
+        }
+    }
+
     std::printf("PASS: moq_consumer_test\n");
     return 0;
 }
