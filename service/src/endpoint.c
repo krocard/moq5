@@ -318,6 +318,21 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->wt_profile = cfg->wt_profile;
     }
 
+    /* Handshake bound: the same complete-presence gate; a v0-sized caller gets
+     * 0 (already memset) = the backend's own default. Only picoquic can apply
+     * it (the connect path's configure_quic hook); every other backend would
+     * silently ignore it, so a non-zero value there is an UNSUPPORTED reject,
+     * as with wt_profile. */
+    out->handshake_timeout_us = 0;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, handshake_timeout_us) +
+            sizeof(cfg->handshake_timeout_us)) {
+        if (cfg->handshake_timeout_us != 0 &&
+            out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+            return MOQ_ERR_UNSUPPORTED;
+        out->handshake_timeout_us = cfg->handshake_timeout_us;
+    }
+
     return resolve_versions(&cfg->versions, out);
 }
 
@@ -379,6 +394,7 @@ struct moq_endpoint {
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
     char *ca_file; size_t ca_file_len; /* NULL = system roots */
     bool  insecure;
+    uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
 
     /* The version offer as transport tokens, preference order. The ALPN
      * entries point at the static strings in moq_alpn.h (no ownership);
@@ -674,13 +690,16 @@ static int ep_wtquic_msquic_pump(moq_wtquic_msquic_managed_t *m,
 #endif
 
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
-/* Install real certificate verification unless explicitly skipped: chain +
- * server-name validation against ep->ca_file (NULL = system roots). The
- * facades' built-in default accepts the peer cert, which is NOT
- * production-safe -- making the safe path the default is this tier's job. */
+/* Apply the caller's handshake bound, then install real certificate
+ * verification unless explicitly skipped: chain + server-name validation
+ * against ep->ca_file (NULL = system roots). The facades' built-in default
+ * accepts the peer cert, which is NOT production-safe -- making the safe path
+ * the default is this tier's job.  */
 static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 {
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    if (ep->handshake_timeout_us > 0)
+        picoquic_set_default_handshake_timeout(quic, ep->handshake_timeout_us);
     if (ep->insecure) return 0;
     return moq_picoquic_set_cert_verifier(quic, ep->ca_file);
 }
@@ -1607,6 +1626,7 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     ep->alloc = *alloc;
     ep->protocol = r.protocol;
     ep->insecure = cfg->insecure_skip_verify;
+    ep->handshake_timeout_us = r.handshake_timeout_us;
     atomic_init(&ep->interrupted, false);
     atomic_init(&ep->closed, false);
     pthread_mutex_init(&ep->mu, NULL);
