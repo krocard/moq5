@@ -327,6 +327,11 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
     if ((size_t)cfg->struct_size >=
         offsetof(moq_endpoint_cfg_t, handshake_timeout_us) +
             sizeof(cfg->handshake_timeout_us)) {
+        /* Range first, as with wt_profile: a value the backend would turn into
+         * an immediate timeout by wrapping its absolute deadline is a clean
+         * MOQ_ERR_INVAL on EVERY backend, not a capability answer. */
+        if (cfg->handshake_timeout_us > MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US)
+            return MOQ_ERR_INVAL;
         if (cfg->handshake_timeout_us != 0 &&
             out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
             return MOQ_ERR_UNSUPPORTED;
@@ -1559,6 +1564,15 @@ static const ep_backend_row_t EP_BACKENDS[] = {
 _Static_assert(MOQ_ENDPOINT_CFG_V0_SIZE ==
                    offsetof(moq_endpoint_cfg_t, wt_profile),
                "moq_endpoint_cfg_t v0 floor must end exactly at wt_profile");
+
+/* Each further tail field is APPENDED after the previous tail, never inserted
+ * into it: a caller compiled against the older layout keeps the same offsets
+ * for every field it knows, and its buffer ends before the new one. If
+ * handshake_timeout_us is ever moved ahead of wt_profile's end this fires. */
+_Static_assert(offsetof(moq_endpoint_cfg_t, handshake_timeout_us) >=
+                   offsetof(moq_endpoint_cfg_t, wt_profile) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->wt_profile),
+               "handshake_timeout_us must be appended after wt_profile");
 
 void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg, size_t cfg_size)
 {

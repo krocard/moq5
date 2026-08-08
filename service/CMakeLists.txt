@@ -243,6 +243,36 @@ if(MOQ_BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_resolve COMMAND test_endpoint_resolve)
 
+    # Handshake-bound propagation (picoquic only): prove the resolved value
+    # reaches the QUIC context through the real connect path. endpoint.c is
+    # recompiled with the picoquic setter renamed to a recorder the test
+    # defines, so the seam exists only in this binary -- the shipping library
+    # never sees it. Own object set for exactly that reason.
+    if(MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED)
+        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c)
+        target_include_directories(moq-service-hs-test-internals
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(moq-service-hs-test-internals
+            PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+        target_compile_definitions(moq-service-hs-test-internals PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS}
+            picoquic_set_default_handshake_timeout=moq_test_set_default_handshake_timeout)
+        target_compile_features(moq-service-hs-test-internals PUBLIC c_std_11)
+
+        add_executable(test_endpoint_handshake_timeout
+            tests/test_endpoint_handshake_timeout.c)
+        target_link_libraries(test_endpoint_handshake_timeout PRIVATE
+            moq-service-hs-test-internals moq::core Threads::Threads)
+        target_compile_definitions(test_endpoint_handshake_timeout PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_endpoint_handshake_timeout PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_handshake_timeout
+                 COMMAND test_endpoint_handshake_timeout)
+    endif()
+
     # White-box post() NULL-session contract test (no network, no msf): endpoint.c
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own

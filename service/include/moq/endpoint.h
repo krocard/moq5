@@ -212,13 +212,36 @@ typedef struct moq_endpoint_cfg {
      * handshake holds the endpoint in CONNECTING before it goes terminal. It
      * does NOT bound a peer that completes the handshake and then stalls the
      * WebTransport CONNECT or the MoQ SETUP. 0 leaves the backend's own value
-     * (30 s on picoquic). Honored by the picoquic backend on both protocols; no
-     * other backend exposes a handshake bound, so a NON-ZERO value there is a
-     * connect-time MOQ_ERR_UNSUPPORTED, not a silent no-op. Because it is past
+     * (30 s on picoquic). Honored by the picoquic backend on both protocols. No
+     * other service backend can apply THIS setting -- a transport-handshake-only
+     * bound -- so a NON-ZERO value there is a connect-time MOQ_ERR_UNSUPPORTED,
+     * not a silent no-op. That is a statement about this knob, not about
+     * timeouts in general: other backends have their own timeout mechanisms
+     * with different scope (the MsQuic managed facade, for one, carries a
+     * combined idle/handshake setting), and this field does not drive them.
+     *
+     * ACCEPTED RANGE. The value is a real duration, not a switch: the backend
+     * applies it as an absolute deadline (connection start + this bound), so an
+     * unbounded value would wrap that sum and produce the OPPOSITE of a long
+     * wait. The accepted values are therefore exactly:
+     *   0                                           leave the backend default
+     *   1 .. MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US  a microsecond duration
+     *   anything larger                             MOQ_ERR_INVAL
+     * The MOQ_ERR_INVAL is raised during resolution, BEFORE the backend
+     * capability check, so an out-of-range value reads as INVAL on every
+     * backend rather than UNSUPPORTED on some. There is NO "infinite" sentinel
+     * and nothing is silently clamped -- use 0 to leave the backend's own
+     * value. Because it is past
      * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint64_t handshake_timeout_us;
 } moq_endpoint_cfg_t;
+
+/* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).
+ * A practical no-limit ceiling -- roughly 292,000 years -- chosen so a backend
+ * can add the duration to its absolute microsecond clock without the unsigned
+ * sum wrapping. A larger value is MOQ_ERR_INVAL, never a clamp. */
+#define MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US ((uint64_t)INT64_MAX)
 
 /* Frozen v0 config floor: the smallest cfg struct_size connect()/resolve accept.
  * The required prefix runs through `alloc` (url, protocol, backend, versions,
