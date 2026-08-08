@@ -207,6 +207,17 @@ typedef struct moq_endpoint_cfg {
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg), not the
      * pointer-only moq_endpoint_cfg_init(). */
     uint32_t wt_profile;
+    /* appended (enabled by struct_size): upper bound in microseconds on the
+     * TRANSPORT handshake -- how long a peer that never completes the QUIC/TLS
+     * handshake holds the endpoint in CONNECTING before it goes terminal. It
+     * does NOT bound a peer that completes the handshake and then stalls the
+     * WebTransport CONNECT or the MoQ SETUP. 0 leaves the backend's own value
+     * (30 s on picoquic). Honored by the picoquic backend on both protocols; no
+     * other backend exposes a handshake bound, so a NON-ZERO value there is a
+     * connect-time MOQ_ERR_UNSUPPORTED, not a silent no-op. Because it is past
+     * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
+     * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    uint64_t handshake_timeout_us;
 } moq_endpoint_cfg_t;
 
 /* Frozen v0 config floor: the smallest cfg struct_size connect()/resolve accept.
@@ -223,16 +234,18 @@ typedef struct moq_endpoint_cfg {
  * clears and stamps ONLY the frozen v0 prefix (MOQ_ENDPOINT_CFG_V0_SIZE) and
  * leaves every appended tail field untouched. A config produced this way runs
  * with the tail ABSENT (struct_size stops at the v0 floor), which resolves to
- * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile -- no explicit selection.
- * Because it never writes past the v0 floor, it can NEVER overflow the buffer of
- * an old caller that predates a later tail field. To SET any tail field, use
+ * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection) and to 0
+ * (the backend default) for handshake_timeout_us. Because it never writes past
+ * the v0 floor, it can NEVER overflow the buffer of an old caller that predates
+ * a later tail field. To SET any tail field, use
  * moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
 
 /* Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the
- * initializer to use whenever you set anything beyond the v0 floor (wt_profile).
- * Pass sizeof(moq_endpoint_cfg_t). Never writes past cfg_size, so it is safe for
- * a caller compiled against an older, smaller header too. */
+ * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
+ * handshake_timeout_us). Pass sizeof(moq_endpoint_cfg_t). Never writes past
+ * cfg_size, so it is safe for a caller compiled against an older, smaller
+ * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,
                                          size_t cfg_size);
 
