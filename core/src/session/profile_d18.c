@@ -1034,12 +1034,15 @@ static moq_request_family_t d18_family_from_req_kind(uint32_t kind)
 
 /* Handle a GOAWAY (§10.4) decoded on an established request bidi: validate
  * (no trailing bytes; a server must not receive a non-zero New Session URI),
- * then migrate + free + strict-drain via the draft-neutral core. `r` is the
- * dispatcher's reader positioned just past the GOAWAY envelope. */
+ * then migrate + free via the draft-neutral core, which strict-drains the bidi
+ * unless the peer's FIN has already been observed. `r` is the dispatcher's
+ * reader positioned just past the GOAWAY envelope. `peer_fin_observed` is the
+ * owner's cumulative FIN fact as its dispatcher received it -- a FIN latched on
+ * an earlier call counts, not only one riding this chunk. */
 static moq_result_t d18_request_goaway(moq_session_t *s, moq_stream_ref_t ref,
     moq_request_family_t family, int slot,
     const moq_control_envelope_t *env, const moq_buf_reader_t *r,
-    size_t len, size_t *out_consumed)
+    size_t len, bool peer_fin_observed, size_t *out_consumed)
 {
     moq_d18_goaway_t ga;
     moq_result_t rc = moq_d18_decode_goaway_request(env->payload,
@@ -1053,7 +1056,8 @@ static moq_result_t d18_request_goaway(moq_session_t *s, moq_stream_ref_t ref,
         return close_with_error(s, 0x3,
             "server received GOAWAY with non-zero New Session URI");
     rc = session_core_on_request_goaway(s, family, slot, ref, ga.uri.data,
-                                        ga.uri.len, ga.timeout_ms);
+                                        ga.uri.len, ga.timeout_ms,
+                                        peer_fin_observed);
     if (rc < 0)
         return rc;
     if (s->state == MOQ_SESS_CLOSED)
@@ -1089,7 +1093,7 @@ static moq_result_t d18_process_request_stream(
         if (!committed)
             return close_with_error(s, 0x3,
                 "GOAWAY as first message on a request stream");
-        return d18_request_goaway(s, ref, fam, gep.slot, &env, &r, len,
+        return d18_request_goaway(s, ref, fam, gep.slot, &env, &r, len, fin,
                                   out_consumed);
     }
 
@@ -1393,7 +1397,10 @@ static moq_result_t d18_process_request_stream(
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;        /* cache overflow / duplicate alias */
 
-        rc = session_core_on_publish(s, &d);
+        /* `fin` here is the staging owner's observed request FIN, which
+         * `handle_request_stream_bytes()` supplies from its retained latch --
+         * not merely this transport call's flag. */
+        rc = session_core_on_publish(s, &d, fin);
         if (rc < 0)
             return rc;
         if (s->state == MOQ_SESS_CLOSED)
@@ -1486,7 +1493,8 @@ static moq_result_t d18_process_request_stream(
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;        /* cache overflow / duplicate alias */
 
-        rc = session_core_on_publish_namespace(s, &d);
+        /* The staging owner's observed request FIN (see PUBLISH above). */
+        rc = session_core_on_publish_namespace(s, &d, fin);
         if (rc < 0)
             return rc;
         if (s->state == MOQ_SESS_CLOSED)
@@ -1530,15 +1538,10 @@ static moq_result_t d18_process_request_stream(
             return rc;
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;
-        /* TRACK_STATUS is the first and only message; the requester's FIN rides
-         * this chunk. Record it on the committed entry so accept/reject need not
-         * leave a drain ref for a FIN that already arrived. */
-        if (fin) {
-            moq_request_endpoint_t te =
-                request_registry_find_by_streamref(s, ref);
-            if (te.kind == MOQ_REQ_TRACK_STATUS)
-                s->track_statuses[te.slot].req_recv_fin = true;
-        }
+        /* TRACK_STATUS is the first and only message, so the requester's FIN
+         * rides this chunk. The commit re-keyed the bidi to the new owner; the
+         * FIN is handed over and driven through this family's own FIN handling
+         * by the request-stream handoff, not recorded here. */
         *out_consumed = moq_buf_reader_offset(&r);
         return MOQ_OK;
     }
@@ -1608,6 +1611,15 @@ static moq_result_t d18_process_request_stream(
          * detect (and reject) any trailing bytes the same chunk carried after the
          * SUBSCRIBE_NAMESPACE envelope, on the WOULD_BLOCK path as on the OK path. */
         *out_consumed = msg_len;
+        /* The ownership transition is HERE: this entry now owns the bidi and the
+         * request bytes, and the core will release the generic staging slot even
+         * if processing refuses below. So a FIN that rode the creating
+         * SUBSCRIBE_NAMESPACE becomes this entry's transitional ownership NOW --
+         * before any event-, scratch- or action-capacity refusal can strand it.
+         * It is never written into `pending_fin`, and it is installed only on
+         * this draft-18 handoff: a draft-16 direct request reaches the shared
+         * commit by another route and must not acquire it. */
+        if (fin) s->ns_subs[ns_slot].handoff_fin_pending = true;
         rc = ns_sub_process_recving_publisher(s, ns_slot, fin);
         if (rc < 0)
             return rc;                /* WOULD_BLOCK keeps the entry for a re-feed */
@@ -2122,7 +2134,6 @@ static moq_result_t d18_process_response_stream(
     moq_session_t *s, moq_stream_ref_t ref, int slot, uint32_t kind,
     const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
 {
-    (void)fin;            /* ref is used by the inbound REQUEST_UPDATE arm */
     *out_consumed = 0;
 
     moq_buf_reader_t r;
@@ -2140,7 +2151,8 @@ static moq_result_t d18_process_response_stream(
         moq_request_family_t fam = d18_family_from_req_kind(kind);
         if (fam == (moq_request_family_t)0)
             return close_with_error(s, 0x3, "GOAWAY on unsupported request kind");
-        return d18_request_goaway(s, ref, fam, slot, &env, &r, len, out_consumed);
+        return d18_request_goaway(s, ref, fam, slot, &env, &r, len, fin,
+                                  out_consumed);
     }
 
     /* REQUEST_ERROR is valid for either request kind; route by kind and state. */

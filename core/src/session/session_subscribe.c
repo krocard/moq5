@@ -723,6 +723,23 @@ static moq_result_t handle_fetch_response_bytes(moq_session_t *s, int fslot,
 {
     moq_fetch_entry_t *fe = &s->fetches[fslot];
 
+    /* Publisher side: this bidi carried the peer's FETCH and nothing else. Only
+     * its FIN may follow, whether it arrives on the wire or was handed over by
+     * the commit that re-keyed the bidi onto this entry. The durable latch takes
+     * it and the owner is RETAINED -- the response, and for an accepted fetch the
+     * data stream, are still to come -- so this cannot block. The FETCHER
+     * response decoder below is never reached from here. */
+    if (fe->role == MOQ_FETCH_ROLE_PUBLISHER) {
+        if (len > 0)
+            return close_with_error(s, 0x3,
+                "extra bytes on fetch request bidi");
+        if (fin || fe->handoff_fin_pending) {
+            fe->req_recv_fin = true;
+            fe->handoff_fin_pending = false;
+        }
+        return MOQ_OK;
+    }
+
     /* Draining after a terminal REQUEST_ERROR: absorb the FIN, reject bytes. */
     if (fe->state == MOQ_FETCH_DRAINING_RESPONSE) {
         if (len > 0)
@@ -787,13 +804,21 @@ static moq_result_t handle_track_status_stream_bytes(moq_session_t *s, int tslot
                                                      bool fin)
 {
     moq_ts_entry_t *te = &s->track_statuses[tslot];
+    /* A FIN that rode the creating TRACK_STATUS was handed to this entry by the
+     * commit that re-keyed the bidi; it is the same fact as a wire FIN. */
+    bool fin_now = fin || te->handoff_fin_pending;
 
     /* Publisher side: only the requester's FIN may follow its request. */
     if (te->role == MOQ_TS_ROLE_PUBLISHER) {
         if (len > 0)
             return close_with_error(s, 0x3,
                 "extra bytes on track-status request bidi");
-        if (fin) te->req_recv_fin = true;
+        /* The durable latch takes the FIN over; the owner is retained so the
+         * application can still accept or reject. This cannot block. */
+        if (fin_now) {
+            te->req_recv_fin = true;
+            te->handoff_fin_pending = false;
+        }
         return MOQ_OK;
     }
 
@@ -802,7 +827,7 @@ static moq_result_t handle_track_status_stream_bytes(moq_session_t *s, int tslot
         if (len > 0)
             return close_with_error(s, 0x3,
                 "extra bytes after terminal track-status response");
-        if (fin) ts_free_entry(s, tslot);
+        if (fin_now) ts_free_entry(s, tslot);
         return MOQ_OK;
     }
 
@@ -855,13 +880,19 @@ static moq_result_t handle_subscribe_tracks_stream_bytes(moq_session_t *s,
                                                          bool fin)
 {
     moq_track_sub_entry_t *e = &s->track_subs[slot];
+    /* A FIN that rode the creating SUBSCRIBE_TRACKS was handed to this entry by
+     * the commit that re-keyed the bidi; from here it is the same observed
+     * close as a wire FIN. It is NOT copied into req_recv_fin on the way in:
+     * the cancellation below can refuse on event capacity, and the fact must
+     * survive that refusal so an empty re-feed completes it exactly once. */
+    bool fin_now = fin || e->handoff_fin_pending;
 
     /* Draining after a terminal REQUEST_ERROR: absorb trailing bytes/FIN. */
     if (e->state == MOQ_TRACK_SUB_DRAINING_RESPONSE) {
         if (len > 0)
             return close_with_error(s, 0x3,
                 "extra bytes after terminal subscribe-tracks response");
-        if (fin) track_sub_free_entry(s, slot);
+        if (fin_now) track_sub_free_entry(s, slot);
         return MOQ_OK;
     }
 
@@ -878,26 +909,29 @@ static moq_result_t handle_subscribe_tracks_stream_bytes(moq_session_t *s,
 
     for (;;) {
         e = &s->track_subs[slot];
+        bool peer_fin = track_sub_peer_fin_observed(e);
         size_t consumed = 0;
         moq_result_t rc = as_response
             ? s->profile->process_response_stream(s, stream_ref, slot,
                   (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS,
-                  e->req_recv_buf, e->req_recv_len, e->req_recv_fin, &consumed)
+                  e->req_recv_buf, e->req_recv_len, peer_fin, &consumed)
             : s->profile->process_request_stream(s, stream_ref, slot,
-                  e->req_recv_buf, e->req_recv_len, e->req_recv_fin, &consumed);
+                  e->req_recv_buf, e->req_recv_len, peer_fin, &consumed);
         if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
         if (rc == MOQ_ERR_WOULD_BLOCK) return rc;  /* keep buffer; re-feed retries */
         if (rc < 0) return rc;
 
         if (consumed == 0) {
             if (e->req_recv_len > 0) {
-                if (e->req_recv_fin)
+                if (peer_fin)
                     return close_with_error(s, 0x3,
                         "truncated message on subscribe-tracks stream");
                 return MOQ_OK;            /* incomplete; wait for more bytes */
             }
-            /* No buffered bytes: a clean FIN cancels the subscription. */
-            if (e->req_recv_fin)
+            /* No buffered bytes: a clean FIN cancels the subscription. A
+             * refusal on event capacity leaves the marker set for the re-feed;
+             * a completion frees the entry, whose reset clears both facts. */
+            if (peer_fin)
                 return session_core_on_subscribe_tracks_torn_down(s, slot);
             return MOQ_OK;
         }
@@ -915,7 +949,8 @@ static moq_result_t handle_subscribe_tracks_stream_bytes(moq_session_t *s,
         if (remaining == 0) {
             /* A terminal REQUEST_ERROR left the entry draining; free now if the
              * FIN already arrived in this chunk. */
-            if (e->state == MOQ_TRACK_SUB_DRAINING_RESPONSE && e->req_recv_fin)
+            if (e->state == MOQ_TRACK_SUB_DRAINING_RESPONSE &&
+                track_sub_peer_fin_observed(e))
                 track_sub_free_entry(s, slot);
             return MOQ_OK;
         }
@@ -965,13 +1000,19 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
                                                 bool fin)
 {
     moq_pub_entry_t *e = &s->publishes[slot];
+    /* A FIN that rode the creating PUBLISH was handed to this entry by the
+     * commit that re-keyed the bidi; from here it is the same fact as a FIN
+     * arriving on the wire. It stays in the marker -- not in req_recv_fin --
+     * until this handler durably absorbs it, so a teardown that blocks on
+     * event capacity is resumed by an empty re-feed and completes once. */
+    bool fin_now = fin || e->handoff_fin_pending;
 
     /* Draining after a terminal (PUBLISH_DONE / REQUEST_ERROR): absorb FIN. */
     if (e->state == MOQ_PUB_DRAINING_RESPONSE) {
         if (len > 0)
             return close_with_error(s, 0x3,
                 "extra bytes after terminal publish message");
-        if (fin) pub_free_entry(s, slot);
+        if (fin_now) pub_free_entry(s, slot);
         return MOQ_OK;
     }
 
@@ -983,7 +1024,12 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
     if (e->done_pending) {
         if (len > 0)
             return close_with_error(s, 0x3, "extra bytes after PUBLISH_DONE");
-        if (fin) e->req_recv_fin = true;
+        /* The durable latch takes the FIN over here; the transitional marker
+         * has done its job. */
+        if (fin_now) {
+            e->req_recv_fin = true;
+            e->handoff_fin_pending = false;
+        }
         return MOQ_OK;
     }
 
@@ -1001,20 +1047,21 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
 
     for (;;) {
         e = &s->publishes[slot];
+        bool peer_fin = e->req_recv_fin || e->handoff_fin_pending;
         size_t consumed = 0;
         moq_result_t rc = as_response
             ? s->profile->process_response_stream(s, stream_ref, slot,
                   (uint32_t)MOQ_REQ_PUBLISH,
-                  e->req_recv_buf, e->req_recv_len, e->req_recv_fin, &consumed)
+                  e->req_recv_buf, e->req_recv_len, peer_fin, &consumed)
             : s->profile->process_request_stream(s, stream_ref, slot,
-                  e->req_recv_buf, e->req_recv_len, e->req_recv_fin, &consumed);
+                  e->req_recv_buf, e->req_recv_len, peer_fin, &consumed);
         if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
         if (rc == MOQ_ERR_WOULD_BLOCK) return rc;  /* keep buffer; re-feed retries */
         if (rc < 0) return rc;
 
         if (consumed == 0) {
             if (e->req_recv_len > 0) {
-                if (e->req_recv_fin)
+                if (peer_fin)
                     return close_with_error(s, 0x3,
                         "truncated message on publish stream");
                 return MOQ_OK;            /* incomplete; wait for more bytes */
@@ -1022,9 +1069,15 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
             /* No buffered bytes: a clean FIN tears the publication down --
              * unless a PUBLISH_DONE was just deferred for Stream-Count gating
              * (e.g. PUBLISH_DONE and the FIN arrived together), in which case the
-             * FIN is absorbed and the gated finish waits for the data streams. */
-            if (e->req_recv_fin) {
-                if (e->done_pending) return MOQ_OK;
+             * FIN is absorbed and the gated finish waits for the data streams.
+             * A blocked teardown leaves the marker set for the next re-feed;
+             * a completed one frees the entry, which clears it. */
+            if (peer_fin) {
+                if (e->done_pending) {
+                    e->req_recv_fin = true;
+                    e->handoff_fin_pending = false;
+                    return MOQ_OK;
+                }
                 return publish_torn_down(s, slot);
             }
             return MOQ_OK;
@@ -1042,11 +1095,72 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
         if (remaining == 0) {
             /* A terminal left the entry draining; free now if the FIN already
              * arrived in this chunk. */
-            if (e->state == MOQ_PUB_DRAINING_RESPONSE && e->req_recv_fin)
+            if (e->state == MOQ_PUB_DRAINING_RESPONSE &&
+                (e->req_recv_fin || e->handoff_fin_pending))
                 pub_free_entry(s, slot);
             return MOQ_OK;
         }
         /* More buffered messages remain (established lifecycle). */
+    }
+}
+
+/* A peer request that carried the FIN in the same chunk commits into another
+ * pool and re-keys the bidi to that owner; the staging slot that recorded the
+ * FIN is then released. The FIN belongs to the destination owner, so record it
+ * there as transitional ownership and drive that family's own FIN handling --
+ * the same handler a later wire FIN would reach. Nothing here decides the
+ * outcome: a family whose teardown blocks on capacity keeps the marker and is
+ * resumed by an empty re-feed, which routes back to the same handler. Families
+ * outside this slice keep their existing behavior. */
+static moq_result_t request_stream_handoff_fin(moq_session_t *s,
+                                                moq_stream_ref_t stream_ref,
+                                                moq_request_endpoint_t dest)
+{
+    switch (dest.kind) {
+    case MOQ_REQ_PUBLISH:
+        return handle_publish_stream_bytes(s, (int)dest.slot, stream_ref,
+                                            NULL, 0, false);
+    case MOQ_REQ_TRACK_STATUS:
+        return handle_track_status_stream_bytes(s, (int)dest.slot, stream_ref,
+                                                 NULL, 0, false);
+    case MOQ_REQ_FETCH:
+        return handle_fetch_response_bytes(s, (int)dest.slot, stream_ref,
+                                            NULL, 0, false);
+    case MOQ_REQ_ANNOUNCEMENT:
+        return handle_announcement_stream_bytes(s, (int)dest.slot, stream_ref,
+                                                 NULL, 0, false);
+    case MOQ_REQ_SUBSCRIBE_TRACKS:
+        return handle_subscribe_tracks_stream_bytes(s, (int)dest.slot,
+                                                     stream_ref, NULL, 0, false);
+    default:
+        return MOQ_OK;
+    }
+}
+
+/* Install the transitional FIN ownership on the destination owner. Separate
+ * from the drive above so it happens while the staging slot is still being
+ * retired -- the fact is never absent between the commit and its handling. */
+static bool request_stream_handoff_fin_install(moq_session_t *s,
+                                                moq_request_endpoint_t dest)
+{
+    switch (dest.kind) {
+    case MOQ_REQ_PUBLISH:
+        s->publishes[dest.slot].handoff_fin_pending = true;
+        return true;
+    case MOQ_REQ_TRACK_STATUS:
+        s->track_statuses[dest.slot].handoff_fin_pending = true;
+        return true;
+    case MOQ_REQ_FETCH:
+        s->fetches[dest.slot].handoff_fin_pending = true;
+        return true;
+    case MOQ_REQ_ANNOUNCEMENT:
+        s->announcements[dest.slot].handoff_fin_pending = true;
+        return true;
+    case MOQ_REQ_SUBSCRIBE_TRACKS:
+        s->track_subs[dest.slot].handoff_fin_pending = true;
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -1323,10 +1437,22 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
              * are a violation on the WOULD_BLOCK path too (not silently dropped
              * with the freed staging slot). */
             bool extra = (consumed < e->req_recv_len);
+            /* The destination lives in idx_ns_by_ref, NOT the request registry --
+             * the stream-ref key still names this staging slot until the free
+             * below. Resolve the committed namespace-sub owner through its own
+             * index, and drive its transitional FIN ownership only after the
+             * staging slot is released, through the family's own handler by an
+             * empty internal re-feed. No post-FIN peer bytes are invented. */
+            int32_t ns_dest = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
+                                              stream_ref._v);
+            bool handed_fin = rc == MOQ_OK && ns_dest >= 0 &&
+                              s->ns_subs[ns_dest].handoff_fin_pending;
             sub_free_entry(s, (size_t)slot);
             if (extra)
                 return close_with_error(s, 0x3,
                     "extra bytes after request on stream");
+            if (handed_fin)
+                return handle_bidi_stream_bytes(s, stream_ref, NULL, 0, false);
             return rc;                /* MOQ_OK (committed) or WOULD_BLOCK (retry) */
         }
         if (rc == MOQ_ERR_WOULD_BLOCK)
@@ -1365,9 +1491,15 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
                 request_registry_find_by_streamref(s, stream_ref);
             bool staging_key_is_stale =
                 (cur.kind == MOQ_REQ_SUBSCRIPTION && cur.slot == slot);
+            /* The FIN rode the request into the new owner; hand it over before
+             * the staging slot that recorded it is released. */
+            bool handed_fin = !staging_key_is_stale && e->req_recv_fin &&
+                request_stream_handoff_fin_install(s, cur);
             if (!staging_key_is_stale)
                 s->subs[slot].request_stream_ref = moq_stream_ref_from_u64(0);
             sub_free_entry(s, (size_t)slot);
+            if (handed_fin)
+                return request_stream_handoff_fin(s, stream_ref, cur);
             return MOQ_OK;
         }
 
@@ -1545,8 +1677,11 @@ moq_result_t request_stream_teardown(moq_session_t *s,
 moq_result_t session_core_on_request_goaway(
     moq_session_t *s, moq_request_family_t family, int slot,
     moq_stream_ref_t ref, const uint8_t *uri, size_t uri_len,
-    uint64_t timeout_ms)
+    uint64_t timeout_ms, bool peer_fin_observed)
 {
+    /* The one authoritative drain decision for this terminal, used by the
+     * preflight below and by the retirement that follows it. */
+    bool need_drain = !peer_fin_observed;
     /* We already migrated this request with our own GOAWAY (entry kept live): a
      * GOAWAY received now is a second GOAWAY on the stream -> PROTOCOL_VIOLATION
      * (§10.4), even though our entry is not yet in the strict drain ring. */
@@ -1581,11 +1716,14 @@ moq_result_t session_core_on_request_goaway(
     }
 
     /* Fixed-count, reserve-before-mutate: event slot, the conditional close
-     * action, and a strict drain slot. No data-stream resets (graceful
-     * migration leaves media on the old session). */
+     * action, and -- only when one is owed -- a strict drain slot. No
+     * data-stream resets (graceful migration leaves media on the old session).
+     * A peer that already closed its send half can send nothing late, so an
+     * exhausted ring must not refuse a terminal that needs no reference. */
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (close_half && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
 
     size_t scratch_saved = s->event_scratch_len;
     moq_bytes_t ev_uri = {0};
@@ -1617,10 +1755,10 @@ moq_result_t session_core_on_request_goaway(
     }
 
     /* Close our send half (reserved above) unless it is already FIN'd, then retire
-     * the bidi (strict drain + free the entry). */
+     * the bidi (free the entry, plus the strict drain when one is owed). */
     if (close_half)
         (void)queue_close_bidi(s, ref);
-    request_goaway_retire(s, family, slot, ref);
+    request_goaway_retire(s, family, slot, ref, need_drain);
     return MOQ_OK;
 }
 
@@ -1646,14 +1784,16 @@ static void request_goaway_free_entry(moq_session_t *s,
     }
 }
 
-/* Receive-side retire (a GOAWAY we *received*): strict-drain the request bidi so
- * the peer's later FIN/RESET/STOP retires the ref while a duplicate GOAWAY or stray
- * non-empty bytes close 0x3, then free the entry. The caller reserved the drain
- * slot. */
+/* Receive-side retire (a GOAWAY we *received*): when `need_drain`, strict-drain
+ * the request bidi so the peer's later FIN/RESET/STOP retires the ref while a
+ * duplicate GOAWAY or stray non-empty bytes close 0x3; then free the entry
+ * either way. The caller decided `need_drain` and reserved the slot when true;
+ * a peer FIN already observed leaves nothing for a reference to absorb. */
 void request_goaway_retire(moq_session_t *s, moq_request_family_t family,
-                           int slot, moq_stream_ref_t ref)
+                           int slot, moq_stream_ref_t ref, bool need_drain)
 {
-    (void)drain_ref_add_strict(s, ref);
+    if (need_drain)
+        (void)drain_ref_add_strict(s, ref);
     request_goaway_free_entry(s, family, slot);
 }
 
@@ -2232,12 +2372,34 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
         uint64_t err_code = d->auth_reject_code
             ? d->auth_reject_code : MOQ_REQUEST_ERROR_NOT_SUPPORTED;
         if (d->target_kind == MOQ_REQ_SUBSCRIPTION) {
-            /* Terminating the subscription: tear down its active subgroups
-             * (same as UNSUBSCRIBE) before announcing PUBLISH_DONE and freeing
-             * it, so its data streams are reset on the wire and its subgroup
-             * slots released rather than left pinned after termination.
-             * WOULD_BLOCK here is retryable and resumes via the idempotent reset
-             * loop; nothing is committed/freed yet. */
+            /* The terminal frees a live publisher-role subscription whose
+             * request bidi the peer may still be sending on, so it owes a drain
+             * reference to absorb a message already in flight -- unless that
+             * peer FIN has already been observed. This family is same-entry:
+             * `handle_request_stream_bytes()` latched the FIN on THIS entry
+             * before dispatching, and there is no ownership handoff and no
+             * handoff marker, so `req_recv_fin` is the whole fact. Draft-16
+             * carries the terminal on the control channel and never drains.
+             *
+             * ONE decision, reserved here and inserted below. It is reserved
+             * BEFORE `sub_reset_subgroups()` because that helper queues resets
+             * and mutates subgroup state: a refusal afterwards would leave a
+             * half-torn-down subscription behind. */
+            moq_sub_entry_t *ue = &s->subs[d->target_slot];
+            bool need_drain = moq_session_uses_request_streams(s) &&
+                              ue->request_stream_ref._v != 0 &&
+                              !ue->req_recv_fin;
+            if (need_drain && s->drain_ref_count >= s->drain_ref_cap) {
+                result = MOQ_ERR_WOULD_BLOCK;
+                goto cleanup_all;
+            }
+
+            /* Tear down the subscription's active subgroups (same as
+             * UNSUBSCRIBE) before announcing PUBLISH_DONE and freeing it, so its
+             * data streams are reset on the wire and its subgroup slots enter
+             * MOQ_SG_RESETTING for the terminal reap rather than staying pinned
+             * as live streams. WOULD_BLOCK here is retryable and resumes via the
+             * idempotent reset loop; nothing is committed/freed yet. */
             rc = sub_reset_subgroups(s, (size_t)d->target_slot);
             if (rc < 0) { result = rc; goto cleanup_all; }
 
@@ -2284,6 +2446,10 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
                 if (rc < 0) { result = rc; goto cleanup_all; }
                 rc = queue_send_bidi(s, up_ref, done_buf, done_len, true);
                 if (rc < 0) { result = rc; goto cleanup_all; }
+                /* The exact terminal is on the wire; take the reference the
+                 * decision above reserved, before the entry is freed. */
+                if (need_drain)
+                    (void)drain_ref_add(s, up_ref);
             } else {
                 /* Control-channel profiles (draft-16): encode both before queuing
                  * to avoid partial output. */
@@ -3003,8 +3169,10 @@ moq_result_t moq_session_request_goaway_subscribe(
 }
 
 /* Internal draft-18 cancel of a subscriber-role subscription: STOP_SENDING +
- * RESET the request bidi, reserve a drain slot so a late SUBSCRIBE_OK /
- * REQUEST_ERROR is discarded rather than mistaken for a new inbound request, then
+ * RESET the request bidi, reserve and install a NORMAL drain reference -- but
+ * only while the peer's request send half is still open, so a late SUBSCRIBE_OK /
+ * REQUEST_ERROR is discarded rather than mistaken for a new inbound request; an
+ * already-observed FIN leaves nothing to absorb and needs no reference. Then
  * free the entry. Reserve-before-mutate (WOULD_BLOCK leaves state intact). Shared
  * by moq_session_unsubscribe and the UNSUPPORTED_EXTENSION (0x33) path; the caller
  * has already validated role/state and that request streams are in use. Does NOT
@@ -3012,9 +3180,17 @@ moq_result_t moq_session_request_goaway_subscribe(
 static moq_result_t subscribe_request_bidi_cancel(moq_session_t *s, int slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
-    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
-    if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = e->request_stream_ref;
+    /* One drain decision for both the preflight and the insertion below. The
+     * subscription is the same-entry family -- the staging slot IS the
+     * subscription slot, so there is no handoff marker and `req_recv_fin` is the
+     * whole observed-FIN fact. A peer that already closed its send half can send
+     * nothing late, so the reference has nothing to absorb; the abort action and
+     * the entry's retirement are unaffected. */
+    bool need_drain = ref._v != 0 && !e->req_recv_fin;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
     moq_action_t abort_a;
     memset(&abort_a, 0, sizeof(abort_a));
     abort_a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
@@ -3024,7 +3200,8 @@ static moq_result_t subscribe_request_bidi_cancel(moq_session_t *s, int slot)
     abort_a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
     moq_result_t src = push_action(s, &abort_a);
     if (src < 0) return src;
-    (void)drain_ref_add(s, ref);   /* slot reserved above */
+    if (need_drain)
+        (void)drain_ref_add(s, ref);   /* slot reserved above */
     sub_free_entry(s, (size_t)slot);
     return MOQ_OK;
 }
@@ -3282,12 +3459,17 @@ moq_result_t moq_session_done_subscribe(
 
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     bool req_stream = moq_session_uses_request_streams(s);
+    moq_stream_ref_t req_ref = e->request_stream_ref;
     /* Reserve a drain slot so a late in-flight REQUEST_UPDATE arriving on the
      * request bidi after we FIN + free is discarded, not mistaken for a new
-     * inbound request. */
-    if (req_stream && s->drain_ref_count >= s->drain_ref_cap)
+     * inbound request -- unless the subscriber's FIN was already observed, which
+     * leaves nothing to absorb. `req_recv_fin` is the whole fact here: the
+     * subscription is the same-entry family and carries no handoff marker. One
+     * decision, used by this preflight and by the insertion below; the
+     * PUBLISH_DONE + FIN and the entry's retirement are unaffected. */
+    bool need_drain = req_stream && req_ref._v != 0 && !e->req_recv_fin;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
-    moq_stream_ref_t req_ref = e->request_stream_ref;
 
     moq_finish_publish_encode_args_t args = {
         .request_id = e->request_id,
@@ -3309,7 +3491,7 @@ moq_result_t moq_session_done_subscribe(
          * FIN it. The publisher may destroy subscription state immediately. */
         rc = queue_subscribe_response(s, (size_t)slot, elen, true /* fin */);
         if (rc < 0) return rc;
-        if (req_ref._v != 0)
+        if (need_drain)
             (void)drain_ref_add(s, req_ref);   /* slot reserved above */
     } else {
         moq_action_t act;

@@ -277,6 +277,14 @@ if(TARGET moq::sim)
     target_link_libraries(test_d18_subscribe_tracks PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_subscribe_tracks COMMAND test_d18_subscribe_tracks)
 
+    add_executable(test_ownership_graph unit/test_ownership_graph.c)
+    target_link_libraries(test_ownership_graph PRIVATE moq-core-test-internals)
+    add_test(NAME ownership_graph COMMAND test_ownership_graph)
+
+    add_executable(test_d18_fin_handoff unit/test_d18_fin_handoff.c)
+    target_link_libraries(test_d18_fin_handoff PRIVATE moq-core-test-internals)
+    add_test(NAME d18_fin_handoff COMMAND test_d18_fin_handoff)
+
     add_executable(test_d18_publish unit/test_d18_publish.c)
     target_link_libraries(test_d18_publish PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_publish COMMAND test_d18_publish)

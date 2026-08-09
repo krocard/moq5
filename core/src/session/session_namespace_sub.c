@@ -362,19 +362,29 @@ static void ns_sub_free_prefix(moq_session_t *s, moq_ns_sub_entry_t *e)
 /* ns_sub_free_entry is declared in session_internal.h (shared with the request
  * GOAWAY handler). */
 
+/* `peer_fin_observed` is the caller's cumulative fact for this owner --
+ * `ns_sub_fin_observed()`, which takes the dispatcher's current FIN, the durable
+ * `pending_fin` latch and the transitional `handoff_fin_pending` marker
+ * together, so a FIN that rode the creating SUBSCRIBE_NAMESPACE still counts on
+ * an internal retry. */
 static moq_result_t ns_sub_send_request_error(moq_session_t *s,
                                                 size_t ns_slot,
-                                                uint64_t error_code)
+                                                uint64_t error_code,
+                                                bool peer_fin_observed)
 {
     moq_ns_sub_entry_t *e = &s->ns_subs[ns_slot];
 
     /* Stream-correlated profiles (draft-18) free the request bidi here, so
-     * reserve a drain slot up front: a request the peer sent before seeing our
-     * REQUEST_ERROR + FIN is then discarded rather than mistaken for a fresh
-     * request (the generic request path checks the drain ring first). Draft-16
-     * keeps the ns_sub index mapped until teardown and never consults the ring,
-     * so it does not drain. */
-    bool drain = moq_session_uses_request_streams(s);
+     * reserve a drain slot up front -- but only while the peer's send half is
+     * still open: a request it sent before seeing our REQUEST_ERROR + FIN is
+     * then discarded rather than mistaken for a fresh request (the generic
+     * request path checks the drain ring first), while an already-observed FIN
+     * leaves nothing to absorb. Draft-16 keeps the ns_sub index mapped until
+     * teardown and never consults the ring, so it does not drain. One decision
+     * for the preflight and the insertion below; the REQUEST_ERROR + FIN, the
+     * request/auth commit and the entry's retirement are unaffected. */
+    bool drain = moq_session_uses_request_streams(s) &&
+                 e->stream_ref._v != 0 && !peer_fin_observed;
     if (drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -398,7 +408,7 @@ static moq_result_t ns_sub_send_request_error(moq_session_t *s,
     e->auth_committed = true;
     process_auth_tokens_free_staging(s, e->resolved_tokens,
         e->token_staged, e->token_count);
-    if (drain && e->stream_ref._v != 0)
+    if (drain)
         (void)drain_ref_add(s, e->stream_ref);   /* slot reserved above */
     ns_sub_free_entry(s, ns_slot);
     return MOQ_OK;
@@ -462,6 +472,10 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot)
     e->announced_suffixes_inbound = false;
     e->goaway_sent = false;   /* selective free: clear the migration marker so a
                                * reused slot is never seen as already migrated */
+    e->handoff_fin_pending = false;   /* same reason: this pool resets named
+                                       * fields, so the transitional FIN fact
+                                       * must not follow the slot to its next
+                                       * owner */
     e->state = MOQ_NS_SUB_FREE;
     e->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
     memset(&e->request_ep, 0, sizeof(e->request_ep));
@@ -659,14 +673,29 @@ moq_result_t moq_session_subscribe_namespace(
 /* Stream-correlated local teardown of a namespace-sub request bidi (§10.9.1): an
  * unexpected message (e.g. a REQUEST_UPDATE, which is not modelled here) on an
  * established/pending publisher-side bidi closes that bidi, not the session.
- * Cancel the request stream with ONE whole-stream abort, retire the ref via the drain ring so
- * a late in-flight message is discarded rather than mistaken for a fresh request,
- * and free the entry. Reserves all capacity before mutating (retryable). */
-static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot)
+ * Cancel the request stream with ONE whole-stream abort, retire the ref via the
+ * drain ring -- but only while the peer's send half is still open, so a late
+ * in-flight message is discarded rather than mistaken for a fresh request; an
+ * already-observed FIN leaves nothing to absorb -- and free the entry.
+ * `peer_fin_observed` is the caller's cumulative fact for this owner.
+ *
+ * This helper mutates nothing before its capacity reservations succeed, so a
+ * WOULD_BLOCK leaves the session exactly as it was. That is NOT the same as the
+ * ingress operation being retryable: the caller neither retains the extra bytes
+ * that reached this terminal nor records the teardown obligation anywhere, so
+ * the documented empty re-feed cannot resume the operation -- and no peer bytes
+ * are ever re-delivered to recover it either. Giving the operation a durable
+ * carrier -- retained bytes, or a private marker -- is a separate correction. */
+static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot,
+                                          bool peer_fin_observed)
 {
-    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
-    if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = s->ns_subs[slot].stream_ref;
+    /* One decision for the preflight and the insertion. The abort and the
+     * entry's retirement are unconditional. */
+    bool need_drain = ref._v != 0 && !peer_fin_observed;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
     a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
@@ -676,8 +705,25 @@ static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot)
     a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
-    if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
+    if (need_drain) (void)drain_ref_add(s, ref);   /* slot reserved above */
     ns_sub_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+/* Reciprocate the subscriber's graceful cancel: close our own send half so the
+ * peer can retire the bidi, then tear the publisher-side entry down. The close
+ * needs an action slot, so a refusal leaves the entry AND its transitional FIN
+ * ownership intact for an empty re-feed. One body, driven both by a later wire
+ * FIN and by a handed-over one. */
+static moq_result_t ns_sub_publisher_graceful_close(moq_session_t *s,
+                                                    int32_t ns_slot)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[ns_slot];
+    if (e->stream_ref._v != 0) {
+        if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        (void)queue_close_bidi(s, e->stream_ref);
+    }
+    ns_sub_free_entry(s, (size_t)ns_slot);
     return MOQ_OK;
 }
 
@@ -759,7 +805,8 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
 
         if (e->auth_reject_code) {
             moq_result_t erc = ns_sub_send_request_error(s,
-                (size_t)ns_slot, e->auth_reject_code);
+                (size_t)ns_slot, e->auth_reject_code,
+                ns_sub_fin_observed(e, fin));
             return erc;
         }
 
@@ -772,7 +819,8 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
         if (ns_sub_prefix_conflicts(s, e->prefix_parts,
                 e->prefix_count, (int)ns_slot)) {
             moq_result_t erc = ns_sub_send_request_error(s,
-                (size_t)ns_slot, MOQ_REQUEST_ERROR_PREFIX_OVERLAP);
+                (size_t)ns_slot, MOQ_REQUEST_ERROR_PREFIX_OVERLAP,
+                ns_sub_fin_observed(e, fin));
             if (erc != MOQ_OK) ns_sub_free_prefix(s, e);
             return erc;
         }
@@ -957,6 +1005,7 @@ moq_result_t ns_sub_on_new_bidi(moq_session_t *s,
                                 * is not a real empty prefix). */
     e->got_response = false;
     e->pending_fin = false;
+    e->handoff_fin_pending = false;
     e->closing_remote_error = false;
     moq_index_insert(s->idx_ns_by_ref, s->idx_ns_mask,
                      stream_ref._v, slot);
@@ -1077,7 +1126,8 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
             e->state == MOQ_NS_SUB_ESTABLISHED) {
             if (len > 0) {
                 if (moq_session_uses_request_streams(s))
-                    return ns_sub_local_teardown(s, (size_t)ns_slot);
+                    return ns_sub_local_teardown(s, (size_t)ns_slot,
+                                                 ns_sub_fin_observed(e, fin));
                 return close_with_error(s, 0x3,
                     "extra bytes on bidi stream after request");
             }
@@ -1087,13 +1137,9 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
              * send half (so the peer can retire the bidi -- the subscriber's cancel
              * is a graceful FIN, not a reset), then tear the publisher-side entry
              * down. Reserve the close action first (retryable on re-feed). */
-            if (fin && moq_session_uses_request_streams(s)) {
-                if (e->stream_ref._v != 0) {
-                    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-                    (void)queue_close_bidi(s, e->stream_ref);
-                }
-                ns_sub_free_entry(s, (size_t)ns_slot);
-            }
+            if (ns_sub_fin_observed(e, fin) &&
+                moq_session_uses_request_streams(s))
+                return ns_sub_publisher_graceful_close(s, ns_slot);
             return MOQ_OK;
         }
 
@@ -1117,7 +1163,19 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
     /* Decode, validate, auth, emit NS_SUB_REQUEST, commit -- shared with the
      * draft-18 request-stream handoff so the ns_sub state machine has one
      * implementation. */
-    return ns_sub_process_recving_publisher(s, ns_slot, fin);
+    {
+        moq_result_t prc = ns_sub_process_recving_publisher(s, ns_slot, fin);
+        if (prc < 0) return prc;
+        /* The commit that just landed may be the retry of a request whose FIN
+         * was handed over at the ownership transition; that close is owed here,
+         * on the index-routed path, exactly as on the original dispatch. */
+        e = &s->ns_subs[ns_slot];
+        if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER &&
+            ns_sub_fin_observed(e, fin) &&
+            moq_session_uses_request_streams(s))
+            return ns_sub_publisher_graceful_close(s, ns_slot);
+        return prc;
+    }
 }
 
 /* -- Publisher: accept namespace subscription ---------------------- */
@@ -1204,8 +1262,11 @@ moq_result_t moq_session_reject_ns_sub(
      * drain slot up front so a request the peer sent before seeing our
      * REQUEST_ERROR + FIN is discarded rather than mistaken for a fresh request
      * (the generic request path checks the drain ring first). Draft-16 keeps the
-     * ns_sub index mapped until teardown and never consults the ring. */
-    bool drain = moq_session_uses_request_streams(s);
+     * ns_sub index mapped until teardown and never consults the ring. With the
+     * peer's close already observed -- on the wire or handed over by the commit
+     * -- the bidi needs no reference, so a full ring cannot refuse this. */
+    bool drain = moq_session_uses_request_streams(s) &&
+                 !ns_sub_fin_observed(e, false);
     if (drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -1442,16 +1503,21 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
             /* Request-stream GOAWAY (§10.4): migrate the namespace subscription.
              * Terminal on this bidi -- reject trailing bytes -- then the
              * draft-neutral core surfaces MOQ_EVENT_REQUEST_GOAWAY, frees the
-             * entry, closes our half, and strict-drains the ref. */
+             * entry, closes our half, and strict-drains the ref only when the
+             * peer's FIN has not already been observed. */
             if (resp.has_trailing_bytes)
                 return close_with_error(s, 0x3, "extra bytes after GOAWAY");
             if (s->perspective == MOQ_PERSPECTIVE_SERVER &&
                 resp.goaway_uri_len > 0)
                 return close_with_error(s, 0x3,
                     "server received GOAWAY with non-zero New Session URI");
+            /* This route's durable FIN fact is `pending_fin`, latched by the
+             * dispatcher before the response parser runs and retained across a
+             * refusal -- so a GOAWAY that rode the FIN still knows it on the
+             * empty re-feed that completes it. */
             return session_core_on_request_goaway(s, MOQ_REQUEST_FAMILY_NS_SUB,
                 slot, e->stream_ref, resp.goaway_uri, resp.goaway_uri_len,
-                resp.goaway_timeout_ms);
+                resp.goaway_timeout_ms, e->pending_fin);
         }
         case MOQ_NS_RESP_OK: {
             if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;

@@ -295,6 +295,13 @@ typedef struct moq_ann_entry {
     size_t             req_recv_cap;
     size_t             req_recv_len;
     bool               req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * PUBLISH_NAMESPACE carried the peer's FIN, and the commit that re-keyed
+     * the bidi onto this entry took that FIN over with it. The announcement
+     * handler consumes it into req_recv_fin and retains the owner -- the
+     * application still has to accept or reject -- so it never survives the
+     * call that installed it. Cleared on every free/reuse. */
+    bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -424,6 +431,13 @@ typedef struct moq_fetch_entry {
     size_t             req_recv_cap;
     size_t             req_recv_len;
     bool               req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * FETCH carried the peer's FIN, and the commit that re-keyed the bidi onto
+     * this entry took that FIN over with it. Both publisher-role states consume
+     * it synchronously into req_recv_fin and retain the owner -- the response
+     * and any data stream are still to come -- so it never survives the call
+     * that installed it. Cleared on every free/reuse. */
+    bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -496,6 +510,13 @@ typedef struct moq_pub_entry {
     size_t             req_recv_cap;
     size_t             req_recv_len;
     bool               req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * PUBLISH carried the peer's FIN, and the commit that re-keyed the bidi
+     * onto this entry took that FIN over with it. It is consumed by this
+     * family's own FIN handling; a teardown that blocks on event capacity
+     * keeps it, so an empty re-feed resumes and completes exactly once.
+     * Cleared on every free/reuse. */
+    bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -586,6 +607,12 @@ typedef struct moq_ts_entry {
     size_t                      req_recv_cap;
     size_t                      req_recv_len;
     bool                        req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * TRACK_STATUS carried the peer's FIN, and the commit that re-keyed the
+     * bidi onto this entry took that FIN over with it. The publisher-side FIN
+     * handling consumes it into req_recv_fin, retaining the owner.
+     * Cleared on every free/reuse. */
+    bool                        handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -929,6 +956,14 @@ typedef struct moq_ns_sub_entry {
     bool                got_response;
     bool                parse_complete;
     bool                pending_fin;
+    /* Transitional FIN ownership, distinct from pending_fin: the creating
+     * SUBSCRIBE_TRACKS-style handoff -- here the draft-18 SUBSCRIBE_NAMESPACE
+     * request-stream commit -- carried the peer's FIN, and the commit that
+     * moved the bidi into this entry took that FIN over with it. The reciprocal
+     * close it drives reserves an action slot, so the fact stays here across a
+     * refusal and an empty re-feed completes it. This pool's free is SELECTIVE,
+     * so it is cleared there by name. */
+    bool                handoff_fin_pending;
     bool                closing_remote_error;
     bool                forward;
     bool                auth_processed;
@@ -1006,6 +1041,14 @@ typedef struct moq_track_sub_entry {
     size_t                  req_recv_cap;
     size_t                  req_recv_len;
     bool                    req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * SUBSCRIBE_TRACKS carried the peer's FIN, and the commit that re-keyed the
+     * bidi onto this entry took that FIN over with it. Unlike the track-status,
+     * fetch and announcement families, THIS consumer can block -- the
+     * cancellation reserves event capacity -- so the fact stays here across the
+     * refusal and an empty re-feed completes it. Cleared by the whole-record
+     * reset on free/reuse. */
+    bool                    handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -1234,6 +1277,35 @@ typedef struct moq_staged_datagram {
     uint8_t  *bytes;
     size_t    len;
 } moq_staged_datagram_t;
+
+/* -- Peer FIN on a request bidi ------------------------------------ *
+ * The peer has closed its send half when the durable latch records a wire FIN,
+ * or when a same-call FIN handed over with the request still sits on the
+ * destination owner as transitional ownership. A terminal that would reserve a
+ * drain ref to absorb the peer's remaining send half must consult this, not
+ * req_recv_fin alone: a FIN already observed leaves nothing to drain, and a
+ * full drain ring must not block a terminal the peer has already finished. */
+static inline bool pub_peer_fin_observed(const moq_pub_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool ts_peer_fin_observed(const moq_ts_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool fetch_peer_fin_observed(const moq_fetch_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool ann_peer_fin_observed(const moq_ann_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool track_sub_peer_fin_observed(const moq_track_sub_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+/* The namespace-sub family's durable latch is `pending_fin`, and its handler
+ * also sees the wire FIN of the current call, so the unified fact takes all
+ * three. */
+static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
+    return fin || e->pending_fin || e->handoff_fin_pending;
+}
 
 /* -- Request registry ---------------------------------------------- */
 
@@ -2128,8 +2200,20 @@ typedef struct moq_decoded_publish_namespace {
     uint64_t         auth_reject_code; /* non-zero: message-level token reject */
 } moq_decoded_publish_namespace_t;
 
+/* `request_fin_observed` says the request bidi's FIN has been observed for the
+ * buffered request now being dispatched -- on this transport call, or on an
+ * earlier one whose refusal the generic staging owner retained in its
+ * `req_recv_fin` latch (`handle_request_stream_bytes()` passes that latch, not
+ * the raw call FIN, so an empty re-feed still carries the fact). Draft-16
+ * passes false: its control-channel route has no per-request bidi FIN.
+ *
+ * A pre-commit rejection creates no destination owner and installs no
+ * `handoff_fin_pending` marker; staging's latch is its whole retry carrier. The
+ * fact suppresses the drain reference and nothing else -- wire output and
+ * staging retirement still follow stream correlation. */
 moq_result_t session_core_on_publish_namespace(moq_session_t *s,
-                                                moq_decoded_publish_namespace_t *d);
+                                                moq_decoded_publish_namespace_t *d,
+                                                bool request_fin_observed);
 
 /* Dispatch bytes arriving on an established PUBLISH_NAMESPACE request bidi
  * (stream-correlated profiles), role-keyed: the announcer side parses the
@@ -2509,8 +2593,11 @@ typedef struct moq_decoded_publish_done {
 
 /* -- Publish handlers (session_publish.c) ----------------------------- */
 
+/* `request_fin_observed` carries the same fact as the announcement handler
+ * above, on the same terms. */
 moq_result_t session_core_on_publish(moq_session_t *s,
-                                      moq_decoded_publish_t *d);
+                                      moq_decoded_publish_t *d,
+                                      bool request_fin_observed);
 moq_result_t session_core_on_publish_ok(moq_session_t *s,
                                          const moq_decoded_publish_ok_t *d);
 /* Surface a PUBLISH error (REQUEST_ERROR rejecting our outbound PUBLISH).
@@ -2660,12 +2747,20 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot);
 
 /* Surface MOQ_EVENT_REQUEST_GOAWAY for a request migrated by a request-stream
  * GOAWAY (§10.4): free the request entry, close our send half if still open, and
- * strict-drain the bidi. Leaves data streams alone (graceful migration). The
- * caller resolves family+slot from the bidi's stream ref. */
+ * -- unless the peer's FIN has already been observed -- strict-drain the bidi.
+ * Leaves data streams alone (graceful migration). The caller resolves
+ * family+slot from the bidi's stream ref.
+ *
+ * `peer_fin_observed` is the owner's cumulative fact, not a raw per-call flag:
+ * the draft-18 dispatchers receive it from the owner's durable FIN latch, and
+ * the namespace-subscription route passes `pending_fin`. Once the peer has
+ * closed its send half nothing can arrive late, so the strict reference has
+ * nothing to absorb and is not reserved -- output and retirement are
+ * unaffected. */
 moq_result_t session_core_on_request_goaway(
     moq_session_t *s, moq_request_family_t family, int slot,
     moq_stream_ref_t ref, const uint8_t *uri, size_t uri_len,
-    uint64_t timeout_ms);
+    uint64_t timeout_ms, bool peer_fin_observed);
 
 /* Outbound per-request GOAWAY (§10.4): the shared sender behind the seven typed
  * public wrappers. Enforces the family×state eligibility matrix, draft-16
@@ -2688,12 +2783,15 @@ moq_result_t session_core_send_request_goaway(
 bool request_goaway_free_on_teardown(moq_session_t *s, moq_stream_ref_t ref);
 bool request_goaway_already_sent(moq_session_t *s, moq_stream_ref_t ref);
 
-/* Retire a request migrated by a per-request GOAWAY (sent or received): strict-
- * drain the request bidi (FIN/RESET/STOP retire it; a duplicate GOAWAY or stray
- * non-empty bytes close 0x3) and free/tombstone the entry, leaving data streams
- * intact. The caller has reserved the drain-ref slot. */
+/* Retire a request migrated by a per-request GOAWAY (sent or received): when
+ * `need_drain`, strict-drain the request bidi (FIN/RESET/STOP retire it; a
+ * duplicate GOAWAY or stray non-empty bytes close 0x3); either way free or
+ * tombstone the entry, leaving data streams intact. The caller decides
+ * `need_drain` -- an already-observed peer FIN leaves nothing to absorb -- and
+ * has reserved the drain-ref slot when it is true. Retirement itself is
+ * unconditional. */
 void request_goaway_retire(moq_session_t *s, moq_request_family_t family,
-                           int slot, moq_stream_ref_t ref);
+                           int slot, moq_stream_ref_t ref, bool need_drain);
 
 /* -- Shared namespace-prefix helpers (ns_sub + track_sub) ------------ *
  * Two namespace prefixes overlap when one is a prefix of the other (an empty

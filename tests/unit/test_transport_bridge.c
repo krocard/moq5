@@ -10,6 +10,8 @@
 #include "../../core/src/bridge/transport_bridge_internal.h"
 #include "../support/sweep_arm.h"
 #include "../support/failpoint.h"
+#include "../support/fin_case.h"
+#include "../support/ownership_graph.h"
 #include <string.h>
 
 /*
@@ -437,9 +439,15 @@ static int test_budgeted_service_requires_output(void)
  * allocator so a test can fail one of its allocations by ordinal. The
  * bridges always stay on the default allocator, so an armed failure can
  * only land inside the session it targets. */
-static int d18_pair_init_alloc(test_pair_t *tp, uint32_t client_max_events,
-                               const moq_alloc_t *client_alloc,
-                               const moq_alloc_t *server_alloc)
+/* Generalized draft-18 pair: adds a server action cap and the server
+ * endpoint's optional native whole-stream abort. Both extras default off, so
+ * the wrappers below keep their existing behaviour exactly. */
+static int d18_pair_init_caps(test_pair_t *tp, uint32_t client_max_events,
+                              const moq_alloc_t *client_alloc,
+                              const moq_alloc_t *server_alloc,
+                              uint32_t server_max_actions,
+                              bool server_native_abort,
+                              uint32_t server_max_events)
 {
     memset(tp, 0, sizeof(*tp));
 
@@ -457,6 +465,10 @@ static int d18_pair_init_alloc(test_pair_t *tp, uint32_t client_max_events,
     scfg.version = MOQ_VERSION_DRAFT_18;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 10;
+    if (server_max_actions) scfg.max_actions = server_max_actions;
+    /* A tiny SERVER event queue lets a test defer an inbound teardown, which
+     * is what leaves a FIN obligation retained on the bridge. 0 = default. */
+    if (server_max_events) scfg.max_events = server_max_events;
 
     if (moq_session_create(&ccfg, 0, &tp->client) < 0) return -1;
     if (moq_session_create(&scfg, 0, &tp->server) < 0) {
@@ -466,6 +478,11 @@ static int d18_pair_init_alloc(test_pair_t *tp, uint32_t client_max_events,
 
     fake_endpoint_init(&tp->client_ep, 1000, 2000);
     fake_endpoint_init(&tp->server_ep, 3000, 4000);
+    /* The bridge RETAINS the vtable pointer it is handed
+     * (transport_bridge.c:108) rather than copying the table, so an op may be
+     * installed after init. It is done here, before bridge creation, so the
+     * endpoint's capability set is fixed for the whole run. */
+    if (server_native_abort) fake_endpoint_enable_abort(&tp->server_ep);
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
@@ -483,6 +500,14 @@ static int d18_pair_init_alloc(test_pair_t *tp, uint32_t client_max_events,
         return -1;
     }
     return 0;
+}
+
+static int d18_pair_init_alloc(test_pair_t *tp, uint32_t client_max_events,
+                               const moq_alloc_t *client_alloc,
+                               const moq_alloc_t *server_alloc)
+{
+    return d18_pair_init_caps(tp, client_max_events, client_alloc,
+                              server_alloc, 0, false, 0);
 }
 
 static int d18_pair_init(test_pair_t *tp, uint32_t client_max_events)
@@ -850,6 +875,136 @@ static int d18_request_bidi_fixture(test_pair_t *tp, uint64_t *bidi_out)
 fail:
     test_pair_destroy(tp);
     return -1;
+}
+
+/*
+ * BACKLOG #245(c): the bridge's own retry must complete the obligation the
+ * refused call created, not silently discard it.
+ *
+ * Extra bytes on a publisher-side namespace-sub bidi tear that bidi down
+ * (session_namespace_sub.c:1078-1080 -> ns_sub_local_teardown), and the
+ * teardown can refuse for action capacity before recording anything durable
+ * (:667-668). Bridge ingress correctly recognises the owner and retains the
+ * retry (transport_bridge.c:2662-2669) -- so #245(a)'s predicate answers
+ * correctly here, which this fixture also pins. Service then retries with
+ * NULL/0 (:1934-1949); today that empty retry reports MOQ_OK, pending_retry is
+ * cleared, and the teardown is lost.
+ *
+ * Recovery is SERVICE-ONLY: the bridge never re-delivers peer bytes, so the
+ * fixture feeds none after the refusal.
+ */
+/* -- Owner-graph and inventory oracles for the ns_sub bidi ----------- */
+
+/* Exact drain-ring membership: the declared refs, each with its declared
+ * reason, and no others. */
+typedef struct drain_spec { uint64_t ref; moq_drain_reason_t reason; } drain_spec_t;
+
+static int check_drain_membership(const moq_session_t *s,
+                                  const drain_spec_t *want, size_t n,
+                                  const char *what)
+{
+    int failures = 0;
+    if (s->drain_ref_count != n) {
+        fprintf(stderr, "FAIL: %s: drain ring holds %zu refs, expected %zu\n",
+                what, s->drain_ref_count, n);
+        failures++;
+    }
+    for (size_t i = 0; i < n; i++) {
+        moq_stream_ref_t r = moq_stream_ref_from_u64(want[i].ref);
+        if (!drain_ref_contains(s, r)) {
+            fprintf(stderr, "FAIL: %s: drain ref %llu is ABSENT\n", what,
+                    (unsigned long long)want[i].ref);
+            failures++;
+            continue;
+        }
+        if (drain_ref_reason(s, r) != want[i].reason) {
+            fprintf(stderr, "FAIL: %s: drain ref %llu reason %d, expected %d\n",
+                    what, (unsigned long long)want[i].ref,
+                    (int)drain_ref_reason(s, r), (int)want[i].reason);
+            failures++;
+        }
+    }
+    for (size_t i = 0; i < s->drain_ref_count; i++) {
+        int declared = 0;
+        for (size_t k = 0; k < n; k++)
+            if (s->drain_refs[i] == want[k].ref) declared = 1;
+        if (!declared) {
+            fprintf(stderr, "FAIL: %s: UNDECLARED drain ref %llu\n", what,
+                    (unsigned long long)s->drain_refs[i]);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/* A shuttle that CHECKS every result it produces and proves it converged.
+ * d18_shuttle_until_quiescent discards both the service and the ingress
+ * results, so a setup that limped to ESTABLISHED through a refused call would
+ * look identical to a clean one.
+ *
+ * Deliberately file-local, and NOT yet strict about everything: a non-WRITE op
+ * and a write outside both id ranges are counted as movement but not
+ * classified. That is sound for the setup path this drives, where neither
+ * occurs. Tighten those two cases before lifting this into shared support. */
+static int strict_feed(moq_transport_bridge_t *to, fake_endpoint_t *from,
+                       uint64_t uni_base, uint64_t bidi_base, uint64_t now,
+                       size_t *moved, const char *what)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK(from->count < FAKE_EP_MAX_OPS);
+    for (size_t i = 0; i < from->count; i++) {
+        fake_op_t *o = &from->ops[i];
+        (*moved)++;
+        if (o->kind != FAKE_OP_WRITE) continue;
+        moq_result_t rc = MOQ_OK;
+        if (o->stream_id >= uni_base && o->stream_id < uni_base + 1000)
+            rc = moq_transport_bridge_on_peer_uni_bytes(
+                to, o->stream_id, o->data, o->data_len, o->fin, now);
+        else if (o->stream_id >= bidi_base && o->stream_id < bidi_base + 1000)
+            rc = moq_transport_bridge_on_peer_bidi_bytes(
+                to, o->stream_id, o->data, o->data_len, o->fin, now);
+        if (rc != MOQ_OK) {
+            fprintf(stderr, "FAIL: %s: ingress on stream %llu returned %d\n",
+                    what, (unsigned long long)o->stream_id, (int)rc);
+            failures++;
+        }
+    }
+    fake_endpoint_clear_ops(from);
+    return failures;
+}
+
+static int d18_strict_shuttle(test_pair_t *tp, int max, uint64_t now,
+                              const char *what)
+{
+    int failures = 0;
+    for (int i = 0; i < max; i++) {
+        size_t moved = 0;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(tp->client_bridge, now),
+            (int)MOQ_OK);
+        failures += strict_feed(tp->server_bridge, &tp->client_ep, 1000, 2000,
+                                now, &moved, what);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(tp->server_bridge, now),
+            (int)MOQ_OK);
+        failures += strict_feed(tp->client_bridge, &tp->server_ep, 3000, 4000,
+                                now, &moved, what);
+        if (moved) continue;
+        /* Quiescence, proven rather than assumed: nothing left to write and
+         * nothing retained on either side. */
+        MOQ_TEST_CHECK_EQ_SIZE(tp->client_ep.count, (size_t)0);
+        MOQ_TEST_CHECK_EQ_SIZE(tp->server_ep.count, (size_t)0);
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp->client_bridge));
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp->server_bridge));
+        MOQ_TEST_CHECK_EQ_SIZE(tp->client->action_tail - tp->client->action_head,
+                               (size_t)0);
+        MOQ_TEST_CHECK_EQ_SIZE(tp->server->action_tail - tp->server->action_head,
+                               (size_t)0);
+        return failures;
+    }
+    fprintf(stderr, "FAIL: %s: shuttle did not converge in %d rounds\n",
+            what, max);
+    return failures + 1;
 }
 
 /*
@@ -3115,6 +3270,1336 @@ static int test_setup_scratch_shortfall_closes_not_fatal(void)
     return failures;
 }
 
+/* -- Axis 4: physical bridge retirement ------------------------------
+ *
+ * SEMANTIC consumption and PHYSICAL retirement are different facts, asserted
+ * separately. The causal sequence is the Axis 4 one: the peer FIN arrives WITH
+ * the request, so the destination owner is created with the FIN transferred
+ * onto it; the application then retires that owner, which -- the FIN having
+ * been observed -- owes NO drain; and the bridge's own service must afterwards
+ * close our half and retire the physical mapping exactly once.
+ *
+ * Successful FIN ingress records `peer_send_closed` and leaves the entry ACTIVE
+ * until the local half closes (transport_bridge.c:2677), so retirement is a
+ * real transition, not a formality.
+ *
+ * No peer bytes follow the FIN. The only continuation is bridge service.
+ */
+
+typedef struct fin_bridge_run {
+    test_pair_t tp;
+    uint64_t    transport_id;   /* the TRANSPORT stream the peer bytes ride */
+    moq_stream_ref_t ref;       /* the SESSION's internal ref -- a DIFFERENT
+                                 * value, captured once at ingress and never
+                                 * re-derived from an entry that may be gone */
+    int         want_slot;
+    uint32_t    want_gen;
+    uint64_t    want_handle;
+} fin_bridge_run_t;
+
+/* -- P7 TRACK_STATUS family ----------------------------------------- */
+
+#define P7_TOK_TYPE 7
+static const uint8_t k_p7_tok[]  = { 't','s','t','o','k' };
+static const uint8_t k_p7_ns0[]  = { 'e','x','.','c','o','m' };
+static const uint8_t k_p7_ns1[]  = { 's','t','a','t' };
+static const uint8_t k_p7_name[] = { 't','0' };
+#define P7_LARGEST_GROUP 0x33
+#define P7_LARGEST_OBJ   0x04
+#define P7_EXPIRES_MS    5500
+
+static const moq_ts_entry_t *p7_owner(const moq_session_t *s,
+                                      moq_stream_ref_t ref)
+{
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    if (ep.kind != MOQ_REQ_TRACK_STATUS) return NULL;
+    if (ep.slot < 0 || (size_t)ep.slot >= s->ts_cap) return NULL;
+    return &s->track_statuses[ep.slot];
+}
+
+static int p7_pool_busy(const moq_session_t *s)
+{
+    int n = 0;
+    for (size_t i = 0; i < s->ts_cap; i++)
+        if (s->track_statuses[i].state != MOQ_TS_FREE) n++;
+    return n;
+}
+
+static int p7_derive_slot(const moq_session_t *s, uint32_t *out_gen)
+{
+    for (size_t i = 0; i < s->ts_cap; i++)
+        if (s->track_statuses[i].state == MOQ_TS_FREE) {
+            *out_gen = s->track_statuses[i].generation | 1u;
+            return (int)i;
+        }
+    return -1;
+}
+
+/* The peer's request id for the request under check. Peer-opened request ids
+ * advance by two, so a second request on the same session legitimately carries
+ * a different one; the expectation is declared by the caller rather than being
+ * read back from the entry. */
+static uint64_t p7_want_request_id;
+
+/* The FIN fact the owner under check must carry. The first request arrives WITH
+ * a FIN, so its owner latches one; a reused slot admitted from a request with
+ * NO FIN must show a CLEARED latch. Declared by the caller rather than assumed
+ * true, or a free that left a stale `true` behind would pass at reuse. */
+static int p7_want_fin = 1;
+
+static int p7_check_live(const moq_session_t *s, moq_stream_ref_t ref,
+                         int want_slot, uint32_t want_gen, uint64_t want_handle,
+                         const char *what)
+{
+    int bad = 0;
+    if (want_slot < 0 || (size_t)want_slot >= s->ts_cap) {
+        fprintf(stderr, "FINBR %s: declared slot out of range\n", what);
+        return 1;
+    }
+    const moq_ts_entry_t *e = p7_owner(s, ref);
+    if (!e) { fprintf(stderr, "FINBR %s: owner absent\n", what); return 1; }
+    if (e != &s->track_statuses[want_slot]) {
+        fprintf(stderr, "FINBR %s: owner in an undeclared slot\n", what);
+        bad++;
+    }
+    if ((int)e->state != (int)MOQ_TS_PENDING_PUBLISHER) {
+        fprintf(stderr, "FINBR %s: state %d\n", what, (int)e->state);
+        bad++;
+    }
+    if ((int)e->role != (int)MOQ_TS_ROLE_PUBLISHER) {
+        fprintf(stderr, "FINBR %s: role %d\n", what, (int)e->role);
+        bad++;
+    }
+    if (e->generation != want_gen) {
+        fprintf(stderr, "FINBR %s: generation\n", what); bad++;
+    }
+    if (e->handle._opaque != want_handle) {
+        fprintf(stderr, "FINBR %s: handle\n", what); bad++;
+    }
+    if (e->request_id != p7_want_request_id) {
+        fprintf(stderr, "FINBR %s: request id\n", what); bad++;
+    }
+    if (e->request_stream_ref._v != ref._v) {
+        fprintf(stderr, "FINBR %s: owner ref\n", what); bad++;
+    }
+    /* The transferred FIN -- this family's carrier is the durable latch. */
+    if ((e->req_recv_fin ? 1 : 0) != p7_want_fin) {
+        fprintf(stderr, "FINBR %s: FIN latch %d, expected %d\n", what,
+                e->req_recv_fin ? 1 : 0, p7_want_fin);
+        bad++;
+    }
+    if (p7_pool_busy(s) != 1) {
+        fprintf(stderr, "FINBR %s: pool occupancy %d, expected 1\n", what,
+                p7_pool_busy(s));
+        bad++;
+    }
+    return bad;
+}
+
+static int p7_check_retired(const moq_session_t *s, moq_stream_ref_t ref,
+                            int want_slot, const char *what)
+{
+    int bad = 0;
+    if (p7_owner(s, ref) != NULL) {
+        fprintf(stderr, "FINBR %s: registry edge survives\n", what); bad++;
+    }
+    /* The POOL too: removing the edge while leaking the slot must not pass. */
+    if (want_slot >= 0 && (size_t)want_slot < s->ts_cap &&
+        s->track_statuses[want_slot].state != MOQ_TS_FREE) {
+        fprintf(stderr, "FINBR %s: pool slot leaked\n", what); bad++;
+    }
+    if (p7_pool_busy(s) != 0) {
+        fprintf(stderr, "FINBR %s: pool occupancy %d, expected 0\n", what,
+                p7_pool_busy(s));
+        bad++;
+    }
+    return bad;
+}
+
+/* The request the producer must surface, built from the DECLARED handle. */
+static int p7_want_request(txs_norm_vec_t *v, uint64_t handle)
+{
+    txs_img_t im;
+    txs_img_init(&im);
+    txs_img_u64(&im, handle);
+    txs_img_u64(&im, 2);                                /* ns part count */
+    txs_img_bytes(&im, k_p7_ns0, sizeof(k_p7_ns0));
+    txs_img_bytes(&im, k_p7_ns1, sizeof(k_p7_ns1));
+    txs_img_bytes(&im, k_p7_name, sizeof(k_p7_name));
+    txs_img_u64(&im, 1);                                /* token count */
+    txs_img_u64(&im, P7_TOK_TYPE);
+    txs_img_bytes(&im, k_p7_tok, sizeof(k_p7_tok));
+    if (!txs_norm_append_img(v, MOQ_EVENT_TRACK_STATUS_REQUEST, &im)) {
+        fprintf(stderr, "FINBR: could not build the declared request image\n");
+        return 1;
+    }
+    return 0;
+}
+
+/* The owner record plus the bytes it owns. The raw compare is SHALLOW by
+ * itself -- it would see a moved `track_id_buf` pointer but not edited bytes --
+ * so the identity buffer is deep-copied alongside it. Bounds-safe: an
+ * over-long or unbacked buffer makes the record incomparable rather than being
+ * read. */
+#define P7_OWN_MAX 256
+typedef struct p7_snap {
+    int      valid;
+    moq_ts_entry_t raw;
+    size_t   tid_len;
+    uint8_t  tid[P7_OWN_MAX];
+} p7_snap_t;
+
+static int p7_check_terminal_wire(void *vctx, const char *what);
+
+/* The family's EXACT topology: one stream-ref edge while live, none at all
+ * once retired. */
+static int p7_check_edges(const og_graph_t *g, moq_stream_ref_t ref,
+                          int want_slot, int live, const char *what)
+{
+    int bad = og_check_integrity(g, what);
+    if (live) {
+        bad += og_check_edge(g, OG_DOM_REQ_STREAMREF, ref._v,
+                             MOQ_REQ_TRACK_STATUS, want_slot, what);
+        const og_edge_spec_t w[] = { { OG_DOM_REQ_STREAMREF, ref._v } };
+        bad += og_check_owner_edges(g, MOQ_REQ_TRACK_STATUS, want_slot, w, 1,
+                                    what);
+    } else {
+        bad += og_check_no_edge(g, OG_DOM_REQ_STREAMREF, ref._v, what);
+        bad += og_check_owner_edges(g, MOQ_REQ_TRACK_STATUS, want_slot, NULL,
+                                    0, what);
+    }
+    bad += og_check_no_edge(g, OG_DOM_NS_REF, ref._v, what);
+    return bad;
+}
+
+/* This route owes NO drain at any phase: the FIN is observed before the
+ * terminal runs, so the declared multiset is EMPTY throughout. */
+static int p7_check_drain(const moq_session_t *s, const char *what)
+{
+    return check_drain_membership(s, NULL, 0, what);
+}
+
+
+/* -- the descriptor's hooks, all four genuinely consumed -------------- */
+
+
+static void p7_capture(const moq_session_t *s, void *vctx, void *state,
+                       size_t cap)
+{
+    fin_bridge_run_t *r = (fin_bridge_run_t *)vctx;
+    p7_snap_t *o = (p7_snap_t *)state;
+    /* The declared size is the contract; refuse rather than overwrite. */
+    if (cap < sizeof(*o)) { fprintf(stderr, "FINBR: snapshot storage too small\n"); return; }
+    memset(o, 0, sizeof(*o));
+    if (r->want_slot < 0 || (size_t)r->want_slot >= s->ts_cap) return;
+    const moq_ts_entry_t *e = &s->track_statuses[r->want_slot];
+    o->raw = *e;
+    o->tid_len = e->track_id_len;
+    if (e->track_id_len > P7_OWN_MAX || (e->track_id_len && !e->track_id_buf))
+        return;
+    if (e->track_id_len) memcpy(o->tid, e->track_id_buf, e->track_id_len);
+    o->valid = 1;
+}
+
+static int p7_check(const moq_session_t *s, void *vctx, const void *state,
+                    size_t cap, const char *what)
+{
+    const p7_snap_t *want = (const p7_snap_t *)state;
+    p7_snap_t now;
+    if (cap < sizeof(now)) {
+        fprintf(stderr, "FINBR %s: snapshot storage too small\n", what);
+        return 1;
+    }
+    p7_capture(s, vctx, &now, sizeof(now));
+    if (!now.valid || !want->valid) {
+        fprintf(stderr, "FINBR %s: incomparable owner record\n", what);
+        return 1;
+    }
+    if (memcmp(&now.raw, &want->raw, sizeof(now.raw)) != 0) {
+        fprintf(stderr, "FINBR %s: owner record changed\n", what);
+        return 1;
+    }
+    if (now.tid_len != want->tid_len ||
+        (now.tid_len && memcmp(now.tid, want->tid, now.tid_len) != 0)) {
+        fprintf(stderr, "FINBR %s: retained track identity changed\n", what);
+        return 1;
+    }
+    return 0;
+}
+
+static bool p7_norm_event(const moq_event_t *ev, void *ctx, txs_norm_vec_t *out)
+{
+    (void)ctx;
+    if (ev->kind != MOQ_EVENT_TRACK_STATUS_REQUEST) {
+        fprintf(stderr, "FINBR: unnormalized event kind %u\n",
+                (unsigned)ev->kind);
+        return false;
+    }
+    const moq_track_status_request_event_t *q = &ev->u.track_status_request;
+    txs_img_t im;
+    txs_img_init(&im);
+    txs_img_u64(&im, q->handle._opaque);
+    if (q->track_namespace.count > 32 || q->token_count > 16) {
+        fprintf(stderr, "FINBR: implausible request counts\n");
+        return false;
+    }
+    if (q->track_namespace.count && !q->track_namespace.parts) {
+        fprintf(stderr, "FINBR: namespace count with NULL parts\n");
+        return false;
+    }
+    if (q->token_count && !q->tokens) {
+        fprintf(stderr, "FINBR: token count with NULL tokens\n");
+        return false;
+    }
+    txs_img_u64(&im, (uint64_t)q->track_namespace.count);
+    for (size_t i = 0; i < q->track_namespace.count; i++) {
+        const moq_bytes_t *b = &q->track_namespace.parts[i];
+        if (b->len && !b->data) {
+            fprintf(stderr, "FINBR: namespace part %zu has NULL bytes\n", i);
+            return false;
+        }
+        txs_img_bytes(&im, b->data, b->len);
+    }
+    if (q->track_name.len && !q->track_name.data) {
+        fprintf(stderr, "FINBR: track name has NULL bytes\n");
+        return false;
+    }
+    txs_img_bytes(&im, q->track_name.data, q->track_name.len);
+    txs_img_u64(&im, (uint64_t)q->token_count);
+    for (size_t i = 0; i < q->token_count; i++) {
+        if (q->tokens[i].token_value.len && !q->tokens[i].token_value.data) {
+            fprintf(stderr, "FINBR: token %zu has NULL bytes\n", i);
+            return false;
+        }
+        txs_img_u64(&im, q->tokens[i].token_type);
+        txs_img_bytes(&im, q->tokens[i].token_value.data,
+                      q->tokens[i].token_value.len);
+    }
+    return txs_norm_append_img(out, ev->kind, &im);
+}
+
+/* The bridge drains the session's actions itself, so anything still queued
+ * afterwards is unexpected by definition. */
+static bool p7_norm_action(const moq_action_t *a, void *ctx, txs_norm_vec_t *out)
+{
+    (void)ctx; (void)out;
+    fprintf(stderr, "FINBR: action kind %u left queued after service\n",
+            (unsigned)a->kind);
+    return false;
+}
+
+static moq_result_t p7_feed_id(moq_transport_bridge_t *b, uint64_t request_id,
+                               uint64_t transport_id, bool fin)
+{
+    uint8_t msg[192];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_bytes_t parts[] = { { k_p7_ns0, sizeof(k_p7_ns0) },
+                            { k_p7_ns1, sizeof(k_p7_ns1) } };
+    moq_namespace_t ns = { parts, 2 };
+    moq_d18_msg_params_t p = { 0 };
+    p.auth_token_count = 1;
+    p.auth_tokens[0].alias_type = 3;              /* USE_VALUE */
+    p.auth_tokens[0].token_type = P7_TOK_TYPE;
+    p.auth_tokens[0].token_value = (moq_bytes_t){ k_p7_tok, sizeof(k_p7_tok) };
+    if (moq_d18_encode_track_status(&w, request_id, &ns,
+            (moq_bytes_t){ k_p7_name, sizeof(k_p7_name) }, &p) != MOQ_OK)
+        return MOQ_ERR_INTERNAL;
+    return moq_transport_bridge_on_peer_bidi_bytes(
+        b, transport_id, msg, moq_buf_writer_offset(&w), fin, 0);
+}
+
+static moq_result_t p7_feed(moq_transport_bridge_t *b, void *vctx,
+                            uint64_t transport_id, bool fin)
+{
+    (void)vctx;
+    return p7_feed_id(b, 0, transport_id, fin);
+}
+
+static moq_result_t p7_terminal(moq_transport_bridge_t *b, void *vctx,
+                                uint64_t transport_id)
+{
+    fin_bridge_run_t *r = (fin_bridge_run_t *)vctx;
+    (void)b; (void)transport_id;
+    moq_track_status_handle_t h;
+    h._opaque = r->want_handle;
+    moq_accept_track_status_cfg_t c;
+    moq_accept_track_status_cfg_init(&c);
+    c.has_largest = true;
+    c.largest_group = P7_LARGEST_GROUP;
+    c.largest_object = P7_LARGEST_OBJ;
+    c.has_expires = true;
+    c.expires_ms = P7_EXPIRES_MS;
+    return moq_session_accept_track_status(r->tp.server, h, &c, 0);
+}
+
+_Static_assert(sizeof(p7_snap_t) <= FIN_BR_SNAP_MAX,
+               "p7 snapshot exceeds the shared bounded storage");
+
+static const fin_bridge_family_t p7_family = {
+    .owner_kind    = MOQ_REQ_TRACK_STATUS,
+    .pool_tag      = MOQ_HANDLE_POOL_TRACK_STATUS,
+    .snap_size     = sizeof(p7_snap_t),
+    .capture       = p7_capture,
+    .check         = p7_check,
+    .normalize_event  = p7_norm_event,
+    .normalize_action = p7_norm_action,
+    .want_request  = p7_want_request,
+    .derive_slot   = p7_derive_slot,
+    .check_live    = p7_check_live,
+    .check_retired = p7_check_retired,
+    .check_edges   = p7_check_edges,
+    .check_drain   = p7_check_drain,
+    .check_terminal_wire = p7_check_terminal_wire,
+};
+
+/* The EXACT terminal the service must put on the wire, decoded rather than
+ * counted: one write, on this transport stream, FIN'd, one REQUEST_OK envelope
+ * with nothing after it, and a body carrying the declared status. */
+static int p7_check_terminal_wire(void *vctx, const char *what)
+{
+    fin_bridge_run_t *r = (fin_bridge_run_t *)vctx;
+    int bad = 0;
+    if (r->tp.server_ep.count != 1) {
+        fprintf(stderr, "FINBR %s: %zu endpoint ops, expected 1\n", what,
+                r->tp.server_ep.count);
+        return 1;
+    }
+    fake_op_t *o = &r->tp.server_ep.ops[0];
+    if (o->kind != FAKE_OP_WRITE) {
+        fprintf(stderr, "FINBR %s: op kind %d, expected WRITE\n", what,
+                (int)o->kind);
+        return 1;
+    }
+    if (o->stream_id != r->transport_id) {
+        fprintf(stderr, "FINBR %s: wrong transport stream\n", what); bad++;
+    }
+    if (!o->fin) {
+        fprintf(stderr, "FINBR %s: local half not FIN'd\n", what); bad++;
+    }
+    moq_buf_reader_t rr;
+    moq_buf_reader_init(&rr, o->data, o->data_len);
+    moq_control_envelope_t env;
+    memset(&env, 0, sizeof(env));
+    if (moq_d18_decode_envelope(&rr, &env) != MOQ_OK) {
+        fprintf(stderr, "FINBR %s: undecodable envelope\n", what); return bad + 1;
+    }
+    if (env.msg_type != (uint64_t)MOQ_D18_REQUEST_OK) {
+        fprintf(stderr, "FINBR %s: msg type %llu\n", what,
+                (unsigned long long)env.msg_type);
+        bad++;
+    }
+    if (moq_buf_reader_remaining(&rr) != 0) {
+        fprintf(stderr, "FINBR %s: trailing bytes after the envelope\n", what);
+        bad++;
+    }
+    moq_d18_track_status_ok_t ok;
+    memset(&ok, 0, sizeof(ok));
+    if (moq_d18_decode_track_status_ok(env.payload, env.payload_len,
+                                       &ok) != MOQ_OK) {
+        fprintf(stderr, "FINBR %s: undecodable TRACK_STATUS_OK body\n", what);
+        return bad + 1;
+    }
+    if (!ok.params.has_largest || ok.params.largest_group != P7_LARGEST_GROUP ||
+        ok.params.largest_object != P7_LARGEST_OBJ) {
+        fprintf(stderr, "FINBR %s: largest mismatch\n", what); bad++;
+    }
+    if (!ok.params.has_expires || ok.params.expires_ms != P7_EXPIRES_MS) {
+        fprintf(stderr, "FINBR %s: expires mismatch\n", what); bad++;
+    }
+    if (ok.track_properties.len != 0) {
+        fprintf(stderr, "FINBR %s: non-empty track properties\n", what); bad++;
+    }
+    return bad;
+}
+
+/*
+ * The runner. Every hook the descriptor declares is CONSUMED: the family
+ * bundle derives and identifies the owner, `capture`/`check` pin its record
+ * across the EVENT POLL, and both normalizers build the images compared
+ * against the declared output. Repeated bridge service is legal; post-FIN peer
+ * bytes are not, and none are ever fed.
+ */
+/* The four phases the bridge entry passes through. */
+typedef enum fin_br_phase {
+    FIN_BR_AFTER_INGRESS = 0,
+    FIN_BR_AFTER_TERMINAL,
+    FIN_BR_AFTER_SERVICE,
+    FIN_BR_AFTER_RESERVICE
+} fin_br_phase_t;
+
+/*
+ * The EXACT bridge state for a class at a phase -- every flag constrained, not
+ * just the interesting ones, so an unrelated flag turning on is caught.
+ *
+ * A retained ingress returns at transport_bridge.c:2662, BEFORE
+ * peer_send_closed is set at :2677: the obligation lives in the retry flags
+ * instead, which is why the two classes need different expectations here.
+ */
+static int fin_br_check_bridge(moq_transport_bridge_t *b, uint64_t transport_id,
+                               moq_stream_ref_t want_ref,
+                               fin_bridge_ingress_t ingress,
+                               fin_br_phase_t phase, const char *what)
+{
+    int bad = 0;
+    bridge_stream_entry_t *e = bridge_find_by_id(b, transport_id);
+
+    if (phase == FIN_BR_AFTER_SERVICE || phase == FIN_BR_AFTER_RESERVICE) {
+        if (e && e->active) {
+            fprintf(stderr, "FINBR %s: mapping still active\n", what);
+            bad++;
+        }
+        {   /* Absent by BOTH identities: an entry repointed to another
+             * transport id while keeping the internal ref must not pass. */
+            bridge_stream_entry_t *by_ref = bridge_find_by_ref(b, want_ref);
+            if (by_ref && by_ref->active) {
+                fprintf(stderr, "FINBR %s: mapping still active by ref\n",
+                        what);
+                bad++;
+            }
+        }
+        if (moq_transport_bridge_has_pending(b)) {
+            fprintf(stderr, "FINBR %s: bridge reports pending work\n", what);
+            bad++;
+        }
+    } else {
+        if (!e) {
+            fprintf(stderr, "FINBR %s: mapping absent\n", what);
+            return bad + 1;
+        }
+        if (!e->active) {
+            fprintf(stderr, "FINBR %s: mapping inactive\n", what); bad++;
+        }
+        if (e->transport_id != transport_id) {
+            fprintf(stderr, "FINBR %s: transport id\n", what); bad++;
+        }
+        /* BOTH identities, so a repointed entry cannot masquerade. */
+        if (e->ref._v != want_ref._v) {
+            fprintf(stderr, "FINBR %s: internal ref\n", what); bad++;
+        }
+        if (bridge_find_by_ref(b, want_ref) != e) {
+            fprintf(stderr, "FINBR %s: ref lookup resolves elsewhere\n", what);
+            bad++;
+        }
+        if (e->kind != BRIDGE_STREAM_BIDI) {
+            fprintf(stderr, "FINBR %s: stream kind %d\n", what, (int)e->kind);
+            bad++;
+        }
+        if (e->origin != BRIDGE_ORIGIN_PEER) {
+            fprintf(stderr, "FINBR %s: stream origin %d\n", what,
+                    (int)e->origin);
+            bad++;
+        }
+        if (e->aborting) {
+            fprintf(stderr, "FINBR %s: entry aborting\n", what); bad++;
+        }
+        if (e->pending_reset || e->pending_stop) {
+            fprintf(stderr, "FINBR %s: reset/stop pending\n", what); bad++;
+        }
+        int want_peer_closed = (ingress == FIN_BR_CONSUMED);
+        if (!!e->peer_send_closed != want_peer_closed) {
+            fprintf(stderr, "FINBR %s: peer_send_closed %d, expected %d\n",
+                    what, (int)e->peer_send_closed, want_peer_closed);
+            bad++;
+        }
+        if (e->local_send_closed) {
+            fprintf(stderr, "FINBR %s: local half already closed\n", what);
+            bad++;
+        }
+        if (ingress == FIN_BR_CONSUMED) {
+            if (e->pending_retry || e->pending_fin || e->fin_retained) {
+                fprintf(stderr, "FINBR %s: FIN state retained after a "
+                        "consumed ingress\n", what);
+                bad++;
+            }
+        } else {
+            if (!e->pending_retry || !e->fin_retained) {
+                fprintf(stderr, "FINBR %s: retained obligation missing\n",
+                        what);
+                bad++;
+            }
+            /* `pending_fin` is a LATER FIN arriving while already suspended;
+             * initial same-call retention owes it false. */
+            if (e->pending_fin) {
+                fprintf(stderr, "FINBR %s: unexpected pending_fin on initial "
+                        "retention\n", what);
+                bad++;
+            }
+        }
+    }
+    if (moq_transport_bridge_is_fatal(b)) {
+        fprintf(stderr, "FINBR %s: bridge went fatal\n", what); bad++;
+    }
+    if (moq_transport_bridge_is_closed(b)) {
+        fprintf(stderr, "FINBR %s: bridge closed\n", what); bad++;
+    }
+    return bad;
+}
+
+/* Set while a self-check drives the runner down a deliberately REFUSED path,
+ * so an expected refusal cannot be mistaken for a failure in focused output. */
+static int fin_br_quiet;
+
+static int run_fin_bridge(const fin_bridge_case_t *f, fin_bridge_run_t *r)
+{
+    int failures = 0;
+    char what[160];
+    /* An invalid descriptor must not reach ANY family hook: an oversized
+     * snapshot would otherwise be written into bounded storage. */
+    if (fin_bridge_problems(f) != 0) {
+        if (!fin_br_quiet)
+            fprintf(stderr, "FINBR %s: invalid descriptor; no hook invoked\n",
+                    f->name ? f->name : "(unnamed)");
+        return failures + 1;
+    }
+    if (f->family->snap_size > sizeof(((fin_bridge_snap_t *)0)->bytes)) {
+        if (!fin_br_quiet)
+            fprintf(stderr, "FINBR %s: snapshot larger than storage\n",
+                    f->name);
+        return failures + 1;
+    }
+
+    /* Slot, generation and the handle they pack into, all from pool state
+     * BEFORE ingress. */
+    r->want_slot = f->family->derive_slot(r->tp.server, &r->want_gen);
+    MOQ_TEST_CHECK(r->want_slot >= 0);
+    if (r->want_slot < 0) return failures;   /* the check above counted it */
+    r->want_handle = moq_handle_pack(f->family->pool_tag,
+                                     r->tp.server->session_tag, r->want_gen,
+                                     (uint32_t)r->want_slot);
+    /* This route owes NO drain at any point: the FIN is observed before the
+     * terminal runs, so the declared multiset is EMPTY throughout. */
+    failures += f->family->check_drain(r->tp.server, "pre-ingress");
+
+    /* 1. Request + FIN in ONE chunk, through real bridge ingress. */
+    moq_result_t want_rc = (f->ingress == FIN_BR_CONSUMED)
+                               ? MOQ_OK : MOQ_ERR_WOULD_BLOCK;
+    MOQ_TEST_CHECK_EQ_INT((int)f->feed(r->tp.server_bridge, f->ctx,
+                                       r->transport_id, true), (int)want_rc);
+
+    /* The SESSION ref, captured while the entry exists; re-deriving it later
+     * would return NULL once retired and make every owner check vacuous. */
+    {
+        bridge_stream_entry_t *e =
+            bridge_find_by_id(r->tp.server_bridge, r->transport_id);
+        MOQ_TEST_CHECK(e != NULL);
+        if (!e) return failures;             /* the check above counted it */
+        r->ref = e->ref;
+        MOQ_TEST_CHECK(r->ref._v != 0);
+        /* The two identities are genuinely different values. */
+        MOQ_TEST_CHECK(r->ref._v != r->transport_id);
+        MOQ_TEST_CHECK(e->active);
+    }
+    snprintf(what, sizeof(what), "%s ingress", f->name);
+    failures += fin_br_check_bridge(r->tp.server_bridge, r->transport_id,
+                                    r->ref, f->ingress, FIN_BR_AFTER_INGRESS, what);
+
+    /* 2. The owner, against the DECLARED identity, plus its exact edge set. */
+    snprintf(what, sizeof(what), "%s admitted", f->name);
+    failures += f->family->check_live(r->tp.server, r->ref, r->want_slot,
+                                     r->want_gen, r->want_handle, what);
+    {
+        og_graph_t g;
+        og_capture(r->tp.server, &g);
+        failures += f->family->check_edges(&g, r->ref, r->want_slot, 1, what);
+    }
+
+    /* 3. Snapshot the owner BEFORE polling, so a mutation caused BY the poll
+     *    cannot become the baseline it is measured against. */
+    fin_bridge_snap_t snap;
+    MOQ_TEST_CHECK(f->family->snap_size <= sizeof(snap.bytes));
+    f->family->capture(r->tp.server, f->ctx, snap.bytes,
+                       f->family->snap_size);
+
+    /* Exactly the declared request event, compared field for field. */
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        moq_event_t ev;
+        while (moq_session_poll_events(r->tp.server, &ev, 1) > 0) {
+            if (!f->family->normalize_event(&ev, f->ctx, &got)) failures++;
+            moq_event_cleanup(&ev);
+        }
+        failures += f->family->want_request(&want, r->want_handle);
+        failures += txs_norm_equals(&got, &want, f->name);
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+
+    /* Nothing the poll touched may have moved: the owner record, its identity,
+     * its exact live edge topology and the drain multiset are ALL reasserted
+     * here, so a poll-time mutation the terminal later clears cannot pass. */
+    snprintf(what, sizeof(what), "%s post-poll", f->name);
+    failures += f->family->check(r->tp.server, f->ctx, snap.bytes,
+                                 f->family->snap_size, what);
+    failures += f->family->check_live(r->tp.server, r->ref, r->want_slot,
+                                      r->want_gen, r->want_handle, what);
+    {
+        og_graph_t g;
+        og_capture(r->tp.server, &g);
+        failures += f->family->check_edges(&g, r->ref, r->want_slot, 1, what);
+    }
+    failures += f->family->check_drain(r->tp.server, what);
+    failures += fin_br_check_bridge(r->tp.server_bridge, r->transport_id,
+                                    r->ref, f->ingress, FIN_BR_AFTER_INGRESS, what);
+
+    /* 4. The application answers; the FIN having been observed, NO drain. */
+    MOQ_TEST_CHECK_EQ_INT((int)f->terminal(r->tp.server_bridge, f->ctx,
+                                           r->transport_id), (int)MOQ_OK);
+    snprintf(what, sizeof(what), "%s terminal", f->name);
+    failures += f->family->check_retired(r->tp.server, r->ref, r->want_slot,
+                                        what);
+    failures += f->family->check_drain(r->tp.server, what);
+    {   /* Semantic retirement is proven in the RAW graph too, before any
+         * physical service runs. */
+        og_graph_t g;
+        og_capture(r->tp.server, &g);
+        failures += f->family->check_edges(&g, r->ref, r->want_slot, 0, what);
+    }
+    /* The PHYSICAL mapping is untouched by the semantic terminal: still active,
+     * still carrying its class's ingress state, our half still open. */
+    failures += fin_br_check_bridge(r->tp.server_bridge, r->transport_id,
+                                    r->ref, f->ingress, FIN_BR_AFTER_TERMINAL, what);
+
+    /* 5. Bridge service alone emits the EXACT terminal and retires the map. */
+    fake_endpoint_clear_ops(&r->tp.server_ep);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_transport_bridge_service(r->tp.server_bridge, 0), (int)MOQ_OK);
+    snprintf(what, sizeof(what), "%s serviced", f->name);
+    failures += f->family->check_terminal_wire(f->ctx, what);
+    failures += f->family->check_retired(r->tp.server, r->ref, r->want_slot,
+                                        what);
+    failures += fin_br_check_bridge(r->tp.server_bridge, r->transport_id,
+                                    r->ref, f->ingress, FIN_BR_AFTER_SERVICE, what);
+    {
+        og_graph_t g;
+        og_capture(r->tp.server, &g);
+        failures += f->family->check_edges(&g, r->ref, r->want_slot, 0, what);
+    }
+    failures += f->family->check_drain(r->tp.server, what);
+
+    /* 6. Idempotence: a second service adds EXACTLY ZERO operations, leaves
+     *    nothing queued, recreates no owner, and installs no drain. */
+    fake_endpoint_clear_ops(&r->tp.server_ep);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_transport_bridge_service(r->tp.server_bridge, 0), (int)MOQ_OK);
+    snprintf(what, sizeof(what), "%s reserviced", f->name);
+    MOQ_TEST_CHECK_EQ_SIZE(r->tp.server_ep.count, (size_t)0);
+    {
+        txs_norm_vec_t leftover;
+        txs_norm_init(&leftover);
+        moq_event_t ev;
+        while (moq_session_poll_events(r->tp.server, &ev, 1) > 0) {
+            if (!f->family->normalize_event(&ev, f->ctx, &leftover))
+                failures++;
+            moq_event_cleanup(&ev);
+        }
+        moq_action_t a;
+        while (moq_session_poll_actions(r->tp.server, &a, 1) > 0) {
+            if (!f->family->normalize_action(&a, f->ctx, &leftover))
+                failures++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_SIZE(leftover.count, (size_t)0);
+        txs_norm_free(&leftover);
+    }
+    failures += f->family->check_retired(r->tp.server, r->ref, r->want_slot,
+                                        what);
+    failures += f->family->check_drain(r->tp.server, what);
+    {
+        og_graph_t g;
+        og_capture(r->tp.server, &g);
+        failures += f->family->check_edges(&g, r->ref, r->want_slot, 0, what);
+    }
+    /* The COMPLETE physical postcondition again: a mapping resurrected only by
+     * the second service must not pass. */
+    failures += fin_br_check_bridge(r->tp.server_bridge, r->transport_id,
+                                    r->ref, f->ingress, FIN_BR_AFTER_RESERVICE, what);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(r->tp.server),
+                          (int)MOQ_SESS_ESTABLISHED);
+    return failures;
+}
+
+/* Permanent descriptor self-checks: every required member, the ingress class,
+ * and the (kind, pool) pairing. Deleting a member from a real descriptor would
+ * only fail the BUILD via an unused static, so validity is probed here on
+ * local copies instead. */
+static int probe_capture_calls;
+static void probe_capture_forbidden(const moq_session_t *s, void *ctx,
+                                    void *state, size_t cap)
+{
+    (void)s; (void)ctx; (void)state; (void)cap;
+    probe_capture_calls++;
+}
+
+static int test_fin_bridge_descriptor_validation(void)
+{
+    int failures = 0;
+    fin_bridge_run_t r;
+    memset(&r, 0, sizeof(r));
+
+    fin_bridge_family_t o = p7_family;
+    fin_bridge_case_t f;
+    memset(&f, 0, sizeof(f));
+    f.name = "probe";
+    f.ctx = &r;
+    f.ingress = FIN_BR_CONSUMED;
+    f.family = &o;
+    f.feed = p7_feed;
+    f.terminal = p7_terminal;
+    MOQ_TEST_CHECK_EQ_INT(fin_bridge_problems(&f), 0);
+
+    /* An oversized snapshot declaration must be refused BEFORE any family hook
+     * runs -- the runner writes into bounded storage, so a hook invoked under an
+     * invalid descriptor would overflow it. */
+    {
+        fin_bridge_family_t big = p7_family;
+        big.snap_size = FIN_BR_SNAP_MAX + 1;
+        big.capture = probe_capture_forbidden;
+        fin_bridge_case_t bad = f;
+        bad.family = &big;
+        probe_capture_calls = 0;
+        MOQ_TEST_CHECK(fin_bridge_problems(&bad) > 0);
+        fin_br_quiet = 1;
+        MOQ_TEST_CHECK(run_fin_bridge(&bad, &r) > 0);
+        fin_br_quiet = 0;
+        MOQ_TEST_CHECK_EQ_INT(probe_capture_calls, 0);
+    }
+
+    /* ingress class */
+    f.ingress = 0;              MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    f.ingress = 99;             MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    f.ingress = FIN_BR_RETAINED; MOQ_TEST_CHECK_EQ_INT(fin_bridge_problems(&f), 0);
+    f.ingress = FIN_BR_CONSUMED;
+
+    /* the bundle itself */
+    f.family = NULL;             MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    f.family = &o;
+
+    /* every required member */
+    o = p7_family; o.snap_size = 0;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.snap_size = FIN_BR_SNAP_MAX + 1;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    /* A nonzero but UNDERSIZED declaration validates structurally -- the
+     * descriptor cannot know the family's real state size -- so the runner
+     * passes the DECLARED size and the family refuses to write. That refusal
+     * is what the undersized mutant below proves. */
+    o = p7_family; o.snap_size = 1;
+    MOQ_TEST_CHECK_EQ_INT(fin_bridge_problems(&f), 0);
+    o = p7_family; o.derive_slot = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.check_live = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.check_retired = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.check_edges = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.check_drain = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.check_terminal_wire = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.want_request = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+
+    /* family identity: unknown kind, and a tag that belongs to another family */
+    o = p7_family; o.owner_kind = MOQ_REQ_NONE;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.owner_kind = 0x7f;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.pool_tag = MOQ_HANDLE_POOL_FETCH;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.owner_kind = MOQ_REQ_FETCH;   /* tag still TRACK_STATUS */
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family;
+    MOQ_TEST_CHECK_EQ_INT(fin_bridge_problems(&f), 0);
+
+    /* the output members, now family-owned */
+    o = p7_family; o.capture = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.check = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.normalize_event = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family; o.normalize_action = NULL;
+    MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    o = p7_family;
+    MOQ_TEST_CHECK_EQ_INT(fin_bridge_problems(&f), 0);
+
+    /* the case's single context */
+    f.ctx = NULL;               MOQ_TEST_CHECK(fin_bridge_problems(&f) > 0);
+    f.ctx = &r;
+    MOQ_TEST_CHECK_EQ_INT(fin_bridge_problems(&f), 0);
+    return failures;
+}
+
+static int p7_fixture_setup(fin_bridge_run_t *r, const char *what)
+{
+    int failures = 0;
+    memset(r, 0, sizeof(*r));
+    if (d18_pair_init(&r->tp, 0) < 0) return -1;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(r->tp.client, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(r->tp.server, 0), (int)MOQ_OK);
+    failures += d18_strict_shuttle(&r->tp, 30, 0, what);
+    /* Setup is classified, not discarded: exactly one SETUP_COMPLETE per side
+     * and nothing else. */
+    {
+        int cs = 0, co = 0, ss = 0, so = 0;
+        moq_event_t ev;
+        while (moq_session_poll_events(r->tp.client, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SETUP_COMPLETE) cs++; else co++;
+            moq_event_cleanup(&ev);
+        }
+        while (moq_session_poll_events(r->tp.server, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SETUP_COMPLETE) ss++; else so++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(cs, 1);
+        MOQ_TEST_CHECK_EQ_INT(co, 0);
+        MOQ_TEST_CHECK_EQ_INT(ss, 1);
+        MOQ_TEST_CHECK_EQ_INT(so, 0);
+    }
+    fake_endpoint_clear_ops(&r->tp.server_ep);
+    fake_endpoint_clear_ops(&r->tp.client_ep);
+    r->transport_id = 400;                /* peer-opened client-initiated bidi */
+    return failures;
+}
+
+static void p7_case_init(fin_bridge_case_t *f, fin_bridge_run_t *r)
+{
+    memset(f, 0, sizeof(*f));
+    f->name = "p7 track-status";
+    f->ctx = r;
+    f->ingress = FIN_BR_CONSUMED;
+    f->family = &p7_family;
+    f->feed = p7_feed;
+    f->terminal = p7_terminal;
+}
+
+static int test_p7_bridge_fin_retirement(void)
+{
+    int failures = 0;
+    fin_bridge_run_t r;
+    int rc = p7_fixture_setup(&r, "p7 setup");
+    if (rc < 0) return 1;
+    failures += rc;
+
+    fin_bridge_case_t f;
+    p7_case_init(&f, &r);
+
+    failures += run_fin_bridge(&f, &r);
+    test_pair_destroy(&r.tp);
+    return failures;
+}
+
+/* Axis 4, on the family whose whole lifecycle is reachable today: once the
+ * owner has been retired, retirement must be COMPLETE and hold under repetition
+ * and reuse. Three obligations, each non-vacuous against the current source:
+ *
+ *   - a repeated APPLICATION terminal on the retired handle is refused and
+ *     changes nothing -- no wire byte, no event, no action, no resurrected
+ *     owner, no drain, no edge;
+ *   - a fresh request REUSES the slot with an ADVANCED generation, so the two
+ *     owners are distinguishable by handle;
+ *   - the RETIRED handle stays refused after that reuse, which is the
+ *     clear-exactly-once fact: a stale handle must not address the new owner.
+ *
+ * It deliberately asserts nothing about where a future FIN handoff marker
+ * lives, and does not carry P3's retained-ingress assumption.
+ */
+static int p7_accept(fin_bridge_run_t *r, uint64_t handle)
+{
+    moq_track_status_handle_t h;
+    h._opaque = handle;
+    moq_accept_track_status_cfg_t c;
+    moq_accept_track_status_cfg_init(&c);
+    c.has_largest = true;
+    c.largest_group = P7_LARGEST_GROUP;
+    c.largest_object = P7_LARGEST_OBJ;
+    c.has_expires = true;
+    c.expires_ms = P7_EXPIRES_MS;
+    return (int)moq_session_accept_track_status(r->tp.server, h, &c, 0);
+}
+
+/* No output of ANY kind: no endpoint op, no event, no action. */
+static int p7_check_silent(fin_bridge_run_t *r, const char *what)
+{
+    int bad = 0;
+    if (r->tp.server_ep.count != 0) {
+        fprintf(stderr, "AXIS4 %s: %zu endpoint ops, expected 0\n", what,
+                r->tp.server_ep.count);
+        bad++;
+    }
+    moq_event_t ev;
+    while (moq_session_poll_events(r->tp.server, &ev, 1) > 0) {
+        fprintf(stderr, "AXIS4 %s: unexpected event kind %u\n", what,
+                (unsigned)ev.kind);
+        moq_event_cleanup(&ev);
+        bad++;
+    }
+    moq_action_t a;
+    while (moq_session_poll_actions(r->tp.server, &a, 1) > 0) {
+        fprintf(stderr, "AXIS4 %s: unexpected action kind %u\n", what,
+                (unsigned)a.kind);
+        moq_action_cleanup(&a);
+        bad++;
+    }
+    return bad;
+}
+
+/* The generic snapshot records the scratch cursor as it stands, but the next
+ * advancing call reclaims it once the event queue has drained
+ * (session_call_prepare). Normalizing that -- and only that, and only when the
+ * captured queue was empty -- keeps real scratch mutation detectable. Same rule
+ * the session-side FIN suite applies. */
+static void p7_expect_after_call_prepare(txs_snapshot_t *snap)
+{
+    if (snap->event_depth == 0) snap->event_scratch_len = 0;
+}
+
+/* The DECLARED free record for `ts_free_entry` (session_track_status.c:27).
+ * That free MEMSETS the entry and then restores exactly three things: the FREE
+ * state, the next generation, and the co-allocated receive buffer. So the
+ * expectation is "zeroed except those", with the owned track key required GONE
+ * -- a narrowed cleanup that left any field behind is caught here rather than
+ * by an absence check that a stale value also satisfies. */
+typedef struct p7_free_expect {
+    uint32_t        generation;
+    const uint8_t  *req_recv_buf;
+    size_t          req_recv_cap;
+} p7_free_expect_t;
+
+static int p7_check_free_record(const moq_session_t *s, int slot,
+                                const p7_free_expect_t *w, const char *what)
+{
+    int bad = 0;
+    if (slot < 0 || (size_t)slot >= s->ts_cap) {
+        fprintf(stderr, "AXIS4 %s: slot out of range\n", what);
+        return 1;
+    }
+    const moq_ts_entry_t *e = &s->track_statuses[slot];
+#define P7_FREE_EQ(field, got, exp) do { \
+    if ((uint64_t)(got) != (uint64_t)(exp)) { \
+        fprintf(stderr, "AXIS4 %s: free record %s = %llu, expected %llu\n", \
+                what, field, (unsigned long long)(got), \
+                (unsigned long long)(exp)); \
+        bad++; \
+    } \
+} while (0)
+    P7_FREE_EQ("state", (int)e->state, (int)MOQ_TS_FREE);
+    P7_FREE_EQ("generation", e->generation, w->generation);
+    P7_FREE_EQ("req_recv_cap", e->req_recv_cap, w->req_recv_cap);
+    /* Everything the memset zeroes. */
+    P7_FREE_EQ("role", (int)e->role, 0);
+    P7_FREE_EQ("handle", e->handle._opaque, 0);
+    P7_FREE_EQ("request_id", e->request_id, 0);
+    P7_FREE_EQ("request_stream_ref", e->request_stream_ref._v, 0);
+    P7_FREE_EQ("req_recv_len", e->req_recv_len, 0);
+    P7_FREE_EQ("req_recv_fin", e->req_recv_fin ? 1 : 0, 0);
+    P7_FREE_EQ("goaway_sent", e->goaway_sent ? 1 : 0, 0);
+    P7_FREE_EQ("track_id_len", e->track_id_len, 0);
+#undef P7_FREE_EQ
+    if (e->req_recv_buf != w->req_recv_buf) {
+        fprintf(stderr, "AXIS4 %s: free record req_recv_buf pointer\n", what);
+        bad++;
+    }
+    if (e->track_id_buf != NULL) {
+        fprintf(stderr, "AXIS4 %s: owned track key survives the free\n", what);
+        bad++;
+    }
+    if (e->hist != NULL) {
+        fprintf(stderr, "AXIS4 %s: reserved history record survives\n", what);
+        bad++;
+    }
+    return bad;
+}
+
+/* The retired physical mapping is gone under BOTH identities -- a stale entry
+ * that lost only its transport-id key would still be reachable by ref -- and
+ * the bridge itself is healthy with nothing owed. */
+static int p7_check_mapping_absent(fin_bridge_run_t *r, uint64_t transport_id,
+                                   moq_stream_ref_t old_ref, const char *what)
+{
+    int bad = 0;
+    if (bridge_find_by_id(r->tp.server_bridge, transport_id) != NULL) {
+        fprintf(stderr, "AXIS4 %s: retired transport id still maps\n", what);
+        bad++;
+    }
+    if (bridge_find_by_ref(r->tp.server_bridge, old_ref) != NULL) {
+        fprintf(stderr, "AXIS4 %s: retired internal ref still maps\n", what);
+        bad++;
+    }
+    if (moq_transport_bridge_is_fatal(r->tp.server_bridge)) {
+        fprintf(stderr, "AXIS4 %s: bridge fatal\n", what); bad++;
+    }
+    if (moq_transport_bridge_is_closed(r->tp.server_bridge)) {
+        fprintf(stderr, "AXIS4 %s: bridge closed\n", what); bad++;
+    }
+    if (moq_transport_bridge_has_pending(r->tp.server_bridge)) {
+        fprintf(stderr, "AXIS4 %s: bridge has pending work\n", what); bad++;
+    }
+    return bad;
+}
+
+/* The reused peer bidi's EXACT bridge record. This is an OPEN-peer-bidi oracle,
+ * deliberately not the FIN-consumed phase oracle: that phase expects
+ * peer_send_closed, which is wrong for an entry admitted from a request with no
+ * FIN. Both lookups must land on the SAME record -- a reverse-lookup repoint
+ * that kept the transport id would satisfy a "some mapping remains" check --
+ * and every flag is declared, so an otherwise-unobserved one cannot drift. */
+static int p7_check_open_peer_bidi(fin_bridge_run_t *r, uint64_t transport_id,
+                                   moq_stream_ref_t want_ref, const char *what)
+{
+    int bad = 0;
+    bridge_stream_entry_t *by_id = bridge_find_by_id(r->tp.server_bridge,
+                                                     transport_id);
+    bridge_stream_entry_t *by_ref = bridge_find_by_ref(r->tp.server_bridge,
+                                                       want_ref);
+    if (!by_id) {
+        fprintf(stderr, "AXIS4 %s: no bridge entry for transport id\n", what);
+        return 1;
+    }
+    if (!by_ref) {
+        fprintf(stderr, "AXIS4 %s: no bridge entry for internal ref\n", what);
+        return 1;
+    }
+    if (by_id != by_ref) {
+        fprintf(stderr, "AXIS4 %s: the two lookups reach DIFFERENT records\n",
+                what);
+        bad++;
+    }
+#define P7_BR_EQ(field, got, exp) do { \
+    if ((uint64_t)(got) != (uint64_t)(exp)) { \
+        fprintf(stderr, "AXIS4 %s: bridge entry %s = %llu, expected %llu\n", \
+                what, field, (unsigned long long)(got), \
+                (unsigned long long)(exp)); \
+        bad++; \
+    } \
+} while (0)
+    P7_BR_EQ("transport_id", by_id->transport_id, transport_id);
+    P7_BR_EQ("ref", by_id->ref._v, want_ref._v);
+    P7_BR_EQ("kind", (int)by_id->kind, (int)BRIDGE_STREAM_BIDI);
+    P7_BR_EQ("origin", (int)by_id->origin, (int)BRIDGE_ORIGIN_PEER);
+    P7_BR_EQ("active", by_id->active ? 1 : 0, 1);
+    /* An OPEN peer bidi with no FIN and no teardown: every one of these is
+     * false, and each is named so a single drifting flag is attributable. */
+    P7_BR_EQ("peer_send_closed", by_id->peer_send_closed ? 1 : 0, 0);
+    P7_BR_EQ("local_send_closed", by_id->local_send_closed ? 1 : 0, 0);
+    P7_BR_EQ("aborting", by_id->aborting ? 1 : 0, 0);
+    P7_BR_EQ("pending_retry", by_id->pending_retry ? 1 : 0, 0);
+    P7_BR_EQ("pending_fin", by_id->pending_fin ? 1 : 0, 0);
+    P7_BR_EQ("fin_retained", by_id->fin_retained ? 1 : 0, 0);
+    P7_BR_EQ("pending_reset", by_id->pending_reset ? 1 : 0, 0);
+    P7_BR_EQ("pending_stop", by_id->pending_stop ? 1 : 0, 0);
+    P7_BR_EQ("pending_reset_code", by_id->pending_reset_code, 0);
+    P7_BR_EQ("pending_stop_code", by_id->pending_stop_code, 0);
+    /* Uni-only classification residue stays in its initialized zero state on a
+     * bidi entry. */
+    P7_BR_EQ("uni_disp", by_id->uni_disp, (uint8_t)BRIDGE_UNI_DISP_PENDING);
+    P7_BR_EQ("classify_len", by_id->classify_len, 0);
+#undef P7_BR_EQ
+    /* Length zero does not imply the buffer is clean: every retained
+     * classification byte must be in its initialized zero state. */
+    for (size_t ci = 0; ci < sizeof(by_id->classify_buf); ci++) {
+        if (by_id->classify_buf[ci] != 0) {
+            fprintf(stderr,
+                    "AXIS4 %s: bridge entry classify_buf[%zu] = %u, expected 0\n",
+                    what, ci, (unsigned)by_id->classify_buf[ci]);
+            bad++;
+        }
+    }
+    /* And the bridge itself is still healthy with nothing owed. */
+    if (moq_transport_bridge_is_fatal(r->tp.server_bridge)) {
+        fprintf(stderr, "AXIS4 %s: bridge fatal\n", what); bad++;
+    }
+    if (moq_transport_bridge_is_closed(r->tp.server_bridge)) {
+        fprintf(stderr, "AXIS4 %s: bridge closed\n", what); bad++;
+    }
+    if (moq_transport_bridge_has_pending(r->tp.server_bridge)) {
+        fprintf(stderr, "AXIS4 %s: bridge has pending work\n", what); bad++;
+    }
+    return bad;
+}
+
+static int test_p7_retirement_idempotence_and_reuse(void)
+{
+    int failures = 0;
+    fin_bridge_run_t r;
+    int rc = p7_fixture_setup(&r, "axis4 setup");
+    if (rc < 0) return 1;
+    failures += rc;
+
+    fin_bridge_case_t f;
+    p7_case_init(&f, &r);
+
+    /* The co-allocated receive buffer persists across entry reuse, so its
+     * pointer and capacity are properties of the FREE slot: captured BEFORE
+     * ingress rather than adopted from the record the free produces. */
+    const int slot_pre = r.want_slot;
+    MOQ_TEST_CHECK(slot_pre >= 0 && (size_t)slot_pre < r.tp.server->ts_cap);
+    const uint8_t *pre_recv_buf = r.tp.server->track_statuses[slot_pre].req_recv_buf;
+    const size_t   pre_recv_cap = r.tp.server->track_statuses[slot_pre].req_recv_cap;
+
+    failures += run_fin_bridge(&f, &r);
+
+    const uint64_t retired_handle = r.want_handle;
+    const int      slot           = r.want_slot;
+    const moq_stream_ref_t old_ref = r.ref;
+
+    /* The declared free record: the generation the LIVE owner carried (taken
+     * from its declared handle, which the fixture derived pre-ingress) plus
+     * one, and the buffer identity captured above. Nothing is read back from
+     * the freed entry. */
+    p7_free_expect_t want_free;
+    want_free.generation   = moq_handle_generation(retired_handle) + 1u;
+    want_free.req_recv_buf = pre_recv_buf;
+    want_free.req_recv_cap = pre_recv_cap;
+    failures += p7_check_free_record(r.tp.server, slot, &want_free,
+                                     "first retirement");
+
+    /* 1. A repeated application terminal on the retired handle. It must not
+     *    mutate unrelated session state, advance the generation a second time,
+     *    change the graph, add a drain, or recreate the retired owner. */
+    fake_endpoint_clear_ops(&r.tp.server_ep);
+    og_graph_t g_pre_repeat;
+    og_capture(r.tp.server, &g_pre_repeat);
+    {
+        txs_snapshot_t before;
+        txs_capture(r.tp.server, &old_ref, 1, &before);
+        p7_expect_after_call_prepare(&before);
+        MOQ_TEST_CHECK_EQ_INT(p7_accept(&r, retired_handle),
+                              (int)MOQ_ERR_STALE_HANDLE);
+        failures += p7_check_silent(&r, "repeat terminal");
+        failures += txs_check_eq(r.tp.server, &old_ref, 1, &before,
+                                 "repeat terminal");
+    }
+    failures += p7_family.check_retired(r.tp.server, old_ref, slot,
+                                        "repeat terminal");
+    failures += p7_family.check_drain(r.tp.server, "repeat terminal");
+    /* The SAME declared record: no second generation increment. */
+    failures += p7_check_free_record(r.tp.server, slot, &want_free,
+                                     "repeat terminal");
+    {
+        og_graph_t g;
+        og_capture(r.tp.server, &g);
+        failures += og_check_integrity(&g, "repeat terminal");
+        /* The WHOLE topology, not just the target's edges: an unrelated edge
+         * inserted, removed or repointed by this refused call is caught here. */
+        failures += og_check_same_topology(&g, &g_pre_repeat, "repeat terminal");
+        failures += p7_family.check_edges(&g, old_ref, slot, 0,
+                                          "repeat terminal");
+    }
+    failures += p7_check_mapping_absent(&r, r.transport_id, old_ref,
+                                        "repeat terminal");
+
+    /* 2. A fresh request reuses the slot with an advanced generation. The new
+     *    identity is DERIVED from pool state before ingress, never read back. */
+    /* Derived from the DECLARED freed generation, not from a fresh read of the
+     *    now-free slot -- a free that advanced the generation twice, or not at
+     *    all, must not be able to define the expectation it is checked against. */
+    const uint32_t new_gen = want_free.generation | 1u;
+    const int new_slot = slot;
+    uint64_t new_handle = moq_handle_pack(p7_family.pool_tag,
+                                          r.tp.server->session_tag, new_gen,
+                                          (uint32_t)new_slot);
+    MOQ_TEST_CHECK(new_handle != retired_handle);
+    {   /* The pool really does hand back the same slot. */
+        uint32_t probe_gen = 0;
+        MOQ_TEST_CHECK_EQ_INT(p7_family.derive_slot(r.tp.server, &probe_gen),
+                              slot);
+        MOQ_TEST_CHECK_EQ_U64(probe_gen, (uint64_t)new_gen);
+    }
+
+    const uint64_t reuse_id = 404;                  /* a second peer-opened bidi */
+    p7_want_request_id = 2;                         /* peer ids advance by two */
+    /* NO FIN this time: the reused owner must show a CLEARED latch, which is
+     * what makes ts_free_entry's cleanup of that field observable. */
+    p7_want_fin = 0;
+    fake_endpoint_clear_ops(&r.tp.server_ep);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)p7_feed_id(r.tp.server_bridge, 2, reuse_id, false), (int)MOQ_OK);
+    {
+        bridge_stream_entry_t *e = bridge_find_by_id(r.tp.server_bridge, reuse_id);
+        MOQ_TEST_CHECK(e != NULL);
+        if (!e) return failures;             /* the check above counted it */
+        moq_stream_ref_t new_ref = e->ref;
+        MOQ_TEST_CHECK(new_ref._v != old_ref._v);
+        failures += p7_family.check_live(r.tp.server, new_ref, new_slot, new_gen,
+                                         new_handle, "reused");
+    }
+    {   /* The request surfaces against the DERIVED handle, and only it. */
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got); txs_norm_init(&want);
+        moq_event_t ev;
+        while (moq_session_poll_events(r.tp.server, &ev, 1) > 0) {
+            if (!p7_family.normalize_event(&ev, &r, &got)) failures++;
+            moq_event_cleanup(&ev);
+        }
+        failures += p7_family.want_request(&want, new_handle);
+        failures += txs_norm_equals(&got, &want, "reused request");
+        txs_norm_free(&got); txs_norm_free(&want);
+    }
+
+    /* 3. The retired handle is STILL refused, although its slot is occupied
+     *    again -- a stale handle must never address the new owner -- and the
+     *    REPLACEMENT owner survives that refusal WHOLE. */
+    fake_endpoint_clear_ops(&r.tp.server_ep);
+    {
+        bridge_stream_entry_t *be = bridge_find_by_id(r.tp.server_bridge,
+                                                      reuse_id);
+        MOQ_TEST_CHECK(be != NULL);
+        if (be) {
+            moq_stream_ref_t new_ref = be->ref;
+            fin_bridge_snap_t owner_before;
+            p7_family.capture(r.tp.server, &r, owner_before.bytes,
+                              p7_family.snap_size);
+            txs_snapshot_t before;
+            txs_capture(r.tp.server, &new_ref, 1, &before);
+            p7_expect_after_call_prepare(&before);
+            og_graph_t g_pre_stale;
+            og_capture(r.tp.server, &g_pre_stale);
+
+            MOQ_TEST_CHECK_EQ_INT(p7_accept(&r, retired_handle),
+                                  (int)MOQ_ERR_STALE_HANDLE);
+
+            failures += p7_check_silent(&r, "stale after reuse");
+            failures += txs_check_eq(r.tp.server, &new_ref, 1, &before,
+                                     "stale after reuse");
+            failures += p7_family.check(r.tp.server, &r, owner_before.bytes,
+                                        p7_family.snap_size,
+                                        "stale after reuse");
+            failures += p7_family.check_live(r.tp.server, new_ref, new_slot,
+                                             new_gen, new_handle,
+                                             "stale after reuse");
+            failures += p7_family.check_drain(r.tp.server, "stale after reuse");
+            {
+                og_graph_t g;
+                og_capture(r.tp.server, &g);
+                failures += og_check_integrity(&g, "stale after reuse");
+                failures += og_check_same_topology(&g, &g_pre_stale,
+                                                   "stale after reuse");
+                failures += p7_family.check_edges(&g, new_ref, new_slot, 1,
+                                                  "stale after reuse");
+                /* The retired stream keys nothing, though its slot is live. */
+                failures += og_check_no_edge(&g, OG_DOM_REQ_STREAMREF,
+                                             old_ref._v, "stale after reuse");
+            }
+            /* Both identities, with the flags this phase requires. */
+            failures += p7_check_open_peer_bidi(&r, reuse_id, new_ref,
+                                                "stale after reuse");
+            failures += p7_check_mapping_absent(&r, r.transport_id, old_ref,
+                                                "stale after reuse");
+        }
+    }
+
+    p7_want_request_id = 0;
+    p7_want_fin = 1;
+    test_pair_destroy(&r.tp);
+    return failures;
+}
+
+
 int main(void)
 {
     int failures = 0;
@@ -3126,6 +4611,9 @@ int main(void)
     failures += test_data_retry_suspension_preserves_pending();
     failures += test_data_reset_suspension_preserves_pending();
     failures += test_bidi_retry_suspension_preserves_pending();
+    failures += test_fin_bridge_descriptor_validation();
+    failures += test_p7_bridge_fin_retirement();
+    failures += test_p7_retirement_idempotence_and_reuse();
     failures += test_bridge_nomem_ns_response();
     failures += test_bridge_nomem_joining_fetch();
     failures += test_bidi_reset_suspension_preserves_pending();

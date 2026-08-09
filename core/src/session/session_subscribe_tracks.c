@@ -461,7 +461,9 @@ moq_result_t session_core_on_subscribe_tracks_torn_down(moq_session_t *s,
 moq_result_t session_core_on_track_sub_update_rejected(moq_session_t *s,
     int slot, const moq_request_endpoint_t *uep)
 {
-    if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
+    bool need_drain = !track_sub_peer_fin_observed(&s->track_subs[slot]);
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
     uint8_t err_buf[128];
     moq_buf_writer_t ew;
     moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -473,7 +475,8 @@ moq_result_t session_core_on_track_sub_update_rejected(moq_session_t *s,
     rc = queue_send_bidi(s, ref, err_buf, moq_buf_writer_offset(&ew), true);
     if (rc < 0) return rc;        /* WOULD_BLOCK: retryable, nothing mutated */
     s->profile->commit_inbound_request(s, uep);
-    if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
+    if (need_drain && ref._v != 0)
+        (void)drain_ref_add(s, ref);   /* slot reserved above */
     track_sub_free_entry(s, slot);
     return MOQ_OK;
 }
@@ -691,7 +694,7 @@ moq_result_t moq_session_reject_subscribe_tracks(moq_session_t *s,
 
     /* Free the request bidi after REQUEST_ERROR + FIN; reserve a drain slot up
      * front unless the requester already closed its half. */
-    bool need_drain = !e->req_recv_fin;
+    bool need_drain = !track_sub_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 

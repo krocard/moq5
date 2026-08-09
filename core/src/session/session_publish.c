@@ -141,7 +141,7 @@ static moq_result_t pub_finalize_done(moq_session_t *s, int slot)
     /* Stream-correlated profiles: if the request bidi has not FIN'd yet, freeing
      * the entry drops its by-streamref key, so a later FIN/bytes would be
      * misclassified. Reserve a drain-ref to absorb that late FIN. */
-    bool need_drain = pe->request_stream_ref._v != 0 && !pe->req_recv_fin;
+    bool need_drain = pe->request_stream_ref._v != 0 && !pub_peer_fin_observed(pe);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -347,7 +347,8 @@ static moq_result_t queue_publish_response(moq_session_t *s, size_t slot,
 /* -- Inbound PUBLISH handler --------------------------------------- */
 
 moq_result_t session_core_on_publish(moq_session_t *s,
-                                      moq_decoded_publish_t *d)
+                                      moq_decoded_publish_t *d,
+                                      bool request_fin_observed)
 {
     bool auth_committed = false;
     moq_result_t result = MOQ_OK;
@@ -379,8 +380,15 @@ moq_result_t session_core_on_publish(moq_session_t *s,
      * the publisher's send half stays open (PUBLISH is not first-and-only), so a
      * late message before it sees our FIN must be discarded, not reclassified as a
      * fresh request. Draft-16 carries the reject on the control channel and never
-     * drains (it also handled auth-reject in its profile decode). */
-    bool reject_drain = d->endpoint.has_stream_ref;
+     * drains (it also handled auth-reject in its profile decode).
+     *
+     * An observed FIN closes the publisher's send half -- with this message, or
+     * on an earlier call whose refusal staging retained -- so nothing can arrive
+     * late and the drain reference is unnecessary: the rejection still emits its
+     * REQUEST_ERROR + FIN and retires staging, it just takes no reference. This
+     * selector is the single drain decision for all four pre-commit branches --
+     * preflight and insertion alike. */
+    bool reject_drain = d->endpoint.has_stream_ref && !request_fin_observed;
 
     /* Message-level authorization-token reject (stream-correlated profiles): a
      * REGISTER carried alongside still commits its alias (§10.2.2). */
@@ -1272,7 +1280,7 @@ moq_result_t moq_session_reject_publish(
      * peer's late FIN (unless it already arrived). */
     moq_pub_entry_t *pe = &s->publishes[slot];
     bool req_stream = (pe->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !pe->req_recv_fin;
+    bool need_drain = req_stream && !pub_peer_fin_observed(pe);
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
@@ -1864,7 +1872,7 @@ moq_result_t moq_session_finish_publish(
      * reciprocal FIN (unless it already arrived). */
     moq_pub_entry_t *pe = &s->publishes[slot];
     bool req_stream = (pe->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !pe->req_recv_fin;
+    bool need_drain = req_stream && !pub_peer_fin_observed(pe);
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;

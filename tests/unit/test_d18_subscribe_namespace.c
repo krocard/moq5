@@ -50,8 +50,9 @@ static int test_codec(void)
                                                     dp, 8, &sn), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(sn.request_id, 4);
         MOQ_TEST_CHECK_EQ_SIZE(sn.track_namespace_prefix.count, 2);
-        MOQ_TEST_CHECK(memcmp(sn.track_namespace_prefix.parts[0].data,
-                              "example.com", 11) == 0);
+        failures += txs_check_part_bytes(&sn.track_namespace_prefix, 0,
+                                         "example.com", 11,
+                                         "decoded subscribe_namespace prefix");
         MOQ_TEST_CHECK_EQ_SIZE(sn.params.auth_token_count, 1);
         MOQ_TEST_CHECK_EQ_U64(sn.params.auth_tokens[0].token_type, 7);
     }
@@ -95,7 +96,8 @@ static int test_codec(void)
                 (int)moq_d18_decode_namespace_msg(env.payload, env.payload_len,
                                                   dp, 8, &suffix), (int)MOQ_OK);
             MOQ_TEST_CHECK_EQ_SIZE(suffix.count, 2);
-            MOQ_TEST_CHECK(memcmp(suffix.parts[1].data, "meeting=1", 9) == 0);
+            failures += txs_check_part_bytes(&suffix, 1, "meeting=1", 9,
+                                             "decoded namespace suffix");
         }
     }
 
@@ -426,9 +428,9 @@ static bool p18ns_norm_event(const moq_event_t *ev, void *vctx,
                 ? ev->u.namespace_found.handle._opaque
                 : ev->u.namespace_gone.handle._opaque;
         txs_img_u64(&img, handle == ctx->h_opaque);
-        txs_img_u64(&img, (uint64_t)ns->count);
-        for (size_t i = 0; i < ns->count; i++)
-            txs_img_bytes(&img, ns->parts[i].data, ns->parts[i].len);
+        if (!txs_img_parts(&img, "namespace found/gone suffix", ns->parts,
+                           ns->count, MOQ_DECODED_MAX_NAMESPACE_PARTS))
+            return false;
         break;
     }
     case MOQ_EVENT_NS_SUB_OK:
@@ -625,13 +627,23 @@ int main(void)
                 got = true;
                 MOQ_TEST_CHECK_EQ_SIZE(
                     ev.u.ns_sub_request.track_namespace_prefix.count, 1);
-                MOQ_TEST_CHECK(memcmp(
-                    ev.u.ns_sub_request.track_namespace_prefix.parts[0].data,
-                    "live", 4) == 0);
+                failures += txs_check_part_bytes(
+                    &ev.u.ns_sub_request.track_namespace_prefix, 0, "live", 4,
+                    "surfaced ns_sub_request prefix");
+                /* The token array is borrowed too: bound and pointer BEFORE
+                 * the index below. */
+                MOQ_TEST_CHECK(ev.u.ns_sub_request.token_count <=
+                               MOQ_DECODED_MAX_TOKENS);
+                MOQ_TEST_CHECK(ev.u.ns_sub_request.token_count == 0 ||
+                               ev.u.ns_sub_request.tokens != NULL);
                 MOQ_TEST_CHECK_EQ_U64(ev.u.ns_sub_request.namespace_interest,
                                       MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE);
                 MOQ_TEST_CHECK_EQ_SIZE(ev.u.ns_sub_request.token_count, 1);
-                MOQ_TEST_CHECK_EQ_U64(ev.u.ns_sub_request.tokens[0].token_type, 9);
+                if (ev.u.ns_sub_request.token_count == 1 &&
+                    ev.u.ns_sub_request.tokens)
+                    MOQ_TEST_CHECK_EQ_U64(
+                        ev.u.ns_sub_request.tokens[0].token_type, 9);
+                else MOQ_TEST_CHECK(0);
             }
             moq_event_cleanup(&ev);
         }

@@ -672,7 +672,7 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
      * response, so reserve a drain slot up front (unless the requester already
      * FIN'd, in which case the bidi is fully closed and nothing late arrives). */
     bool req_stream = (e->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !e->req_recv_fin;
+    bool need_drain = req_stream && !ts_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -745,7 +745,7 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
 #undef TS_REJ_HAS
 
     bool req_stream = (e->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !e->req_recv_fin;
+    bool need_drain = req_stream && !ts_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 

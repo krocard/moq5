@@ -2885,7 +2885,8 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
         moq_result_t drc = d16_decode_publish_namespace(s, env, &decoded, &consumed);
         if (drc != MOQ_OK) return drc;
         if (consumed) return MOQ_OK;
-        return session_core_on_publish_namespace(s, &decoded);
+        /* No per-request bidi FIN on the draft-16 control channel (see PUBLISH). */
+        return session_core_on_publish_namespace(s, &decoded, false);
     }
 
     case MOQ_D16_PUBLISH_NAMESPACE_DONE: {
@@ -2977,7 +2978,10 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
         moq_result_t drc = d16_decode_publish(s, env, &decoded, &consumed);
         if (drc != MOQ_OK) return drc;
         if (consumed) return MOQ_OK;
-        return session_core_on_publish(s, &decoded);
+        /* Draft-16 carries PUBLISH on the shared control channel, where no
+         * per-request bidi FIN can be observed; the reject paths never
+         * drain there. */
+        return session_core_on_publish(s, &decoded, false);
     }
 
     case MOQ_D16_PUBLISH_OK: {

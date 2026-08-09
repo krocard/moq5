@@ -253,7 +253,9 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
         s->session_tag, live_gen, (uint32_t)slot) };
     e->request_id = d->request_id;
     e->request_stream_ref = d->endpoint.stream_ref;
-    e->req_recv_fin = d->request_fin;
+    /* The peer's FIN is NOT copied here: the generic destination handoff
+     * installs it as transitional ownership on this entry and drives the
+     * family's own FIN handling, exactly as it does for a standalone FETCH. */
     e->join_fetch_type = (uint8_t)d->fetch_type;
     e->join_request_id = d->joining_request_id;
     e->join_start = d->joining_start;
@@ -287,7 +289,7 @@ static moq_result_t fetch_reject_pending_join(moq_session_t *s, int slot,
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
     moq_stream_ref_t ref = e->request_stream_ref;
-    bool need_drain = ref._v != 0 && !e->req_recv_fin;
+    bool need_drain = ref._v != 0 && !fetch_peer_fin_observed(e);
     /* Reserve the drain slot before the send: the fetcher's later FIN/RESET on the
      * (soon-freed) join bidi must be absorbed, never read as a stray FIN. */
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
@@ -333,7 +335,8 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
             any_reject = true;
             n_action++;
             send += PENDING_JOIN_REJECT_BOUND;
-            if (e->request_stream_ref._v != 0 && !e->req_recv_fin) n_drain++;
+            if (e->request_stream_ref._v != 0 &&
+                !fetch_peer_fin_observed(e)) n_drain++;
         } else {
             n_event++;
             rel_scratch += pending_join_release_scratch(e);   /* scratch-copied tokens */
@@ -1417,7 +1420,8 @@ moq_result_t moq_session_reject_fetch(
      * ring once the entry is freed (else the empty-FIN path is fatal). Reserve the
      * drain slot before mutating (D16 responds on the control channel: no drain). */
     moq_stream_ref_t req_ref = s->fetches[slot].request_stream_ref;
-    bool need_drain = req_ref._v != 0 && !s->fetches[slot].req_recv_fin;
+    bool need_drain = req_ref._v != 0 &&
+                      !fetch_peer_fin_observed(&s->fetches[slot]);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -1467,10 +1471,12 @@ moq_result_t moq_session_reject_fetch(
 }
 
 /* Internal draft-18 cancel of a fetcher-role fetch: STOP_SENDING + RESET the
- * request bidi, STOP the response data uni if it is open, drain the request bidi
- * (drain_refs), then free the fetch slot and record the request id in the
- * cancel-tombstone cache so an in-flight data uni is absorbed rather than treated
- * as an unknown request (which would close the session). Reserve-before-mutate
+ * request bidi, STOP the response data uni if it is open, enter the request bidi
+ * in the drain ring when the peer's FIN has not already been observed, then free
+ * the fetch slot and record the request id in the cancel-tombstone cache so an
+ * in-flight data uni is absorbed rather than treated as an unknown request
+ * (which would close the session). The data-stream STOP and the tombstone are
+ * unconditional; only the drain reference follows the observed FIN. Reserve-before-mutate
  * (WOULD_BLOCK leaves state intact). Shared by moq_session_fetch_cancel and the
  * UNSUPPORTED_EXTENSION (0x33) path; the caller validated role/state and
  * request-stream use, and does not depend on session_begin_advance (safe inside
@@ -1479,10 +1485,16 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
     bool stop_data = e->data_stream_started && !e->data_stream_fin;
+    /* One drain decision for both the preflight and the insertion below: the
+     * reference exists to absorb what the peer may still send on the request
+     * bidi, so an already-observed FIN makes it unnecessary. The abort, the
+     * data-stream STOP, the registry removal, the cancel tombstone and the
+     * entry's retirement are unaffected. */
+    bool need_drain = e->request_stream_ref._v != 0 &&
+                      !fetch_peer_fin_observed(e);
     if (action_queue_avail(s) < (size_t)(1 + (stop_data ? 1 : 0)))
         return MOQ_ERR_WOULD_BLOCK;
-    if (e->request_stream_ref._v != 0 &&
-        s->drain_ref_count >= s->drain_ref_cap)
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = e->request_stream_ref;
     moq_action_t a;
@@ -1506,12 +1518,14 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
     }
     if (e->request_stream_ref._v != 0) {
         request_registry_remove_by_streamref(s, e->request_stream_ref);
-        (void)drain_ref_add(s, ref);   /* slot reserved above */
+        if (need_drain)
+            (void)drain_ref_add(s, ref);   /* slot reserved above */
         e->request_stream_ref = moq_stream_ref_from_u64(0);
     }
-    /* The request bidi is drained via drain_refs; free the fetch slot now and
-     * tombstone the request id so a late data uni (FETCH_HEADER) is stopped and
-     * absorbed without reoccupying the pool. */
+    /* The request bidi is entered in the drain ring only while still peer-open;
+     * either way the fetch slot is freed now and the request id tombstoned, so a
+     * late data uni (FETCH_HEADER) is stopped and absorbed without reoccupying
+     * the pool. */
     fetch_cancel_tomb_add(s, e->request_id);
     fetch_free_entry(s, slot);
     return MOQ_OK;
@@ -1536,7 +1550,8 @@ moq_result_t moq_session_fetch_cancel(moq_session_t *s,
 
     /* Stream-correlated profiles have no FETCH_CANCEL message: tear down the
      * request bidi via the shared internal sequence (STOP_SENDING + RESET, STOP
-     * the data uni if open), keeping the entry as a request-id tombstone. */
+     * the data uni if open), which frees the entry and records its request id in
+     * the cancel-tombstone cache. */
     if (moq_session_uses_request_streams(s))
         return fetch_request_bidi_cancel(s, slot);
 
