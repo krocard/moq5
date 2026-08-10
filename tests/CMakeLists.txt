@@ -285,6 +285,10 @@ if(TARGET moq::sim)
     target_link_libraries(test_d18_fin_handoff PRIVATE moq-core-test-internals)
     add_test(NAME d18_fin_handoff COMMAND test_d18_fin_handoff)
 
+    add_executable(test_d18_ns_response_fin unit/test_d18_ns_response_fin.c)
+    target_link_libraries(test_d18_ns_response_fin PRIVATE moq-core-test-internals)
+    add_test(NAME d18_ns_response_fin COMMAND test_d18_ns_response_fin)
+
     add_executable(test_d18_publish unit/test_d18_publish.c)
     target_link_libraries(test_d18_publish PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_publish COMMAND test_d18_publish)

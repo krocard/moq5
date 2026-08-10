@@ -1463,6 +1463,102 @@ static moq_result_t copy_suffix_to_event_scratch(moq_session_t *s,
     return MOQ_OK;
 }
 
+/* Rebuild the namespace a canonical suffix key encodes: a one-byte part count,
+ * then each part as a two-byte big-endian length followed by its bytes. Every
+ * length is checked against the bytes that remain and the encoding must be
+ * consumed exactly, so a corrupt key fails closed instead of being read past.
+ * The parts borrow the key's own storage, which outlives the copy into event
+ * scratch that follows. */
+static bool ns_suffix_key_decode(const ns_suffix_key_t *key,
+                                 moq_bytes_t *parts, size_t parts_cap,
+                                 moq_namespace_t *out)
+{
+    if (!key->data || key->len < 1) return false;
+    size_t count = key->data[0];
+    if (count > parts_cap) return false;
+    size_t off = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (key->len - off < 2) return false;
+        size_t plen = ((size_t)key->data[off] << 8) | (size_t)key->data[off + 1];
+        off += 2;
+        if (key->len - off < plen) return false;
+        parts[i].data = key->data + off;
+        parts[i].len = plen;
+        off += plen;
+    }
+    if (off != key->len) return false;
+    out->parts = count ? parts : NULL;
+    out->count = count;
+    return true;
+}
+
+/* §10.18: a FIN or a reset on the SUBSCRIBE_NAMESPACE response stream is
+ * treated as though every still-active namespace received a NAMESPACE_DONE.
+ *
+ * The active suffix set is the durable cursor: each outcome is queued first and
+ * the suffix deactivated only then, so an event-capacity refusal resumes
+ * exactly where it stopped without repeating or losing one. `close_half` is
+ * true only for FIN -- a reset's ingress owns the physical teardown -- and
+ * neither path takes a drain reference, because the peer's send half is
+ * already gone. */
+static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
+                                             bool close_half)
+{
+    moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+
+    /* The close is owed as soon as the terminal completes, so its action slot
+     * is reserved before the first outcome: the bidi must never close while
+     * outcomes are still owed, and a refusal here must not have emitted any. */
+    bool want_close = close_half && moq_session_uses_request_streams(s) &&
+                      e->stream_ref._v != 0;
+    if (want_close && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+
+    /* Only the inbound, peer-announced set is synthesized. The publisher-side
+     * set records what we announced to a subscriber and owes nothing here. */
+    ns_suffix_set_t *set = e->announced_suffixes_inbound
+        ? (ns_suffix_set_t *)e->announced_suffixes : NULL;
+
+    while (set && set->count > 0) {
+        if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+
+        moq_bytes_t parts[MOQ_DECODED_MAX_NAMESPACE_PARTS];
+        moq_namespace_t suffix;
+        if (!ns_suffix_key_decode(&set->keys[0], parts,
+                                  MOQ_DECODED_MAX_NAMESPACE_PARTS, &suffix))
+            return close_with_error(s, 0x1, "corrupt namespace suffix key");
+
+        size_t scratch_save;
+        moq_namespace_t suffix_copy;
+        moq_result_t rc = copy_suffix_to_event_scratch(s, &suffix, &suffix_copy,
+                                                       &scratch_save);
+        if (rc < 0) return rc;
+        /* A permanently undersized arena closes the session and reports it as
+         * MOQ_OK, so stop rather than pushing onto a closed session. */
+        if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+
+        moq_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = MOQ_EVENT_NAMESPACE_GONE;
+        ev.detail_size = (uint32_t)sizeof(moq_namespace_gone_event_t);
+        ev.borrow_epoch = s->borrow_epoch;
+        ev.u.namespace_gone.handle = e->handle;
+        ev.u.namespace_gone.track_namespace_suffix = suffix_copy;
+        rc = push_event(s, &ev);
+        if (rc < 0) {
+            s->event_scratch_len = scratch_save;
+            return rc;
+        }
+        /* Removal swaps the last key into the freed slot, so the next round
+         * reads the live set rather than a stale index. */
+        ns_suffix_set_remove_counted(s, set, set->keys[0].data,
+                                     set->keys[0].len);
+    }
+
+    if (want_close) (void)queue_close_bidi(s, e->stream_ref);
+    ns_sub_free_entry(s, slot);
+    return MOQ_OK;
+}
+
 /* Recovery contract for the results this returns.
  *
  * MOQ_ERR_WOULD_BLOCK is the retryable one the public API documents: the
@@ -1742,6 +1838,11 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
         e->recv_len -= resp.consumed;
     }
 
+    /* The buffer is drained. A FIN latched by the dispatcher terminates the
+     * subscription (§10.18); the latch survives every refusal, so an ordinary
+     * empty re-feed resumes the terminal. */
+    if (e->pending_fin)
+        return ns_sub_response_terminal(s, (size_t)slot, true);
     return MOQ_OK;
 }
 
@@ -1789,7 +1890,8 @@ moq_result_t moq_session_cancel_namespace_sub(
  * (the stream may already be gone). */
 
 static moq_result_t bidi_stream_teardown(moq_session_t *s,
-                                         moq_stream_ref_t stream_ref)
+                                         moq_stream_ref_t stream_ref,
+                                         bool reset)
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
 
@@ -1806,6 +1908,13 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
     int32_t ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
                                       stream_ref._v);
     if (ns_slot >= 0) {
+        /* §10.18 names the reset, not STOP_SENDING: a reset of the response
+         * stream is a NAMESPACE_DONE for every active namespace, and the reset
+         * ingress owns the physical teardown, so no local close is queued. A
+         * refusal here is retried through the same reset input. STOP_SENDING
+         * keeps retiring the owner outright. */
+        if (reset)
+            return ns_sub_response_terminal(s, (size_t)ns_slot, false);
         ns_sub_free_entry(s, (size_t)ns_slot);
         return MOQ_OK;
     }
@@ -1815,13 +1924,13 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
 moq_result_t handle_bidi_stream_reset(moq_session_t *s,
                                        moq_stream_ref_t stream_ref)
 {
-    return bidi_stream_teardown(s, stream_ref);
+    return bidi_stream_teardown(s, stream_ref, true);
 }
 
 moq_result_t handle_bidi_stream_stop(moq_session_t *s,
                                       moq_stream_ref_t stream_ref)
 {
-    return bidi_stream_teardown(s, stream_ref);
+    return bidi_stream_teardown(s, stream_ref, false);
 }
 
 moq_result_t moq_session_request_goaway_ns_sub(
