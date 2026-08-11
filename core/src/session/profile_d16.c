@@ -4815,6 +4815,7 @@ static const moq_profile_ops_t d16_ops = {
      * validator). */
     .uses_request_streams            = false,
     .location_varint_max             = MOQ_QUIC_VARINT_MAX,
+    .fetch_datagram_supported = false,   /* no datagram bit in the fetch header */
     .fetch_descending_supported      = true,   /* absolute Group IDs on the wire */
     .uses_uni_control_channel        = false,
     .classify_uni_stream             = NULL,

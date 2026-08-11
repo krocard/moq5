@@ -334,6 +334,20 @@ if(MOQ_BUILD_TESTS)
             LABELS "network;msquic;qualification"
             TIMEOUT 120)
 
+        # The managed max_open_subgroups must reach the LIVE session: with a
+        # constrained (=1) pool the server's second concurrent open is refused,
+        # while a prefix-sized (old-caller) config keeps the session default and
+        # the second open succeeds.
+        add_executable(test_msquic_subgroup_pool
+            tests/test_msquic_subgroup_pool.c)
+        target_link_libraries(test_msquic_subgroup_pool PRIVATE
+            moq::adapter-msquic-managed Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_subgroup_pool PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+
         add_executable(test_msquic_loopback tests/test_msquic_loopback.c)
         target_link_libraries(test_msquic_loopback PRIVATE
             moq::adapter-msquic-managed Threads::Threads)
@@ -347,6 +361,12 @@ if(MOQ_BUILD_TESTS)
             COMMAND test_msquic_loopback
                 ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
         set_tests_properties(msquic_loopback PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 120)
+        add_test(NAME msquic_subgroup_pool
+            COMMAND test_msquic_subgroup_pool
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_subgroup_pool PROPERTIES
             LABELS "network;msquic"
             TIMEOUT 120)
 

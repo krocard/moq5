@@ -1989,6 +1989,34 @@ MOQ_API moq_result_t moq_session_write_fetch_range(
     uint64_t now_us);
 
 /*
+ * Write an end-of-range gap marker whose inclusive Location is IMMEDIATELY
+ * BEFORE `first_group` -- it covers every Location up to and including the last
+ * object of `first_group - 1`. Publisher side. Advancing call. Use this to mark
+ * a leading gap before the first object a publisher can serve (e.g. a cache's
+ * evicted prefix): the marker lands at group `first_group - 1` with the highest
+ * object id the active draft can represent, which the session supplies so the
+ * caller never needs a draft-specific limit. Returns MOQ_ERR_INVAL if
+ * first_group == 0 (nothing precedes group 0) or kind is invalid, in both cases
+ * without queueing anything or advancing the prior Location. Marker semantics
+ * otherwise match moq_session_write_fetch_range (advances the prior Location
+ * only).
+ */
+MOQ_API moq_result_t moq_session_write_fetch_range_before_group(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    moq_fetch_range_kind_t kind,
+    uint64_t first_group,
+    uint64_t now_us);
+
+/*
+ * True when the negotiated draft's FETCH object header can carry the
+ * datagram-preference bit (draft-18 yes, draft-16 no). Pure query: a publisher
+ * asks the capability instead of testing a draft version, so version details
+ * never leak into caller logic. False for a NULL session.
+ */
+MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
+
+/*
  * Close the fetch data stream with FIN. Publisher side. Advancing call.
  * Frees the fetch entry after queuing the final action.
  */

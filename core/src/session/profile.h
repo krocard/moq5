@@ -333,6 +333,15 @@ typedef struct moq_profile_ops {
     uint64_t location_varint_max;
 
     /*
+     * Capability: true if this profile's FETCH object header can carry the
+     * datagram-preference bit. Draft-18 sets true; draft-16 sets false (no
+     * datagram bit in the fetch header). The session core asks this capability
+     * (moq_session_supports_fetch_datagram) instead of testing a draft version,
+     * so the query never leaks the version.
+     */
+    bool fetch_datagram_supported;
+
+    /*
      * Capability: true if this profile's FETCH-response data plane can carry a
      * descending group order. Draft-16 sets true (fetch objects carry absolute
      * Group IDs); draft-18 sets false (group deltas with ascending-only

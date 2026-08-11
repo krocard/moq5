@@ -389,6 +389,11 @@ static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
         scfg.streaming_objects = true;
     if (m->cfg.session_idle_timeout_us != 0)
         scfg.idle_timeout_us = m->cfg.session_idle_timeout_us;
+    /* Same prefix rule: m->cfg was zeroed then min(struct_size,sizeof)-copied,
+     * so an old-sized caller's poison beyond its struct_size never reaches
+     * here and the session keeps its default pool. */
+    if (m->cfg.max_open_subgroups != 0)
+        scfg.max_open_subgroups = m->cfg.max_open_subgroups;
     if (moq_session_create(&scfg, mgd_now_us(), &mc->session) < 0) {
         m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
@@ -1332,6 +1337,10 @@ static void mgd_copy_cfg(moq_msquic_managed_t *m,
         m->cfg.app_deadline_us = NULL;
         m->cfg.app_deadline_ctx = NULL;
     }
+    /* A partial appended scalar is poison, not a value. Keep the session
+     * default unless the caller-sized prefix covers the whole field. */
+    if (!MGD_CFG_HAS(cfg, max_open_subgroups))
+        m->cfg.max_open_subgroups = 0;
 }
 
 /*
@@ -1525,6 +1534,18 @@ moq_result_t moq_msquic_managed_create(
     const char *alpn_str = moq_alpn_for_version(derived.version);
     if (alpn_str == NULL)
         return MOQ_ERR_UNSUPPORTED;
+
+    /* Reject an out-of-range subgroup pool HERE -- before any allocation or
+     * transport setup -- so the caller sees the core's own MOQ_ERR_INVAL
+     * instead of a downstream INTERNAL (client) or a late child-creation
+     * failure that reads as transport OOM (server). Only when struct_size
+     * covers the whole appended field; a prefix/partial size still ignores
+     * whatever occupies those bytes. */
+    if (cfg->struct_size >=
+            offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) +
+                sizeof(cfg->max_open_subgroups) &&
+        cfg->max_open_subgroups > 0xffffu)
+        return MOQ_ERR_INVAL;
 
     moq_msquic_managed_t *m =
         cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);

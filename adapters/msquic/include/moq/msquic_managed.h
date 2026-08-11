@@ -215,6 +215,20 @@ typedef struct moq_msquic_managed_cfg {
      * moq_msquic_managed_cfg_init_sized. */
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
+
+    /* appended LAST (after the app_deadline block): outgoing subgroup pool per
+     * session, forwarded verbatim to moq_session_cfg_t.max_open_subgroups
+     * (0 = session default -- and what prefix-sized callers get). A small value
+     * makes the SESSION's write pool the sender-side blocker independent of any
+     * consumer table. Honored only when struct_size covers the field ENTIRELY;
+     * a size landing inside it reads as 0, never as its low bytes.
+     *
+     * Contract: 0 selects the session default; legal explicit values are
+     * 1..0xffff. A FULL-SIZED config carrying a larger value makes
+     * moq_msquic_managed_create return MOQ_ERR_INVAL before any allocation or
+     * transport setup -- the core's own limit, reported at the facade rather
+     * than surfacing later as an internal or transport error. */
+    uint32_t max_open_subgroups;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(

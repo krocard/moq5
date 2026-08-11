@@ -138,6 +138,43 @@ int main(void)
     if (moq_msquic_managed_is_fatal(NULL) ||
         moq_msquic_managed_is_closed(NULL))
         return 1;
+    /* appended max_open_subgroups: zero (session default) after a full-size
+     * init, settable, and appended LAST — AFTER the app_deadline block, so the
+     * newest field is the struct tail. Pin field ORDER and TAIL placement, not
+     * an exact byte growth: the append cost (u32 + alignment padding) is
+     * ABI-dependent. */
+    moq_msquic_managed_cfg_init_sized(&mcfg, sizeof(mcfg));
+    if (mcfg.max_open_subgroups != 0)
+        return 1;
+    mcfg.max_open_subgroups = 7;
+    if (mcfg.max_open_subgroups != 7)
+        return 1;
+    /* order: the appended field follows the previous tail (app_deadline_ctx),
+     * i.e. the app_deadline block is preserved ahead of it */
+    if (offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) <
+        offsetof(moq_msquic_managed_cfg_t, app_deadline_ctx) + sizeof(void *))
+        return 1;
+    /* tail: the type is large enough to hold the appended field at its offset */
+    if (sizeof(moq_msquic_managed_cfg_t) <
+        offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) +
+            sizeof(mcfg.max_open_subgroups))
+        return 1;
+    /* a caller sized THROUGH the app_deadline block but excluding the newer
+     * max_open_subgroups: the prior prefix initializes (app_deadline_ctx and
+     * session_idle_timeout_us zeroed), the excluded field keeps its poison */
+    memset(&mcfg, 0xff, sizeof(mcfg));
+    moq_msquic_managed_cfg_init_sized(
+        &mcfg, offsetof(moq_msquic_managed_cfg_t, max_open_subgroups));
+    if (mcfg.struct_size !=
+        (uint32_t)offsetof(moq_msquic_managed_cfg_t, max_open_subgroups))
+        return 1;
+    if (mcfg.session_idle_timeout_us != 0) /* pre-boundary field zeroed */
+        return 1;
+    if (mcfg.app_deadline_ctx != NULL) /* the immediate predecessor zeroed */
+        return 1;
+    if (mcfg.max_open_subgroups == 0) /* poison untouched */
+        return 1;
+
 #endif
     if (cfg.struct_size != sizeof(cfg))
         return 1;

@@ -2943,6 +2943,7 @@ static const moq_profile_ops_t d18_ops = {
     .process_control_data    = d18_process_control_data,
     .uses_request_streams    = true,
     .location_varint_max     = MOQ_VI64_MAX,
+    .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */
     .fetch_descending_supported = false,   /* ascending-only delta reconstruction */
     .uses_uni_control_channel = true,
     .classify_uni_stream     = d18_classify_uni_stream,

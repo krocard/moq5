@@ -1726,7 +1726,10 @@ moq_result_t moq_session_write_fetch_object(
     return MOQ_OK;
 }
 
-moq_result_t moq_session_write_fetch_range(
+/* Shared end-of-range marker emit: validated by the public entry points, which
+ * own their own argument contracts. Rejects before any queueing or cursor
+ * mutation, so a refused call leaves the fetch entry byte-identical. */
+static moq_result_t fetch_range_marker(
     moq_session_t *s,
     moq_fetch_t fetch,
     moq_fetch_range_kind_t kind,
@@ -1734,9 +1737,6 @@ moq_result_t moq_session_write_fetch_range(
     uint64_t object_id,
     uint64_t now_us)
 {
-    if (!s) return MOQ_ERR_INVAL;
-    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
-        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1776,6 +1776,43 @@ moq_result_t moq_session_write_fetch_range(
     entry->prior.group_id = group_id;
     entry->prior.object_id = object_id;
     return MOQ_OK;
+}
+
+moq_result_t moq_session_write_fetch_range(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    moq_fetch_range_kind_t kind,
+    uint64_t group_id,
+    uint64_t object_id,
+    uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
+        return MOQ_ERR_INVAL;
+    return fetch_range_marker(s, fetch, kind, group_id, object_id, now_us);
+}
+
+moq_result_t moq_session_write_fetch_range_before_group(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    moq_fetch_range_kind_t kind,
+    uint64_t first_group,
+    uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
+        return MOQ_ERR_INVAL;
+    if (first_group == 0) return MOQ_ERR_INVAL;   /* nothing precedes group 0 */
+    /* The profile owns the draft's maximum encodable object id; the marker's
+     * inclusive Location is the LAST object of the group before first_group. */
+    uint64_t max_obj = s->profile->location_varint_max;
+    return fetch_range_marker(s, fetch, kind, first_group - 1u, max_obj, now_us);
+}
+
+bool moq_session_supports_fetch_datagram(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->fetch_datagram_supported;
 }
 
 moq_result_t moq_session_end_fetch(
