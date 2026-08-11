@@ -4459,20 +4459,31 @@ int main(void)
             combined, clen, false, 0) == MOQ_OK);
         /* DON'T drain — queue full with begin+end chunk. */
 
-        /* Reset — should WB because queue is full. */
+        /* Reset with the queue full: the obligation is captured and retried.
+         * The begin+end chunk already completed the object normally, so the
+         * closure owed is the SUBGROUP's, not a second object terminal --
+         * without it a receiver that opened this subgroup would never learn
+         * the stream died. */
         moq_result_t rrc = moq_session_on_data_reset(c, rx_ref, 0x1, 0);
-        /* The begin+end chunk already completed the object normally,
-         * so parse_state moved to AWAITING_OBJECT. No terminal needed. */
-        if (rrc == MOQ_OK) {
-            /* Object completed before reset arrived — correct. */
-            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
-            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_OBJECT_CHUNK);
-            MOQ_TEST_CHECK(ev.u.object_chunk.begin == true);
-            MOQ_TEST_CHECK(ev.u.object_chunk.end == true);
-            MOQ_TEST_CHECK(ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_NORMAL);
-            moq_event_cleanup(&ev);
+        int normals = 0, sgresets = 0;
+        for (int spin = 0; spin < 8; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                    MOQ_TEST_CHECK(ev.u.object_chunk.terminal ==
+                                   MOQ_OBJECT_TERMINAL_NORMAL);
+                    if (ev.u.object_chunk.end) normals++;
+                } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x1);
+                }
+                moq_event_cleanup(&ev);
+            }
+            if (rrc == MOQ_OK) break;
+            rrc = moq_session_on_data_reset(c, rx_ref, 0x1, 0);
         }
-
+        MOQ_TEST_CHECK(rrc == MOQ_OK);
+        MOQ_TEST_CHECK(normals == 1);
+        MOQ_TEST_CHECK(sgresets == 1);
         MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 0);
 
         moq_session_destroy(c);
@@ -4528,7 +4539,12 @@ int main(void)
         /* Reset before any object is written. */
         MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0x1, 0) == MOQ_OK);
 
-        /* No OBJECT_CHUNK events — no object was begun. */
+        /* No OBJECT_CHUNK event -- no object was begun -- but the subgroup
+         * identity came from the header, so its closure is reported. */
+        MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBGROUP_RESET);
+        MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x1);
+        moq_event_cleanup(&ev);
         MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 0);
 
         moq_session_destroy(c);
@@ -4572,7 +4588,7 @@ int main(void)
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
 
         moq_rcbuf_t *p = NULL;
-        moq_rcbuf_create(&alloc, (const uint8_t *)"done", 4, &p);
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"done", 4, &p) == MOQ_OK);
         moq_session_write_object(sv, sg, 0, p, 0);
         moq_rcbuf_decref(p);
 
@@ -4600,8 +4616,9 @@ int main(void)
         MOQ_TEST_CHECK(drc == MOQ_ERR_WOULD_BLOCK);
 
         /* Now reset arrives while the final chunk is pending. The pending
-         * chunk has end=true — the object completed normally. Reset should
-         * push that final chunk and NOT add a terminal=RESET event. */
+         * chunk has end=true -- the object completed normally -- so the reset
+         * pushes that final chunk and reports the subgroup's closure rather
+         * than a second object terminal. */
         drc = moq_session_on_data_reset(c, rx_ref, 0x1, 0);
         MOQ_TEST_CHECK(drc == MOQ_ERR_WOULD_BLOCK);
 
@@ -4610,24 +4627,41 @@ int main(void)
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_OK);
         moq_event_cleanup(&ev);
 
-        /* Retry reset. Pending final chunk should push successfully. */
+        /* Retry reset: the pending final chunk pushes, then the subgroup's
+         * own closure is owed -- so the drive may need one more slot. The
+         * object terminal stays NORMAL throughout: a completed object is
+         * never retro-actively reset. */
+        int normals = 0, sgresets = 0;
         drc = moq_session_on_data_reset(c, rx_ref, 0x1, 0);
-        MOQ_TEST_CHECK(drc == MOQ_OK);
-
-        /* Should get the normal final chunk, NOT a terminal=RESET. */
-        MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
-        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_OBJECT_CHUNK);
-        MOQ_TEST_CHECK(ev.u.object_chunk.begin == true);
-        MOQ_TEST_CHECK(ev.u.object_chunk.end == true);
-        MOQ_TEST_CHECK(ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_NORMAL);
-        MOQ_TEST_CHECK(ev.u.object_chunk.chunk != NULL);
-        if (ev.u.object_chunk.chunk) {
-        MOQ_TEST_CHECK(moq_rcbuf_len(ev.u.object_chunk.chunk) == 4);
-        MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(ev.u.object_chunk.chunk), "done", 4) == 0);
+        for (int spin = 0; spin < 8; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                    MOQ_TEST_CHECK(ev.u.object_chunk.terminal ==
+                                   MOQ_OBJECT_TERMINAL_NORMAL);
+                    if (ev.u.object_chunk.end) {
+                        normals++;
+                        MOQ_TEST_CHECK(ev.u.object_chunk.begin == true);
+                        MOQ_TEST_CHECK(ev.u.object_chunk.chunk != NULL);
+                        if (ev.u.object_chunk.chunk) {
+                            MOQ_TEST_CHECK(moq_rcbuf_len(ev.u.object_chunk.chunk) == 4);
+                            MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(
+                                ev.u.object_chunk.chunk), "done", 4) == 0);
+                        }
+                    }
+                } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x1);
+                }
+                moq_event_cleanup(&ev);
+            }
+            if (drc == MOQ_OK) break;
+            drc = moq_session_on_data_reset(c, rx_ref, 0x1, 0);
         }
-        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(drc == MOQ_OK);
+        MOQ_TEST_CHECK(normals == 1);      /* exactly one NORMAL terminal   */
+        MOQ_TEST_CHECK(sgresets == 1);     /* exactly one subgroup closure  */
 
-        /* No more events — no spurious terminal=RESET. */
+        /* No more events. */
         MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 0);
 
         moq_session_destroy(c);
@@ -6513,6 +6547,751 @@ int main(void)
         }
         MOQ_TEST_CHECK(n_fin == 1);
         MOQ_TEST_CHECK(n_reset == 0);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+    /* Local feed helper for the P7 blocks (the earlier one is #undef'd). */
+    #define P7_FEED_ALL(from, to, ref) do { \
+        moq_action_t _a[32]; size_t _n; \
+        while ((_n = moq_session_poll_actions((from), _a, 32)) > 0) \
+            for (size_t _i = 0; _i < _n; _i++) { \
+                if (_a[_i].kind == MOQ_ACTION_SEND_DATA) { \
+                    if (_a[_i].u.send_data.header_len > 0) \
+                        (void)moq_session_on_data_bytes((to), (ref), \
+                            _a[_i].u.send_data.header, \
+                            _a[_i].u.send_data.header_len, false, 0); \
+                    if (_a[_i].u.send_data.payload) \
+                        (void)moq_session_on_data_bytes((to), (ref), \
+                            moq_rcbuf_data(_a[_i].u.send_data.payload), \
+                            moq_rcbuf_len(_a[_i].u.send_data.payload), \
+                            false, 0); \
+                } \
+                moq_action_cleanup(&_a[_i]); \
+            } \
+    } while (0)
+
+    /* == P7.0 appended-field layout ==================================== *
+     * error_code is appended at the TRUE tail: every pre-existing member keeps
+     * its offset, the new field sits last, and the event's detail_size covers
+     * it so a size-aware consumer sees the whole struct. */
+    {
+        MOQ_TEST_CHECK(offsetof(moq_object_chunk_event_t, error_code) >
+                       offsetof(moq_object_chunk_event_t, properties));
+        MOQ_TEST_CHECK(offsetof(moq_object_chunk_event_t, error_code) +
+                       sizeof(uint64_t) <= sizeof(moq_object_chunk_event_t));
+        MOQ_TEST_CHECK(sizeof(moq_object_chunk_event_t) <=
+                       MOQ_EVENT_DETAIL_MAX);
+        /* Routing identity precedes the appended tail and is unmoved. */
+        MOQ_TEST_CHECK(offsetof(moq_object_chunk_event_t, group_id) <
+                       offsetof(moq_object_chunk_event_t, properties));
+    }
+
+    /* == P7.1 per-stream routing identity ============================== *
+     * Every emitted chunk -- begin, continuation and end -- must carry the
+     * identity of the object it belongs to, and that identity must match the
+     * STREAM it arrived on. Two subgroups of one track are delivered on
+     * separate refs and drained SEPARATELY, so each chunk's identity is
+     * checked against its own stream's expected (group, subgroup, object):
+     * a swapped or stale identity cannot pass by being "one of the two". */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        /* Each subgroup is opened, written and fed in ISOLATION, so the only
+         * actions pending when a stream is fed are that stream's own. Their
+         * identities differ in both group and subgroup, so a swapped or stale
+         * identity fails on a field. */
+        moq_stream_ref_t ref_a = moq_stream_ref_from_u64(0xB1);
+        moq_stream_ref_t ref_b = moq_stream_ref_from_u64(0xB2);
+        moq_rcbuf_t *p = NULL;
+        moq_event_t ev;
+
+        for (int which = 0; which < 2; which++) {
+            moq_subgroup_cfg_t sc;
+            moq_subgroup_cfg_init(&sc);
+            sc.group_id = which == 0 ? 7u : 8u;
+            sc.subgroup_id = which == 0 ? 0u : 3u;
+            moq_subgroup_handle_t sgh;
+            MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sc, 0,
+                                                     &sgh) == MOQ_OK);
+
+            moq_stream_ref_t ref = which == 0 ? ref_a : ref_b;
+            uint64_t want_group = sc.group_id;
+            uint64_t want_sub = sc.subgroup_id;
+            const uint64_t want_obj = 0u;
+            const char *pay = which == 0 ? "AAAA" : "BBBB";
+
+            MOQ_TEST_CHECK(moq_session_begin_object(sv, sgh, want_obj, 8, 0) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)pay, 4, &p) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_write_object_data(sv, sgh, p, 0) == MOQ_OK);
+            moq_rcbuf_decref(p);
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)pay, 4, &p) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_write_object_data(sv, sgh, p, 0) == MOQ_OK);
+            moq_rcbuf_decref(p);
+
+            P7_FEED_ALL(sv, c, ref);
+
+            int chunks = 0, continuations = 0;
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                    chunks++;
+                    /* Exact identity of THIS stream, on every chunk. */
+                    MOQ_TEST_CHECK(ev.u.object_chunk.group_id == want_group);
+                    MOQ_TEST_CHECK(ev.u.object_chunk.subgroup_id == want_sub);
+                    MOQ_TEST_CHECK(ev.u.object_chunk.object_id == want_obj);
+                    if (!ev.u.object_chunk.begin) continuations++;
+                }
+                moq_event_cleanup(&ev);
+            }
+            MOQ_TEST_CHECK(chunks >= 2);
+            MOQ_TEST_CHECK(continuations >= 1);   /* the routing-critical ones */
+        }
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == P7.2 terminal RESET carries the peer's exact cause ============ *
+     * A streaming reset mid-object surfaces the peer's application code on
+     * the terminal chunk, exactly once, with no SUBGROUP_RESET in streaming
+     * mode. NORMAL terminals report zero. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 11; sg_cfg.subgroup_id = 2;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        /* Object 0 completes NORMALly; object 1 is begun then reset. */
+        moq_rcbuf_t *p = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"done", 4, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 0, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        MOQ_TEST_CHECK(moq_session_begin_object(sv, sg, 1, 16, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"part", 4, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object_data(sv, sg, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xB7);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        /* Every terminal before the reset is NORMAL and reports code 0. */
+        moq_event_t ev;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_CHUNK && ev.u.object_chunk.end) {
+                MOQ_TEST_CHECK(ev.u.object_chunk.terminal ==
+                               MOQ_OBJECT_TERMINAL_NORMAL);
+                MOQ_TEST_CHECK(ev.u.object_chunk.error_code == 0);
+            }
+            moq_event_cleanup(&ev);
+        }
+
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0xC0FFEE, 0) == MOQ_OK);
+
+        int resets = 0, subgroup_resets = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_CHUNK && ev.u.object_chunk.end &&
+                ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_RESET) {
+                resets++;
+                MOQ_TEST_CHECK(ev.u.object_chunk.error_code == 0xC0FFEE);
+                /* The terminal still names the object it tore down. */
+                MOQ_TEST_CHECK(ev.u.object_chunk.group_id == 11);
+                MOQ_TEST_CHECK(ev.u.object_chunk.subgroup_id == 2);
+                MOQ_TEST_CHECK(ev.u.object_chunk.object_id == 1);
+            }
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) subgroup_resets++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(resets == 1);            /* exactly once */
+        MOQ_TEST_CHECK(subgroup_resets == 0);   /* streaming: no second event */
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F1.1 the FIRST peer cause wins across a blocked NORMAL flush ==== *
+     * A NORMAL continuation is pending and the queue is full, so the reset
+     * cannot be serviced: the obligation and its cause must be captured
+     * BEFORE that blocked flush. A later drive carrying a DIFFERENT code must
+     * retry the stored obligation, never adopt the newer value. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        cx.max_events = 2;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 31; sg_cfg.subgroup_id = 4;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_begin_object(sv, sg, 0, 64, 0) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        for (int w = 0; w < 4; w++) {
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"zz", 2, &p) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_write_object_data(sv, sg, p, 0) == MOQ_OK);
+            moq_rcbuf_decref(p);
+        }
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xC1);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        /* Blocked with a NORMAL continuation still pending. */
+        moq_result_t rc = moq_session_on_data_reset(c, rx_ref, 0xBEEF, 0);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
+
+        /* Every later drive supplies a DIFFERENT code; it must be ignored. */
+        moq_event_t ev;
+        int resets = 0, sgresets = 0;
+        for (int spin = 0; spin < 16 && rc == MOQ_ERR_WOULD_BLOCK; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK && ev.u.object_chunk.end &&
+                    ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_RESET) {
+                    resets++;
+                    MOQ_TEST_CHECK(ev.u.object_chunk.error_code == 0xBEEF);
+                } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0xBEEF);
+                }
+                moq_event_cleanup(&ev);
+            }
+            rc = moq_session_on_data_reset(c, rx_ref, 0xDEAD, 0);
+        }
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_CHUNK && ev.u.object_chunk.end &&
+                ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_RESET) {
+                resets++;
+                MOQ_TEST_CHECK(ev.u.object_chunk.error_code == 0xBEEF);
+            } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                sgresets++;
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0xBEEF);
+            }
+            moq_event_cleanup(&ev);
+        }
+        /* Exactly one terminal, of exactly one flavor, carrying 0xBEEF. */
+        MOQ_TEST_CHECK(resets + sgresets == 1);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F1.2 the owed terminal lands on the GENERIC route alone ========= *
+     * Same blocked shape, but after freeing capacity the ONLY drives are
+     * empty on_data_bytes calls: the pending-chunk path must carry the
+     * obligation through to the terminal and free the stream without another
+     * on_data_reset. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        cx.max_events = 2;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 32; sg_cfg.subgroup_id = 5;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_begin_object(sv, sg, 0, 64, 0) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        for (int w = 0; w < 4; w++) {
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"qq", 2, &p) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_write_object_data(sv, sg, p, 0) == MOQ_OK);
+            moq_rcbuf_decref(p);
+        }
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xC2);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0xBEEF, 0)
+                       == MOQ_ERR_WOULD_BLOCK);
+
+        /* From here on: ONLY empty on_data_bytes drives. */
+        moq_event_t ev;
+        int resets = 0, sgresets = 0;
+        for (int spin = 0; spin < 16; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK && ev.u.object_chunk.end &&
+                    ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_RESET) {
+                    resets++;
+                    MOQ_TEST_CHECK(ev.u.object_chunk.error_code == 0xBEEF);
+                } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0xBEEF);
+                }
+                moq_event_cleanup(&ev);
+            }
+            if (resets + sgresets == 1) break;
+            (void)moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0);
+        }
+        MOQ_TEST_CHECK(resets + sgresets == 1);   /* landed without a reset call */
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F2 streaming reset with NO object in flight is never silent ===== *
+     * A completed object leaves nothing to attach an object terminal to, so
+     * a resolved subgroup reports SUBGROUP_RESET with the peer's code -- the
+     * closure a receiver that opened the subgroup depends on. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 33; sg_cfg.subgroup_id = 6;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"whole", 5, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 0, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xC3);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        moq_event_t ev;
+        while (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
+
+        /* Reset with the stream idle between objects. */
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0x5150, 0) == MOQ_OK);
+
+        int sgresets = 0, chunks = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                sgresets++;
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x5150);
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.group_id == 33);
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.subgroup_id == 6);
+            } else if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                chunks++;
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(sgresets == 1);   /* never silent */
+        MOQ_TEST_CHECK(chunks == 0);     /* and no fabricated object terminal */
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F1.2b generic-only route emits no spurious/duplicate chunk ===== *
+     * Extends the generic-only drive with an EXACT chunk ledger: the drained
+     * NORMAL chunk must appear once, with its real payload, and the owed
+     * terminal must follow -- no empty continuation from re-pushing an
+     * already-delivered chunk. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        cx.max_events = 2;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 41; sg_cfg.subgroup_id = 2;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_begin_object(sv, sg, 0, 64, 0) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        for (int w = 0; w < 4; w++) {
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"mn", 2, &p) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_write_object_data(sv, sg, p, 0) == MOQ_OK);
+            moq_rcbuf_decref(p);
+        }
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xD1);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0xBEEF, 0)
+                       == MOQ_ERR_WOULD_BLOCK);
+
+        moq_event_t ev;
+        int normals = 0, empties = 0, terminals = 0, sgresets = 0;
+        for (int spin = 0; spin < 24; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                    if (ev.u.object_chunk.terminal == MOQ_OBJECT_TERMINAL_RESET &&
+                        ev.u.object_chunk.end) {
+                        terminals++;
+                        MOQ_TEST_CHECK(ev.u.object_chunk.error_code == 0xBEEF);
+                    } else if (ev.u.object_chunk.chunk == NULL &&
+                               !ev.u.object_chunk.begin &&
+                               !ev.u.object_chunk.end) {
+                        /* A payload-less CONTINUATION is the duplicate-push
+                         * signature (a begin-only header chunk is legal and
+                         * carries no payload). It must never appear. */
+                        empties++;
+                    } else if (ev.u.object_chunk.chunk != NULL) {
+                        normals++;
+                        MOQ_TEST_CHECK(moq_rcbuf_len(ev.u.object_chunk.chunk) > 0);
+                    }
+                } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0xBEEF);
+                }
+                moq_event_cleanup(&ev);
+            }
+            if (terminals + sgresets == 1) break;
+            (void)moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0);
+        }
+        MOQ_TEST_CHECK(empties == 0);              /* no duplicate push      */
+        MOQ_TEST_CHECK(terminals + sgresets == 1); /* exactly one closure    */
+        MOQ_TEST_CHECK(normals >= 1);              /* real payload delivered */
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F1.2c a PARKED subgroup terminal is retried by generic drives ==== *
+     * Two-stage refusal: the final NORMAL chunk lands, then the subgroup
+     * terminal is refused and parks. From there only empty on_data_bytes
+     * drives run -- they must complete exactly one subgroup reset with the
+     * original code. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        cx.max_events = 2;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 42; sg_cfg.subgroup_id = 1;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        /* ONE complete object, fully parsed and left UNPOLLED so the queue
+         * is full with the stream between objects: the only thing still owed
+         * at reset time is the subgroup terminal, which must therefore park. */
+        moq_rcbuf_t *p = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"ab", 2, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 0, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xD2);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        moq_result_t rc0 = moq_session_on_data_reset(c, rx_ref, 0x77, 0);
+        MOQ_TEST_CHECK(rc0 == MOQ_ERR_WOULD_BLOCK);   /* refused, parked/owed */
+
+        moq_event_t ev;
+        int sgresets = 0, empties = 0;
+        for (int spin = 0; spin < 24; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x77);
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.group_id == 42);
+                } else if (ev.kind == MOQ_EVENT_OBJECT_CHUNK &&
+                           ev.u.object_chunk.chunk == NULL &&
+                           !ev.u.object_chunk.begin && !ev.u.object_chunk.end) {
+                    empties++;   /* payload-less continuation = duplicate */
+                }
+                moq_event_cleanup(&ev);
+            }
+            if (sgresets == 1) break;
+            /* GENERIC drives only -- no further on_data_reset. */
+            (void)moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0);
+        }
+        MOQ_TEST_CHECK(sgresets == 1);
+        MOQ_TEST_CHECK(empties == 0);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F2b a SUPPRESSED object still closes the visible subgroup ======= *
+     * Forward State 0 suppresses an object's events, but a subgroup already
+     * visible from an earlier object must still receive exactly one closure
+     * when the stream resets during the suppressed object. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 51; sg_cfg.subgroup_id = 3;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"seen", 4, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 0, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xD3);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        /* The first object IS visible: the subgroup is open to the app. */
+        moq_event_t ev;
+        int visible = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) visible++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(visible >= 1);
+
+        /* Forward State 0 for this subscription (white-box: the exact state
+         * rx_objects_suppressed reads at object admission). */
+        for (size_t i = 0; i < c->sub_cap; i++)
+            if (c->subs[i].role == MOQ_SUB_ROLE_SUBSCRIBER)
+                c->subs[i].forward = false;
+
+        /* A second object is admitted under suppression, then the peer resets
+         * mid-object. */
+        MOQ_TEST_CHECK(moq_session_begin_object(sv, sg, 1, 32, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"hidden", 6, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object_data(sv, sg, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        int suppressed_chunks = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) suppressed_chunks++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(suppressed_chunks == 0);   /* suppression really held */
+
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0x9001, 0) == MOQ_OK);
+
+        int sgresets = 0, chunks = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                sgresets++;
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x9001);
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.group_id == 51);
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.subgroup_id == 3);
+            } else if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                chunks++;
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(chunks == 0);     /* the suppressed object stays hidden */
+        MOQ_TEST_CHECK(sgresets == 1);   /* but the subgroup still closes      */
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F2c whole-object PENDING_EMIT survives the reset ================ *
+     * A COMPLETE whole-object payload whose OBJECT_RECEIVED was refused is
+     * not a partial: it predates the reset and must still be delivered, in
+     * order, before the subgroup terminal. Both obligations are driven under
+     * repeated backpressure, and after the initial on_data_reset the drives
+     * are GENERIC only. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = false;   /* whole-object mode */
+        cx.max_events = 1;   /* one slot: object 2 must park in PENDING_EMIT */
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 61; sg_cfg.subgroup_id = 7;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        /* Two complete objects: the first fills the queue, the second parks
+         * in PENDING_EMIT with its payload fully parsed. */
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"first", 5, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 0, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"second", 6, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 1, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xE1);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        /* NON-VACUITY: the live rx slot really is parked in PENDING_EMIT with
+         * its complete payload retained -- otherwise the arms below would
+         * prove nothing about the parked-object path. */
+        {
+            int parked = 0;
+            for (size_t i = 0; i < c->rx_cap; i++)
+                if (c->rx_streams[i].active &&
+                    c->rx_streams[i].parse_state == MOQ_RX_PENDING_EMIT)
+                    parked++;
+            MOQ_TEST_CHECK(parked == 1);
+        }
+
+        /* Reset with the complete second object still owed: refused, with the
+         * obligation and its code retained. */
+        moq_result_t rc = moq_session_on_data_reset(c, rx_ref, 0xFEED, 0);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
+
+        moq_event_t ev;
+        int objs = 0, sgresets = 0, order_ok = 1, seen_sgreset = 0;
+        int saw_second = 0;
+        /* Exact ordered ledger: "first", "second", then the closure. */
+        int step = 0, extra = 0;
+        for (int spin = 0; spin < 24; spin++) {
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                    objs++;
+                    if (seen_sgreset) order_ok = 0;   /* object after closure */
+                    const char *want = step == 0 ? "first" : "second";
+                    size_t wlen = step == 0 ? 5u : 6u;
+                    if (step <= 1) {
+                        MOQ_TEST_CHECK(ev.u.object_received.payload != NULL);
+                        if (ev.u.object_received.payload) {
+                            MOQ_TEST_CHECK(moq_rcbuf_len(
+                                ev.u.object_received.payload) == wlen);
+                            MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(
+                                ev.u.object_received.payload), want, wlen) == 0);
+                        }
+                        if (step == 1) saw_second = 1;
+                    } else {
+                        extra++;
+                    }
+                    step++;
+                } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                    sgresets++;
+                    seen_sgreset = 1;
+                    MOQ_TEST_CHECK(step == 2);   /* exactly after both objects */
+                    MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0xFEED);
+                } else {
+                    extra++;
+                }
+                moq_event_cleanup(&ev);
+            }
+            if (sgresets == 1) break;
+            /* GENERIC-only re-drives finish both obligations. */
+            (void)moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0);
+        }
+        MOQ_TEST_CHECK(extra == 0);       /* no additional/duplicate event   */
+        {   /* the rx stream is gone */
+            int live = 0;
+            for (size_t i = 0; i < c->rx_cap; i++)
+                if (c->rx_streams[i].active) live++;
+            MOQ_TEST_CHECK(live == 0);
+        }
+        MOQ_TEST_CHECK(objs == 2);        /* the complete object was NOT lost */
+        MOQ_TEST_CHECK(saw_second == 1);  /* with its original payload        */
+        MOQ_TEST_CHECK(sgresets == 1);    /* exactly one closure              */
+        MOQ_TEST_CHECK(order_ok == 1);    /* object precedes the closure      */
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == F2d suppression from the FIRST object still resolves identity ==== *
+     * Forward State 0 is set BEFORE any object is admitted, so the very first
+     * object is suppressed and NO object event is ever surfaced for this
+     * stream. Its parsed header still resolves the real (group, subgroup), so
+     * the reset closes the subgroup with that exact identity. This is the
+     * positive half of the load-bearing distinction whose negative half is
+     * the header-only unresolved-FIRST_OBJECT arm (which stays silent). */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+        cx.streaming_objects = true;
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_subscription_t server_sub;
+        sf_setup(&failures, &alloc, &cx, NULL, &c, &sv, &server_sub);
+
+        /* Suppress BEFORE the first object is admitted. */
+        for (size_t i = 0; i < c->sub_cap; i++)
+            if (c->subs[i].role == MOQ_SUB_ROLE_SUBSCRIBER)
+                c->subs[i].forward = false;
+
+        moq_subgroup_cfg_t sg_cfg;
+        moq_subgroup_cfg_init(&sg_cfg);
+        sg_cfg.group_id = 71; sg_cfg.subgroup_id = 5;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK(moq_session_open_subgroup(sv, server_sub, &sg_cfg, 0, &sg) == MOQ_OK);
+        /* A PARTIAL first object: its header is parsed (identity resolved),
+         * its payload never completes. */
+        MOQ_TEST_CHECK(moq_session_begin_object(sv, sg, 0, 64, 0) == MOQ_OK);
+        moq_rcbuf_t *p = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"partial", 7, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object_data(sv, sg, p, 0) == MOQ_OK);
+        moq_rcbuf_decref(p);
+
+        moq_stream_ref_t rx_ref = moq_stream_ref_from_u64(0xF1);
+        P7_FEED_ALL(sv, c, rx_ref);
+
+        /* Nothing at all was surfaced for this stream. */
+        moq_event_t ev;
+        int pre_chunks = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) pre_chunks++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(pre_chunks == 0);
+
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, rx_ref, 0x4242, 0) == MOQ_OK);
+
+        int sgresets = 0, chunks = 0;
+        while (moq_session_poll_events(c, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                sgresets++;
+                /* The REAL identity from the suppressed object's header --
+                 * not a fabricated subgroup 0. */
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.group_id == 71);
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.subgroup_id == 5);
+                MOQ_TEST_CHECK(ev.u.subgroup_reset.error_code == 0x4242);
+            } else if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) {
+                chunks++;
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(chunks == 0);     /* no object terminal ever surfaced */
+        MOQ_TEST_CHECK(sgresets == 1);   /* exactly one closure, no duplicate */
+        {   /* the rx stream is gone */
+            int live = 0;
+            for (size_t i = 0; i < c->rx_cap; i++)
+                if (c->rx_streams[i].active) live++;
+            MOQ_TEST_CHECK(live == 0);
+        }
 
         moq_session_destroy(c);
         moq_session_destroy(sv);

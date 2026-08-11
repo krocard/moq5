@@ -1217,10 +1217,14 @@ typedef enum moq_rx_parse_state {
      * pending_fin set; rx_finish_stream is retried on the next drive until the
      * event is queued, then the entry is recorded-finished and freed. */
     MOQ_RX_PENDING_FINISHED = 8,
-    /* RESET_STREAM seen in whole-object mode with the subgroup resolved, but
-     * the SUBGROUP_RESET event could not be queued (event queue full). The
-     * stream stays live with reset_error_code retained; the emit is retried on
-     * the next drive until it lands, then the entry is freed. */
+    /* A subgroup-level closure is owed for a bound, resolved subgroup -- the
+     * reset had no application-visible object terminal to carry it (whole-object
+     * mode, a streaming stream idle between objects or past its last one, an
+     * object suppressed by Forward State 0, or after a final NORMAL chunk
+     * drained) -- but the SUBGROUP_RESET event could not be queued (event queue
+     * full). The stream stays live with reset_error_code retained; the emit is
+     * retried on the next drive, by any route, until it lands, then the entry
+     * is freed. */
     MOQ_RX_PENDING_RESET    = 9,
 } moq_rx_parse_state_t;
 
@@ -1290,6 +1294,16 @@ typedef struct moq_rx_stream {
     bool                   pending_end;
     bool                   pending_from_input;
     moq_object_terminal_t  pending_terminal;
+    /* The peer's RESET_STREAM code owed to the pending terminal chunk, copied
+     * from the retained obligation below when the terminal is armed. */
+    uint64_t               pending_reset_code;
+    /* A peer RESET_STREAM was observed and its terminal is not yet emitted.
+     * Captured BEFORE any operation that can block, so a refused flush cannot
+     * lose the obligation, and never overwritten: the FIRST peer code is the
+     * cause, whatever a later re-drive passes. Every drive route -- repeated
+     * on_data_reset, or the generic pending-chunk path of on_data_bytes --
+     * completes this same obligation. */
+    bool                   reset_owed;
 } moq_rx_stream_t;
 
 /* A datagram that arrived for an alias not yet established by a SUBSCRIBE_OK;

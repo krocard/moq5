@@ -10,6 +10,7 @@
  * behaviour reachable without faking the C layer.
  */
 
+#include <cstddef>
 #include <moq/session.hpp>
 #include <moq/rcbuf.h>
 
@@ -354,6 +355,80 @@ int main()
             MOQ_CHECK(feed_failures == 0);
         }
     }
+    /* -- the appended object-chunk reset cause crosses the binding -------- *
+     * Through the real polled_event -> variant conversion, not layout
+     * assertions: a full-sized RESET terminal carries the exact peer code, a
+     * NORMAL terminal reads zero, an older/smaller detail reads zero even with
+     * a poisoned physical tail, and copies preserve the code. */
+    {
+        /* 1. full-sized RESET terminal -> exact nonzero code */
+        moq_event_t e{};
+        e.kind = MOQ_EVENT_OBJECT_CHUNK;
+        e.detail_size = static_cast<uint32_t>(sizeof(moq_object_chunk_event_t));
+        e.u.object_chunk.end = true;
+        e.u.object_chunk.terminal = MOQ_OBJECT_TERMINAL_RESET;
+        e.u.object_chunk.error_code = 0xC0FFEEu;
+        moq::polled_event owner(e);
+        auto v = owner.variant();
+        auto *oc = std::get_if<moq::event::object_chunk>(&v);
+        MOQ_CHECK(oc != nullptr);
+        if (oc) MOQ_CHECK(oc->error_code == 0xC0FFEEu);
+
+        /* 4. copy preserves the exact code */
+        if (oc) {
+            moq::event::object_chunk copy = *oc;
+            MOQ_CHECK(copy.error_code == 0xC0FFEEu);
+            moq::event_variant vcopy = v;
+            auto *oc2 = std::get_if<moq::event::object_chunk>(&vcopy);
+            MOQ_CHECK(oc2 != nullptr);
+            if (oc2) MOQ_CHECK(oc2->error_code == 0xC0FFEEu);
+        }
+    }
+    {
+        /* 2. full-sized NORMAL terminal with POISON in the physical tail ->
+         *    still zero: a cause is meaningful only under a RESET terminal. */
+        moq_event_t e{};
+        e.kind = MOQ_EVENT_OBJECT_CHUNK;
+        e.detail_size = static_cast<uint32_t>(sizeof(moq_object_chunk_event_t));
+        e.u.object_chunk.end = true;
+        e.u.object_chunk.terminal = MOQ_OBJECT_TERMINAL_NORMAL;
+        e.u.object_chunk.error_code = 0xABCDEF01u;   /* poison */
+        moq::polled_event owner(e);
+        auto v = owner.variant();
+        auto *oc = std::get_if<moq::event::object_chunk>(&v);
+        MOQ_CHECK(oc != nullptr);
+        if (oc) MOQ_CHECK(oc->error_code == 0u);
+
+        /* Same for the STOP terminal. */
+        moq_event_t e2{};
+        e2.kind = MOQ_EVENT_OBJECT_CHUNK;
+        e2.detail_size = static_cast<uint32_t>(sizeof(moq_object_chunk_event_t));
+        e2.u.object_chunk.end = true;
+        e2.u.object_chunk.terminal = MOQ_OBJECT_TERMINAL_STOP;
+        e2.u.object_chunk.error_code = 0xABCDEF01u;
+        moq::polled_event owner2(e2);
+        auto v2 = owner2.variant();
+        auto *oc2 = std::get_if<moq::event::object_chunk>(&v2);
+        MOQ_CHECK(oc2 != nullptr);
+        if (oc2) MOQ_CHECK(oc2->error_code == 0u);
+    }
+    {
+        /* 3. old-sized detail ending BEFORE error_code, with deterministic
+         *    poison physically present in the tail -> reads zero */
+        moq_event_t e{};
+        e.kind = MOQ_EVENT_OBJECT_CHUNK;
+        e.u.object_chunk.end = true;
+        e.u.object_chunk.terminal = MOQ_OBJECT_TERMINAL_RESET;
+        e.u.object_chunk.error_code = 0xDEADBEEFu;   /* the poison */
+        e.detail_size = static_cast<uint32_t>(
+            offsetof(moq_object_chunk_event_t, error_code));
+        moq::polled_event owner(e);
+        auto v = owner.variant();
+        auto *oc = std::get_if<moq::event::object_chunk>(&v);
+        MOQ_CHECK(oc != nullptr);
+        if (oc) MOQ_CHECK(oc->error_code == 0u);
+    }
+
 
     MOQ_PASS("test_batched_poll_semantics");
     return failures ? 1 : 0;

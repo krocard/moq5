@@ -929,22 +929,39 @@ typedef struct moq_subgroup_finished_event {
 } moq_subgroup_finished_event_t;
 
 /*
- * A subgroup data stream ended abnormally with a RESET_STREAM. The abnormal
- * counterpart of SUBGROUP_FINISHED: emitted in whole-object mode
- * (streaming_objects=false), where a reset mid-object drops the partial object
- * and would otherwise leave no trace of the stream ending. Lets a
- * receiver/relay close its per-subgroup state on an abnormal end.
+ * A subgroup data stream ended abnormally with a RESET_STREAM: the abnormal
+ * counterpart of SUBGROUP_FINISHED, which a receiver/relay uses to close its
+ * per-subgroup state.
+ *
+ * A reset has exactly TWO non-overlapping surfaces, chosen by whether an
+ * application-visible object terminal can carry the closure -- for one reset
+ * exactly one of them fires:
+ *
+ *   - A streaming object is in flight AND its object events are surfaced:
+ *     the closure IS that object's OBJECT_CHUNK with
+ *     terminal=MOQ_OBJECT_TERMINAL_RESET, carrying the peer's code in the
+ *     chunk's error_code. This event is NOT emitted.
+ *   - Otherwise, for a bound subgroup whose ID is resolved, no visible object
+ *     terminal can carry the closure, so THIS event reports it. That covers
+ *     whole-object mode (a partial payload is dropped; a complete one is
+ *     delivered as OBJECT_RECEIVED first, in order, and this event follows),
+ *     a streaming stream between objects or after its last object completed,
+ *     and a streaming object whose events are suppressed by Forward State 0
+ *     (its parsed header resolves the subgroup identity even though no object
+ *     event is surfaced for it).
  *
  * Exactly one of `sub` / `pub` is valid, matching the OBJECT_RECEIVED events of
- * the same subgroup. `error_code` is the RESET_STREAM application error code.
+ * the same subgroup. `error_code` is the RESET_STREAM application error code:
+ * the FIRST code the peer sent for this stream, retained across event-queue
+ * backpressure so a re-driven terminal reports the original cause. Emitted at
+ * most once per stream.
+ *
  * Not emitted for FETCH streams, for gracefully FINed streams (those emit
- * SUBGROUP_FINISHED), or for streams reset before a usable subgroup ID was
+ * SUBGROUP_FINISHED), or for a stream reset before its subgroup ID was
  * resolved -- a FIRST_OBJECT-mode header that never carried an object has only
  * the decoder default, and reporting it would let a relay seal subgroup 0 by
- * mistake. In streaming mode (streaming_objects=true) a reset is instead
- * surfaced as a terminal OBJECT_CHUNK with terminal=MOQ_OBJECT_TERMINAL_RESET
- * and this event is not emitted. Owns no resources (moq_event_cleanup is a
- * no-op).
+ * mistake. A suppressed object's parsed header DOES resolve the identity, so
+ * that case still reports. Owns no resources (moq_event_cleanup is a no-op).
  */
 typedef struct moq_subgroup_reset_event {
     moq_subscription_t sub;
@@ -1117,17 +1134,31 @@ typedef struct moq_object_chunk_event {
     moq_rcbuf_t          *chunk;       /* OWNED; payload bytes, NULL if no data */
     bool                  begin;       /* first chunk: metadata fields valid */
     bool                  end;         /* last chunk or only chunk */
-    moq_object_terminal_t terminal;    /* valid when end=true */
+    /* valid when end=true. MOQ_OBJECT_TERMINAL_RESET means the peer reset the
+     * stream while THIS object was in flight and surfaced; the cause is in
+     * error_code below. When no visible object terminal can carry the closure
+     * (whole-object mode, between objects, or a suppressed object), the reset
+     * reports MOQ_EVENT_SUBGROUP_RESET instead -- for one reset exactly one of
+     * the two surfaces fires. */
+    moq_object_terminal_t terminal;
     uint8_t               _pad[3];
-    uint64_t              group_id;        /* valid when begin=true */
-    uint64_t              subgroup_id;     /* valid when begin=true */
-    uint64_t              object_id;       /* valid when begin=true */
+    /* Routing identity: valid on EVERY chunk of the object -- begin,
+     * continuation and end -- so a consumer multiplexing concurrent subgroups
+     * routes each chunk to the record it belongs to. */
+    uint64_t              group_id;
+    uint64_t              subgroup_id;
+    uint64_t              object_id;
     uint8_t               publisher_priority; /* valid when begin=true */
     moq_object_status_t   status;          /* valid when begin=true */
     bool                  end_of_group;    /* valid when begin=true */
     uint8_t               _pad2[4];
     uint64_t              payload_length;  /* declared wire length; valid when begin=true */
     moq_rcbuf_t          *properties;      /* OWNED; valid when begin=true, NULL if none */
+    /* Appended. The peer's RESET_STREAM application code, valid ONLY on a
+     * terminal chunk whose terminal is MOQ_OBJECT_TERMINAL_RESET; zero on
+     * every other chunk, including NORMAL and STOP terminals (zero is also a
+     * legal peer code, so read it only under the RESET terminal). */
+    uint64_t              error_code;
 } moq_object_chunk_event_t;
 
 typedef uint32_t moq_namespace_interest_t;
