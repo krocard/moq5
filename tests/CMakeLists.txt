@@ -289,6 +289,18 @@ if(TARGET moq::sim)
     target_link_libraries(test_d18_ns_response_fin PRIVATE moq-core-test-internals)
     add_test(NAME d18_ns_response_fin COMMAND test_d18_ns_response_fin)
 
+    # The interop client's URL policy is header-only and private to the tool,
+    # so the test reaches it by include path and links only moq::core. The
+    # client target itself stays gated by MOQ_BUILD_INTEROP_CLIENT.
+    add_executable(test_interop_url_policy
+                   ${CMAKE_SOURCE_DIR}/tools/moq-interop-client/test_url_policy.c)
+    target_include_directories(test_interop_url_policy PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools/moq-interop-client
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+    target_link_libraries(test_interop_url_policy PRIVATE moq::core)
+    add_test(NAME interop_url_policy COMMAND test_interop_url_policy)
+    set_tests_properties(interop_url_policy PROPERTIES LABELS "interop;unit")
+
     add_executable(test_d18_publish unit/test_d18_publish.c)
     target_link_libraries(test_d18_publish PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_publish COMMAND test_d18_publish)

@@ -253,6 +253,17 @@ void bridge_retire_or_tombstone(moq_transport_bridge_t *b, moq_stream_ref_t ref)
     }
 
     if (e->local_send_closed && !e->peer_send_closed) {
+        /* A bidi we opened whose send half a peer STOP_SENDING closed: the
+         * peer's half still carries the response, so the mapping must survive
+         * until its own terminal. moq_session_has_transport_stream() cannot
+         * answer for this case -- it consults the data and namespace indexes,
+         * not the draft-18 request registry (BACKLOG #245) -- so the STOP fact
+         * is what decides. An ordinary FIN keeps the existing behaviour. */
+        if (e->kind == BRIDGE_STREAM_BIDI &&
+            e->origin == BRIDGE_ORIGIN_LOCAL &&
+            e->peer_stop_received) {
+            return;
+        }
         if (moq_session_has_transport_stream(b->session, e->ref)) {
             return;
         }
@@ -381,6 +392,76 @@ void bridge_cleanup_all_pending(moq_transport_bridge_t *b)
     for (uint32_t i = 0; i < b->pending_count; i++)
         bridge_cleanup_pending_item(&b->alloc, &b->pending[i]);
     b->pending_count = 0;
+}
+
+static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
+                                    const bridge_pending_item_t *item);
+
+/* Queued output that a STOP_SENDING on this stream has made obsolete. Items
+ * carrying the stream's ref are matched by ref; the control-channel writes
+ * that carry none are matched by transport id only when they name this stream,
+ * so an unrelated item can never be selected. */
+static bool bridge_pending_is_bidi_output(const bridge_pending_item_t *p,
+                                          const bridge_stream_entry_t *e)
+{
+    if (p->kind != PENDING_COPIED_WRITE &&
+        p->kind != PENDING_CLOSE_BIDI_FIN)
+        return false;
+
+    if (p->stream_ref._v != 0)
+        return p->stream_ref._v == e->ref._v;
+    return p->stream_id == e->transport_id;
+}
+
+/* Drop that output in place, freeing what each item owns while preserving the
+ * relative order of everything else in the FIFO. */
+static void bridge_drop_pending_bidi_output(moq_transport_bridge_t *b,
+                                            const bridge_stream_entry_t *e)
+{
+    uint32_t dst = 0;
+    for (uint32_t src = 0; src < b->pending_count; src++) {
+        bridge_pending_item_t *p = &b->pending[src];
+        if (bridge_pending_is_bidi_output(p, e)) {
+            bridge_cleanup_pending_item(&b->alloc, p);
+            memset(p, 0, sizeof(*p));
+            continue;
+        }
+        if (dst != src) {
+            b->pending[dst] = *p;
+            memset(p, 0, sizeof(*p));
+        }
+        dst++;
+    }
+    b->pending_count = dst;
+}
+
+/* RFC 9000 §3.5: a STOP_SENDING asks us to stop sending, and we answer with
+ * RESET_STREAM on that half. Queue it as a pending operation rather than
+ * calling the endpoint re-entrantly from its own receive callback, so it obeys
+ * the ordinary WOULD_BLOCK retry and fatal rules. At most one reset is queued
+ * per stream however many STOP indications arrive: `peer_stop_received` records
+ * that the answer is owed, independently of local_send_closed, which an
+ * ordinary FIN may already have set. Called for both stream origins. */
+static moq_result_t bridge_stop_bidi_send_half(moq_transport_bridge_t *b,
+                                                bridge_stream_entry_t *e,
+                                                uint64_t error_code)
+{
+    if (e->peer_stop_received) return MOQ_OK;
+
+    bridge_drop_pending_bidi_output(b, e);
+    e->peer_stop_received = true;
+    e->local_send_closed = true;
+
+    bridge_pending_item_t p;
+    memset(&p, 0, sizeof(p));
+    p.kind = PENDING_RESET_STREAM;
+    p.stream_id = e->transport_id;
+    p.error_code = error_code;
+    if (!bridge_enqueue_pending(b, &p)) {
+        bridge_set_fatal(b, 0x1);
+        return MOQ_ERR_INTERNAL;
+    }
+    return MOQ_OK;
 }
 
 bool bridge_stream_has_inbound_pending(const bridge_stream_entry_t *e)
@@ -1171,6 +1252,13 @@ static moq_result_t dispatch_send_bidi(moq_transport_bridge_t *b,
         moq_action_cleanup(act);
         return MOQ_OK;
     }
+    /* A peer STOP_SENDING reset this send half, so anything the session still
+     * wants to write on it is obsolete. An ordinary FIN is left alone: that
+     * path's existing behaviour is not this correction's business. */
+    if (e->peer_stop_received) {
+        moq_action_cleanup(act);
+        return MOQ_OK;
+    }
 
     moq_transport_result_t wr = sanitize_stream_result(
         b->ops->write(b->endpoint_ctx, e->transport_id, data, len, fin));
@@ -1223,6 +1311,8 @@ static moq_result_t dispatch_close_bidi(moq_transport_bridge_t *b,
 
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     if (!e) return MOQ_OK;
+    /* A peer STOP_SENDING reset this send half: the FIN is obsolete, not owed. */
+    if (e->peer_stop_received) return MOQ_OK;
 
     uint64_t sid = e->transport_id;
     moq_transport_result_t wr = sanitize_stream_result(
@@ -1565,6 +1655,15 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
         }
 
         case PENDING_COPIED_WRITE: {
+            /* A stream whose send half a peer STOP reset while this write
+             * waited: the bytes are obsolete, so drop the item. */
+            bridge_stream_entry_t *pe = p->stream_ref._v != 0
+                ? bridge_find_by_ref(b, p->stream_ref) : NULL;
+            if (pe && pe->kind == BRIDGE_STREAM_BIDI &&
+                pe->peer_stop_received) {
+                bridge_cleanup_pending_item(&b->alloc, p);
+                break;
+            }
             moq_transport_result_t wr = sanitize_stream_result(
                 b->ops->write(b->endpoint_ctx, p->stream_id,
                                p->data, p->data_len, p->fin));
@@ -1837,6 +1936,11 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
         }
 
         case PENDING_CLOSE_BIDI_FIN: {
+            bridge_stream_entry_t *pe = bridge_find_by_ref(b, p->stream_ref);
+            if (pe && pe->peer_stop_received) {
+                bridge_cleanup_pending_item(&b->alloc, p);
+                break;
+            }
             moq_transport_result_t wr = sanitize_stream_result(
                 b->ops->write(b->endpoint_ctx, p->stream_id,
                                NULL, 0, true));
@@ -2777,11 +2881,28 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
     /* STOP_SENDING asks us to stop sending on the targeted stream's local send
      * half. A bidi has a local send half regardless of which peer opened it
      * (request bidis carry our requests/responses); a uni has one only when we
-     * opened it. A peer STOP_SENDING on a bidi is the D18 request cancellation
-     * signal and is delivered through the dedicated bidi-stop input, which is
-     * distinct from a RESET_STREAM and MUST NOT route through reset. */
+     * opened it. Either way the answer is a RESET of that half (RFC 9000 §3.5),
+     * queued for service rather than issued re-entrantly from this callback.
+     *
+     * What differs is the OTHER direction. On a bidi WE opened, the peer's send
+     * half still carries the response: draft-18 §3.3.2 has a rejecting endpoint
+     * send REQUEST_ERROR and FIN, which can only arrive if the receive half and
+     * its request owner survive. Cancelling the whole request here would free
+     * that owner and make the response parse as a fresh inbound request.
+     *
+     * On a bidi the PEER opened, the STOP is the requester cancelling the
+     * request it made, so it is delivered to the session through the dedicated
+     * bidi-stop input -- distinct from a RESET_STREAM, and never routed
+     * through reset. */
     moq_result_t rc;
     if (e->kind == BRIDGE_STREAM_BIDI) {
+        rc = bridge_stop_bidi_send_half(b, e, error_code);
+        if (rc < 0) return rc;
+
+        if (e->origin == BRIDGE_ORIGIN_LOCAL) {
+            bridge_retire_or_tombstone(b, e->ref);
+            return MOQ_OK;
+        }
         rc = moq_session_on_bidi_stream_stop(
             b->session, e->ref, error_code, now_us);
     } else if (e->origin == BRIDGE_ORIGIN_LOCAL) {
