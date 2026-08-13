@@ -1179,6 +1179,11 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.on_lane_pump_ctx = ep;
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
     fc.app_deadline_ctx = ep;
+    /* Send QUIC keepalive on the client connection so an idle publisher (one
+     * with no subscriber yet) is not dropped by a relay's transport idle
+     * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
+     * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
+    fc.keep_alive_interval_ms = 15000;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;

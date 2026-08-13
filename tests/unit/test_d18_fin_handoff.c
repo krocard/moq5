@@ -6888,6 +6888,11 @@ typedef struct req_seed_snap {
     int      ns_got_response;
     int      ns_parse_complete;
     int      ns_closing_remote_error;
+    /* The durable local-teardown obligation marker (#245c). Distinct from the
+     * `fin` latch above: `fin` records that the peer's send half closed, while
+     * this records that an extra-bytes/re-fed teardown is owed on this bidi. A
+     * capacity-refused teardown must retain BOTH before the empty re-feed. */
+    int      ns_local_teardown_pending;
     /* The retained request bytes themselves. A length alone would let an
      * altered but still-decodable message replay to the same terminal. */
     int      buf_invalid;   /* longer than the snapshot, or absent while
@@ -6968,6 +6973,9 @@ static void req_seed_diff(const req_seed_snap_t *have,
                   want->ns_parse_complete);
     SEED_DIFF_U64(what, "closing_remote_error", have->ns_closing_remote_error,
                   want->ns_closing_remote_error);
+    SEED_DIFF_U64(what, "local_teardown_pending",
+                  have->ns_local_teardown_pending,
+                  want->ns_local_teardown_pending);
     if (have->recv_len == want->recv_len && want->recv_len > 0 &&
         memcmp(have->buf, want->buf, want->recv_len) != 0) {
         TXS_DIAG("TXN %s: retained request bytes changed\n", what);
@@ -7794,11 +7802,11 @@ static void test_precommit_rejects(void)
 /* -- Axis 3 current-call-FIN terminals -------------------------------- */
 
 /* These terminals close an owner the peer's message just condemned. No handoff
- * marker can be present, so the FIN they must consult is the one on the call
- * that carried the message -- and none of them does. Each reserves and adds its
- * drain reference unconditionally, so a peer that closed its send half in the
- * same chunk still spends one, and an exhausted ring refuses a transition that
- * needs no reference at all. */
+ * marker can be present, so the FIN they consult is the one on the call that
+ * carried the message. Each reserves and adds its drain reference only when the
+ * peer half is genuinely open: a peer that closed its send half in the same
+ * chunk spends none, and an exhausted ring cannot refuse a same-call-FIN
+ * transition that needs no reference at all. */
 
 static size_t enc_request_update(uint8_t *buf, size_t cap, uint64_t rid)
 {
@@ -8315,9 +8323,9 @@ static void run_terminal_matrix(const terminal_case_t *c, size_t split)
 
 /* A GOAWAY on a committed request bidi migrates that one request: it surfaces
  * REQUEST_GOAWAY, closes our send half where it is still open, frees the entry
- * and retires the ref with a GOAWAY-STRICT reference -- unconditionally. The
- * dispatcher knows whether the peer FIN'd in the same chunk; the helper it
- * calls takes no fin parameter, so that fact is discarded at both callers. */
+ * and retires the ref with a GOAWAY-STRICT reference only when the peer half is
+ * still open. The caller passes the observed peer-FIN fact through, so a GOAWAY
+ * that rode the same-call FIN owes no drain. */
 
 #define GOAWAY_TIMEOUT_MS 4200
 
@@ -8552,7 +8560,8 @@ static moq_stream_ref_t arm_goaway_local_subscribe(moq_session_t *s)
  * FIN reaches the terminal as the
  * entry's durable `pending_fin` (session_namespace_sub.c:1057) rather than as a
  * call parameter. That makes this origin the control for the GOAWAY pair: the
- * fact IS available here, and the shared terminal still ignores it. */
+ * fact IS available here, and the shared terminal consults it -- the ns_sub
+ * origin passes `pending_fin` through, so a same-call FIN owes no drain. */
 
 static int ns_sub_pool_busy(const moq_session_t *s)
 {
@@ -8583,6 +8592,7 @@ static void nsg_owner_capture(const moq_session_t *s, moq_stream_ref_t ref,
         r->ns_got_response         = e->got_response ? 1 : 0;
         r->ns_parse_complete       = e->parse_complete ? 1 : 0;
         r->ns_closing_remote_error = e->closing_remote_error ? 1 : 0;
+        r->ns_local_teardown_pending = e->local_teardown_pending ? 1 : 0;
     }
     /* The stream-ref request-registry key is deliberately empty for this
      * family, but is recorded so a stray one would be caught; the by-ID key is
@@ -8805,18 +8815,19 @@ static void run_ns_goaway_latched(void)
 
 /* Draft-18 defines no post-request message on a publisher-side namespace-sub
  * bidi, so extra bytes terminate that BIDI rather than the session (§10.9.1).
- * Two independent obligations meet here and are kept apart:
+ * Two landed obligations meet here and are kept apart:
  *
- *   #245(c) -- the refused call's obligation must be RETAINED. The branch is
- *   `if (len > 0) return ns_sub_local_teardown(...)` and never appends those
- *   bytes to the entry, so a capacity refusal discards them; the documented
- *   empty re-feed then reaches the same branch with len == 0 and reports
- *   MOQ_OK. How the obligation is retained is the fix's choice -- raw bytes or
- *   a private marker -- so nothing here may require recv_len to grow.
+ *   #245(c) -- the refused call's obligation is RETAINED durably in owner state.
+ *   The branch (`if (len > 0) return ns_sub_local_teardown(...)`) deliberately
+ *   does NOT append those bytes to the entry; instead the refusal installs the
+ *   `local_teardown_pending` marker, which carries the semantic retry, and the
+ *   documented empty re-feed (len == 0) then COMPLETES the teardown through that
+ *   marker. The oracle pins the marker, not raw bytes -- recv_len is not
+ *   required to grow.
  *
- *   #249 -- the drain reference is reserved and added unconditionally, even
- *   when the peer closed its send half in the very same chunk (`fin` is simply
- *   dropped on this branch). */
+ *   #249 -- the drain selector is FIN-aware: the cumulative peer FIN is latched
+ *   into `pending_fin` BEFORE the capacity refusal, so a same-call FIN owes no
+ *   drain and a genuinely open peer half owes exactly one. */
 
 static bool nsl_norm_action(const moq_action_t *a, void *vctx,
                             txs_norm_vec_t *out)
@@ -8847,16 +8858,51 @@ static void want_nsl_output(txs_norm_vec_t *v, moq_stream_ref_t ref)
 
 static const uint8_t k_nsl_extra[2] = { 0xde, 0xad };
 
+/* Exact graph conservation: the captured edge set survives unchanged (same
+ * count, every prior edge present exactly once, no added edge). Used to bracket
+ * the refused teardown so a stray edge created by the refused call is caught
+ * before any later drain/fill can absorb it. */
+static int nsl_graph_equal(const og_graph_t *g0, const moq_session_t *s,
+                           const char *what)
+{
+    og_graph_t g1;
+    og_capture(s, &g1);
+    int bad = og_check_integrity(&g1, what);
+    if (g1.edge_count != g0->edge_count) {
+        fprintf(stderr, "NSL %s: %zu graph edges, expected %zu\n", what,
+                g1.edge_count, g0->edge_count);
+        bad++;
+    }
+    for (size_t i = 0; i < g0->edge_count; i++) {
+        const og_edge_t *e = &g0->edges[i];
+        size_t seen = 0;
+        for (size_t j = 0; j < g1.edge_count; j++) {
+            const og_edge_t *f = &g1.edges[j];
+            if (f->domain == e->domain && f->key == e->key &&
+                f->kind == e->kind && f->slot == e->slot)
+                seen++;
+        }
+        if (seen != 1) {
+            fprintf(stderr, "NSL %s: edge (%d key %llu) not conserved (%zu)\n",
+                    what, (int)e->domain, (unsigned long long)e->key, seen);
+            bad++;
+        }
+    }
+    return bad;
+}
+
 /* An inbound SUBSCRIBE_NAMESPACE the application has not answered: a
  * publisher-side entry in PENDING_PUBLISHER, whose bidi treats further bytes as
  * a local teardown. Returns the entry's own buffered length so a later oracle
  * can require it UNCHANGED without assuming how the fix stores its obligation. */
-static moq_stream_ref_t arm_pending_publisher_ns_sub(moq_session_t *s,
-                                                     size_t *out_recv_len)
+static moq_stream_ref_t arm_pending_publisher_ns_sub_at(moq_session_t *s,
+                                                        uint64_t ref_v,
+                                                        uint64_t request_id,
+                                                        size_t *out_recv_len)
 {
-    moq_stream_ref_t ref = moq_stream_ref_from_u64(1);   /* peer-opened */
+    moq_stream_ref_t ref = moq_stream_ref_from_u64(ref_v);   /* peer-opened */
     nss_ctx_t c = nss_ctx;
-    c.request_id = 0;
+    c.request_id = request_id;
     MOQ_TEST_CHECK_EQ_INT((int)nss_feed(s, &c, ref, false), (int)MOQ_OK);
     arm_output_exact(s, MOQ_EVENT_NS_SUB_REQUEST, 1, 0, "ns_sub request", NULL);
     MOQ_TEST_CHECK_EQ_INT(ns_sub_pool_busy(s), 1);
@@ -8867,11 +8913,265 @@ static moq_stream_ref_t arm_pending_publisher_ns_sub(moq_session_t *s,
         MOQ_TEST_CHECK_EQ_INT((int)e->state,
                               (int)MOQ_NS_SUB_PENDING_PUBLISHER);
         MOQ_TEST_CHECK_EQ_U64(e->stream_ref._v, ref._v);
+        /* Absolute "false at arm" for BOTH carriers. */
         MOQ_TEST_CHECK_EQ_INT(e->pending_fin ? 1 : 0, 0);
+        MOQ_TEST_CHECK_EQ_INT(e->local_teardown_pending ? 1 : 0, 0);
         g_ns_sub_request_id = e->request_id;
         if (out_recv_len) *out_recv_len = e->recv_len;
     }
     return ref;
+}
+
+static moq_stream_ref_t arm_pending_publisher_ns_sub(moq_session_t *s,
+                                                     size_t *out_recv_len)
+{
+    return arm_pending_publisher_ns_sub_at(s, 1, 0, out_recv_len);
+}
+
+/* #245(c) -- the refused call's obligation is RETAINED, isolated with NO peer
+ * FIN so the drain selector plays no part. The publisher-side branch
+ * (`if (len > 0) return ns_sub_local_teardown(...)`) deliberately does NOT
+ * append those bytes to the entry; the refusal installs the durable
+ * `local_teardown_pending` marker, and the documented empty re-feed (len == 0)
+ * COMPLETES the teardown through it. The marker carries the retry, so nothing
+ * here requires recv_len to grow: only the bytes the entry ALREADY owned are
+ * immutable. */
+static void run_nsl_retry_obligation(void)
+{
+    const char *what = "ns_sub teardown retry";
+    moq_session_t *s = make_session_full(MOQ_PERSPECTIVE_SERVER, 0, 1);
+    if (!s) return;
+    size_t armed_len = 0;
+    moq_stream_ref_t ref = arm_pending_publisher_ns_sub(s, &armed_len);
+
+    /* Fill the ONE action slot with a distinct blocker on an unrelated ref, so
+     * the teardown's own abort cannot be queued. */
+    moq_stream_ref_t blocker = moq_stream_ref_from_u64(0x5000);
+    MOQ_TEST_CHECK_EQ_INT((int)queue_close_bidi(s, blocker), (int)MOQ_OK);
+    MOQ_TEST_CHECK(action_queue_full(s));
+
+    seed_snap_t owner0;
+    memset(&owner0, 0, sizeof(owner0));
+    nsg_owner_capture(s, ref, &owner0);
+    drain_snap_t ring_before;
+    drain_snap(s, &ring_before);
+    txs_snapshot_t before;
+    txs_capture(s, &ref, 1, &before);
+    expect_after_call_prepare(&before);
+
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, k_nsl_extra,
+                                              sizeof(k_nsl_extra), false, 1),
+        (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+
+    /* Everything about the owner is required unchanged EXCEPT the retained
+     * teardown itself, whose representation the fix chooses. The bytes the
+     * entry already held are compared byte for byte; only what lies beyond that
+     * prefix is left free. */
+    {
+        seed_snap_t nowsnap;
+        memset(&nowsnap, 0, sizeof(nowsnap));
+        nsg_owner_capture(s, ref, &nowsnap);
+        MOQ_TEST_CHECK_EQ_INT(nowsnap.req.buf_invalid, 0);
+        MOQ_TEST_CHECK(nowsnap.req.recv_len >= armed_len);
+        if (!nowsnap.req.buf_invalid && !owner0.req.buf_invalid &&
+            nowsnap.req.recv_len >= armed_len && armed_len > 0)
+            MOQ_TEST_CHECK(memcmp(nowsnap.req.buf, owner0.req.buf,
+                                  armed_len) == 0);
+        seed_snap_t expect = owner0;
+        expect.req.recv_len = nowsnap.req.recv_len;   /* carrier: unconstrained */
+        memcpy(expect.req.buf, nowsnap.req.buf, sizeof(expect.req.buf));
+        /* The ONE intended mutation: the teardown obligation is now durable.
+         * No FIN was fed, so the cumulative-FIN latch stays false. */
+        expect.req.ns_local_teardown_pending = 1;
+        expect.req.fin = 0;
+        nsg_owner_check(s, ref, &expect, what);
+        MOQ_TEST_CHECK_EQ_INT(ns_sub_pool_busy(s), 1);
+    }
+    failures += txs_check_eq(s, &ref, 1, &before, what);
+    drain_snap_t now;
+    drain_snap(s, &now);
+    failures += drain_multiset_equals(&now, &ring_before, what);
+
+    /* Only the blocker is queued; the teardown produced nothing yet. */
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        collect_events(s, &nsl_hooks, &got);
+        MOQ_TEST_CHECK_EQ_SIZE(got.count, (size_t)0);
+        collect_actions(s, &nsl_hooks, &got);
+        want_close_bidi(&want, blocker);
+        failures += txs_norm_equals(&got, &want, "ns_sub teardown blocked");
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+
+    /* The documented recovery: retry with no new bytes. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+    check_nsg_retired(s, ref);
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        collect_events(s, &nsl_hooks, &got);
+        collect_actions(s, &nsl_hooks, &got);
+        want_nsl_output(&want, ref);
+        failures += txs_norm_equals(&got, &want, "ns_sub teardown replayed");
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+    drain_snap_t after, want_ring;
+    drain_snap(s, &after);
+    drain_snap_plus(&ring_before, ref, MOQ_DRAIN_NORMAL, &want_ring);
+    failures += drain_multiset_equals(&after, &want_ring,
+                                      "ns_sub teardown replay granted");
+    check_drain_ref_reason(s, ref, MOQ_DRAIN_NORMAL);
+
+    /* And it happens exactly once: a second empty re-feed produces nothing. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+    check_nsg_retired(s, ref);          /* no silent resurrection */
+    check_no_output(s, &nsl_hooks);
+    drain_snap_t after2;
+    drain_snap(s, &after2);
+    failures += drain_multiset_equals(&after2, &want_ring,
+                                      "ns_sub teardown replay idempotent");
+    moq_session_destroy(s);
+}
+
+/* #245(c) + #249 cumulative-FIN retention: an extra-bytes+FIN teardown that
+ * blocks on its action slot must retain the FIN durably in session-owned state,
+ * not just the teardown obligation. The peer's send half is already closed, so
+ * the eventual abort owes NO drain -- but the empty re-feed carries fin=false,
+ * so unless the FIN was latched the selector recomputes need_drain=true and, on
+ * a full ring, stalls the teardown forever waiting for a terminal that already
+ * arrived. This pins the durable cumulative FIN fact and the drainless
+ * completion against an exhausted ring. */
+static void run_nsl_fin_retry_obligation(void)
+{
+    const char *what = "ns_sub teardown FIN retry";
+    moq_session_t *s = make_session_full(MOQ_PERSPECTIVE_SERVER, 0, 1);
+    if (!s) return;
+    size_t armed_len = 0;
+    moq_stream_ref_t ref = arm_pending_publisher_ns_sub(s, &armed_len);
+
+    /* Fill the ONE action slot so the teardown's own abort cannot be queued. */
+    moq_stream_ref_t blocker = moq_stream_ref_from_u64(0x5000);
+    MOQ_TEST_CHECK_EQ_INT((int)queue_close_bidi(s, blocker), (int)MOQ_OK);
+    MOQ_TEST_CHECK(action_queue_full(s));
+
+    /* Baselines captured BEFORE the refused call, so a wrong drain, a stray
+     * graph edge, or a corrupted owned byte inserted BY that call is caught at
+     * the refused point -- never absorbed into a later fill. */
+    seed_snap_t owner0;
+    memset(&owner0, 0, sizeof(owner0));
+    nsg_owner_capture(s, ref, &owner0);
+    drain_snap_t ring_before;
+    drain_snap(s, &ring_before);
+    txs_snapshot_t before;
+    txs_capture(s, &ref, 1, &before);
+    expect_after_call_prepare(&before);
+    og_graph_t g0;
+    og_capture(s, &g0);
+
+    /* Extra bytes AND a peer FIN, action-blocked. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, k_nsl_extra,
+                                              sizeof(k_nsl_extra), true, 1),
+        (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+
+    /* PRE-FILL oracle: only the declared owner deltas moved, the previously
+     * owned byte prefix is exact, the whole session / graph / drain multiset are
+     * unchanged, and only the blocker action is queued with no event. */
+    {
+        seed_snap_t nowsnap;
+        memset(&nowsnap, 0, sizeof(nowsnap));
+        nsg_owner_capture(s, ref, &nowsnap);
+        MOQ_TEST_CHECK_EQ_INT(nowsnap.req.buf_invalid, 0);
+        MOQ_TEST_CHECK(nowsnap.req.recv_len >= armed_len);
+        if (!nowsnap.req.buf_invalid && !owner0.req.buf_invalid &&
+            nowsnap.req.recv_len >= armed_len && armed_len > 0)
+            MOQ_TEST_CHECK(memcmp(nowsnap.req.buf, owner0.req.buf,
+                                  armed_len) == 0);
+        seed_snap_t expect = owner0;
+        expect.req.recv_len = nowsnap.req.recv_len;   /* carrier: unconstrained */
+        memcpy(expect.req.buf, nowsnap.req.buf, sizeof(expect.req.buf));
+        expect.req.ns_local_teardown_pending = 1;
+        expect.req.fin = 1;                      /* cumulative FIN, retained */
+        nsg_owner_check(s, ref, &expect, "ns_sub FIN teardown blocked");
+        MOQ_TEST_CHECK_EQ_INT(ns_sub_pool_busy(s), 1);
+    }
+    failures += txs_check_eq(s, &ref, 1, &before, "ns_sub FIN teardown blocked");
+    failures += nsl_graph_equal(&g0, s, "ns_sub FIN teardown blocked");
+    {
+        drain_snap_t now;
+        drain_snap(s, &now);
+        failures += drain_multiset_equals(&now, &ring_before,
+                                          "ns_sub FIN teardown blocked ring");
+    }
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        collect_events(s, &nsl_hooks, &got);
+        MOQ_TEST_CHECK_EQ_SIZE(got.count, (size_t)0);
+        collect_actions(s, &nsl_hooks, &got);
+        want_close_bidi(&want, blocker);
+        failures += txs_norm_equals(&got, &want, "ns_sub FIN teardown blocked");
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+
+    /* Only now EXHAUST the drain ring: a NORMAL drain could no longer be
+     * reserved, but the retained FIN means none is owed. (The blocker action was
+     * consumed by the classification above.) */
+    fill_drain_ring(s);
+    drain_snap_t ring_full;
+    drain_snap(s, &ring_full);
+
+    /* The documented recovery: no new bytes. It completes with exactly one abort
+     * and NO drain, even against the full ring. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+    check_nsg_retired(s, ref);
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        collect_events(s, &nsl_hooks, &got);
+        collect_actions(s, &nsl_hooks, &got);
+        want_nsl_output(&want, ref);
+        failures += txs_norm_equals(&got, &want, what);
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+    drain_snap_t after;
+    drain_snap(s, &after);
+    failures += drain_multiset_equals(&after, &ring_full,
+                                      "ns_sub FIN teardown no drain");
+
+    /* Exactly once: a second empty re-feed changes nothing. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+    check_nsg_retired(s, ref);
+    check_no_output(s, &nsl_hooks);
+    drain_snap_t after2;
+    drain_snap(s, &after2);
+    failures += drain_multiset_equals(&after2, &ring_full,
+                                      "ns_sub FIN teardown idempotent");
+    moq_session_destroy(s);
 }
 
 /* The drain selector pair, run with capacity available so nothing else can
@@ -8936,10 +9236,1515 @@ static void run_nsl_drain_selector(bool fin_in_call)
     moq_session_destroy(s);
 }
 
+/* Clear-exactly-once across slot reuse: owner A genuinely reaches the blocked
+ * teardown state with BOTH local_teardown_pending=true and pending_fin=true,
+ * then recovers and retires. The selective free must clear BOTH, and the two
+ * facts are proven by DIFFERENT observations, stated honestly:
+ *   - the freed slot is inspected DIRECTLY (before owner B arms), so both
+ *     local_teardown_pending==false and pending_fin==false are proven by the
+ *     free itself;
+ *   - only local_teardown_pending drives the empty-refeed replay, so owner B's
+ *     first empty feed being INERT (no replayed abort) is the independent proof
+ *     that no stale teardown marker survived. A stale pending_fin alone would
+ *     not tear owner B down; the direct field check above is what pins it. */
+static void run_nsl_reuse_after_teardown(void)
+{
+    moq_session_t *s = make_session_full(MOQ_PERSPECTIVE_SERVER, 0, 1);
+    if (!s) return;
+
+    /* Owner A, armed then action-blocked on its FIN teardown so BOTH markers
+     * become durable. */
+    moq_stream_ref_t refA = arm_pending_publisher_ns_sub_at(s, 1, 0, NULL);
+    int32_t slotA = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, refA._v);
+    MOQ_TEST_CHECK(slotA >= 0);
+
+    moq_stream_ref_t blocker = moq_stream_ref_from_u64(0x5000);
+    MOQ_TEST_CHECK_EQ_INT((int)queue_close_bidi(s, blocker), (int)MOQ_OK);
+    MOQ_TEST_CHECK(action_queue_full(s));
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, refA, k_nsl_extra,
+                                              sizeof(k_nsl_extra), true, 1),
+        (int)MOQ_ERR_WOULD_BLOCK);
+    {
+        const moq_ns_sub_entry_t *eA = ns_by_ref(s, refA);
+        MOQ_TEST_CHECK(eA != NULL);
+        if (eA) {
+            MOQ_TEST_CHECK_EQ_INT(eA->local_teardown_pending ? 1 : 0, 1);
+            MOQ_TEST_CHECK_EQ_INT(eA->pending_fin ? 1 : 0, 1);
+        }
+    }
+
+    /* Recover: drain the blocker, empty re-feed completes the teardown and
+     * retires owner A; drain its abort so the next arm starts clean. */
+    {
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, refA, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    check_nsg_retired(s, refA);
+
+    /* The selective free itself cleared BOTH fields on the vacated slot, checked
+     * directly BEFORE any fresh-bidi re-init could mask them: this is where the
+     * free-entry marker-clear and pending-FIN-clear are each observable. */
+    MOQ_TEST_CHECK_EQ_INT((int)s->ns_subs[slotA].state, (int)MOQ_NS_SUB_FREE);
+    MOQ_TEST_CHECK_EQ_INT(s->ns_subs[slotA].local_teardown_pending ? 1 : 0, 0);
+    MOQ_TEST_CHECK_EQ_INT(s->ns_subs[slotA].pending_fin ? 1 : 0, 0);
+
+    {
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    }
+
+    /* Owner B reuses the freed slot (the peer's next request id is 2). The arm
+     * helper re-asserts both carriers false at arm; the slot identity is the one
+     * A vacated. A stale field cleared by the selective free would break either
+     * assertion or the inert-feed behaviour below. */
+    moq_stream_ref_t refB = arm_pending_publisher_ns_sub_at(s, 5, 2, NULL);
+    int32_t slotB = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, refB._v);
+    MOQ_TEST_CHECK_EQ_INT(slotB, slotA);
+
+    /* An empty feed on the fresh owner is inert: no teardown, no graceful close,
+     * no output; the owner stays PENDING_PUBLISHER with both carriers clear. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, refB, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    const moq_ns_sub_entry_t *eB = ns_by_ref(s, refB);
+    MOQ_TEST_CHECK(eB != NULL);
+    if (eB) {
+        MOQ_TEST_CHECK_EQ_INT((int)eB->state,
+                              (int)MOQ_NS_SUB_PENDING_PUBLISHER);
+        MOQ_TEST_CHECK_EQ_INT(eB->local_teardown_pending ? 1 : 0, 0);
+        MOQ_TEST_CHECK_EQ_INT(eB->pending_fin ? 1 : 0, 0);
+    }
+    MOQ_TEST_CHECK_EQ_INT(ns_sub_pool_busy(s), 1);
+    check_no_output(s, &nsl_hooks);
+    moq_session_destroy(s);
+}
+
 static void test_ns_sub_local_teardown(void)
 {
+    run_nsl_retry_obligation();
+    run_nsl_fin_retry_obligation();
     run_nsl_drain_selector(false);
     run_nsl_drain_selector(true);
+    run_nsl_reuse_after_teardown();
+}
+
+/* -- #245(b): the no-owner admission blockers ------------------------
+ *
+ * handle_request_stream_bytes()'s no-slot path returns MOQ_ERR_WOULD_BLOCK on
+ * capacity shortfalls BEFORE any staging entry or registry owner exists.
+ * Verified against the current source, the path has exactly FOUR such
+ * origins (session_subscribe.c:1258-1318):
+ *
+ *   1. !fin with the drain ring full, at the no-slot preflight (:1271);
+ *   2. pre-SETUP no-slot rejection with action_queue_avail < 2 (:1280);
+ *   3. post-SETUP no-slot REQUEST_ERROR with the action queue full
+ *      (queue_send_bidi -> action_queue_full);
+ *   4. post-SETUP no-slot REQUEST_ERROR with action room but an insufficient
+ *      remaining send-buffer tail (queue_send_bidi's retryable tail check).
+ *
+ * No other WOULD_BLOCK origin exists on this path: push_action after the
+ * `avail >= 2` preflight cannot block, the REQUEST_ERROR encode writes a
+ * 64-byte stack buffer, drain_ref_add follows its own preflight, and
+ * request_goaway_already_sent cannot hold for a fresh peer ref.
+ *
+ * The completion contract is STORAGE-NEUTRAL: each blocked case accepts
+ * exactly two outcomes -- immediate MOQ_OK with the whole terminal obligation
+ * durably queued, or WOULD_BLOCK with a durable carrier that completes on the
+ * documented EMPTY re-feed -- through one shared completion checker, so both
+ * arms require the same exact final output, cleanup and exactly-once
+ * postconditions. Any other return fails the permanent outcome validator.
+ * The WOULD_BLOCK arm completes on the documented empty re-feed through its
+ * durable no-slot carrier (#245b), and its cumulative FIN is retained in the
+ * carrier so the completion owes no drain the peer already made unnecessary.
+ *
+ * Terminal obligations, exact:
+ *   pre-SETUP:  STOP_BIDI_STREAM + RESET_BIDI_STREAM, both CANCELLED (0x1),
+ *               no event;
+ *   post-SETUP: REQUEST_ERROR(INTERNAL_ERROR 0x0, retry=0,
+ *               "request pool full") + FIN on the request bidi, no event;
+ *   no peer FIN: exactly one NORMAL drain ref, released by the later FIN;
+ *   peer FIN:    no drain ref.
+ *
+ * The seed is a LEGALLY occupied one-slot subscription pool: a fragmented
+ * inbound SUBSCRIBE on its own bidi, held in MOQ_SUB_RECVING_REQUEST. Its
+ * slot and generation are DERIVED before ingress, its retained prefix is
+ * compared byte-for-byte against the fixture's own input before it becomes a
+ * baseline, and its whole declared record -- identity, role, registry
+ * presence fields, forbidden by-ID/ns edges -- is conserved absolutely at
+ * every stage. At the REFUSED point the target is NOT required to stay
+ * ownerless (that would forbid the ownership-based repair); every allowed
+ * delta is bounded instead, and complete target cleanup is required at
+ * terminal completion.
+ */
+
+#define NOM_SEED_REF   1u     /* peer-opened bidi carrying the seed */
+#define NOM_TARGET_REF 5u     /* peer-opened bidi carrying the target */
+#define NOM_FILLER0    0x4000u /* fill_drain_ring's first declared filler */
+
+/* Origin 4's live-announcement GOAWAY blocker identity, predeclared before it
+ * becomes a baseline. `armed` is 0 for origins 1-3 (no blocker owner). */
+typedef struct nom_blk {
+    int      armed;
+    int      slot;
+    uint32_t gen;         /* live generation (| 1) after accept */
+    uint64_t handle;
+    uint64_t rid;         /* the committed inbound id (0) */
+    uint64_t ref;         /* NOM_BLK_REF */
+} nom_blk_t;
+
+static const char *nom_reason = "request pool full";
+
+/* A session with a ONE-slot subscription pool and per-origin capacities.
+ * `establish` selects the pre-/post-SETUP arm. */
+static moq_session_t *nom_make_session(bool establish, uint32_t max_actions,
+                                       uint32_t send_buffer_size)
+{
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                               MOQ_PERSPECTIVE_SERVER);
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    cfg.max_subscriptions = 1;
+    if (max_actions) cfg.max_actions = max_actions;
+    if (send_buffer_size) cfg.send_buffer_size = send_buffer_size;
+    moq_session_t *s = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s), (int)MOQ_OK);
+    if (!s) return NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(s, 0), (int)MOQ_OK);
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    if (establish) {
+        uint8_t setup[16];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, setup, sizeof(setup));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup(&w), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_control_bytes(s, setup,
+                                              moq_buf_writer_offset(&w), 0),
+            (int)MOQ_OK);
+        moq_event_t e;
+        while (moq_session_poll_events(s, &e, 1) > 0) moq_event_cleanup(&e);
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+    }
+    return s;
+}
+
+/* One complete, wire-valid d18 SUBSCRIBE at request id 0. */
+static size_t nom_encode_subscribe_at(uint8_t *buf, size_t cap,
+                                      uint64_t request_id)
+{
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("nom") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_d18_msg_params_t p = { 0 };
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_d18_encode_subscribe(&w, request_id, &ns,
+                                      MOQ_BYTES_LITERAL("t"), &p),
+        (int)MOQ_OK);
+    return moq_buf_writer_offset(&w);
+}
+
+static size_t nom_encode_subscribe(uint8_t *buf, size_t cap)
+{
+    return nom_encode_subscribe_at(buf, cap, 0);
+}
+
+/* The seed owner's DECLARED record. Identity (slot, generation) is derived
+ * from the free pool BEFORE ingress; the retained prefix is compared against
+ * the fixture's own input before this record becomes a baseline. An invalid
+ * buffer (over-long, or non-empty with a NULL pointer) makes the record
+ * INCOMPARABLE rather than equal-by-omission. */
+typedef struct nom_seed {
+    int      valid;
+    int      slot;
+    int      state, role;
+    uint64_t request_id;
+    uint32_t generation;
+    uint64_t stream_ref;
+    int      recv_fin;
+    size_t   recv_len;
+    uint8_t  recv[64];
+    /* Registry presence, complete: the by-streamref endpoint's kind, slot,
+     * presence flags and embedded linkage values, plus the by-ID-0 answer --
+     * whose absence is an ARM/seed-only and completed-state rule; the
+     * refused phase's global topology (which may hold an identity-qualified
+     * target carrier at id 0) is owned by nom_graph_conserved. */
+    int      ep_kind;
+    int      ep_slot;
+    int      ep_has_stream_ref;
+    int      ep_has_request_id;
+    uint64_t ep_stream_ref;       /* the endpoint's EMBEDDED linkage values */
+    uint64_t ep_request_id;       /* declared zero while has_request_id==0 */
+    int      byid0_kind;          /* find_by_id(0).kind: an ARM/seed-only
+                                   * declaration. The REFUSED phase's global
+                                   * topology is owned by nom_graph_conserved
+                                   * (which admits an identity-qualified
+                                   * target carrier at id 0); completion
+                                   * restores absolute absence through
+                                   * nom_graph_seed_only. */
+} nom_seed_t;
+
+static void nom_seed_capture(const moq_session_t *s, nom_seed_t *o)
+{
+    memset(o, 0, sizeof(*o));
+    o->slot = -1;
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].state != MOQ_SUB_FREE) { o->slot = (int)i; break; }
+    if (o->slot < 0) return;
+    const moq_sub_entry_t *e = &s->subs[o->slot];
+    o->state = (int)e->state;
+    o->role = (int)e->role;
+    o->request_id = e->request_id;
+    o->generation = e->generation;
+    o->stream_ref = e->request_stream_ref._v;
+    o->recv_fin = e->req_recv_fin ? 1 : 0;
+    o->recv_len = e->req_recv_len;
+    if (o->recv_len > sizeof(o->recv) ||
+        (o->recv_len && !e->req_recv_buf))
+        return;                              /* valid stays 0: incomparable */
+    if (o->recv_len)
+        memcpy(o->recv, e->req_recv_buf, o->recv_len);
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(
+        s, e->request_stream_ref);
+    o->ep_kind = (int)ep.kind;
+    o->ep_slot = ep.slot;
+    o->ep_has_stream_ref = ep.has_stream_ref ? 1 : 0;
+    o->ep_has_request_id = ep.has_request_id ? 1 : 0;
+    o->ep_stream_ref = ep.stream_ref._v;
+    o->ep_request_id = ep.request_id;
+    o->byid0_kind = (int)request_registry_find_by_id(s, 0).kind;
+    o->valid = 1;
+}
+
+static int nom_seed_equal(const moq_session_t *s, const nom_seed_t *want,
+                          const char *what)
+{
+    nom_seed_t now;
+    nom_seed_capture(s, &now);
+    if (!now.valid || !want->valid) {
+        fprintf(stderr, "NOM %s: seed record incomparable\n", what);
+        return 1;
+    }
+    int bad = 0;
+    if (now.slot != want->slot || now.state != want->state ||
+        now.role != want->role || now.request_id != want->request_id ||
+        now.generation != want->generation ||
+        now.stream_ref != want->stream_ref ||
+        now.recv_fin != want->recv_fin ||
+        now.recv_len != want->recv_len ||
+        (now.recv_len && memcmp(now.recv, want->recv, now.recv_len) != 0)) {
+        fprintf(stderr, "NOM %s: seed owner record changed\n", what);
+        bad++;
+    }
+    /* by-ID-0 absence is deliberately NOT compared here: it is absolute at
+     * arm and at completion (the seed-only graph forbids the rid-0 edge
+     * there), while the REFUSED phase admits an identity-qualified target
+     * carrier at decoded id 0 -- the seed helper must not classify that
+     * target-owned edge as seed mutation. */
+    if (now.ep_kind != want->ep_kind || now.ep_slot != want->ep_slot ||
+        now.ep_has_stream_ref != want->ep_has_stream_ref ||
+        now.ep_has_request_id != want->ep_has_request_id ||
+        now.ep_stream_ref != want->ep_stream_ref ||
+        now.ep_request_id != want->ep_request_id) {
+        fprintf(stderr, "NOM %s: seed registry answers changed\n", what);
+        bad++;
+    }
+    return bad;
+}
+
+/* Every field the contract claims ABSOLUTELY, asserted before the captured
+ * record may become a baseline -- shared by the matrix runner and the four
+ * capacity controls so neither seed contract is weaker. */
+static void nom_seed_arm_assert(const nom_seed_t *seed, int want_slot)
+{
+    MOQ_TEST_CHECK_EQ_INT(seed->valid, 1);
+    MOQ_TEST_CHECK_EQ_INT(seed->slot, want_slot);
+    MOQ_TEST_CHECK_EQ_INT(seed->state, (int)MOQ_SUB_RECVING_REQUEST);
+    MOQ_TEST_CHECK_EQ_INT(seed->role, (int)MOQ_SUB_ROLE_PUBLISHER);
+    MOQ_TEST_CHECK_EQ_U64(seed->request_id, (uint64_t)0);
+    MOQ_TEST_CHECK_EQ_U64(seed->stream_ref, (uint64_t)NOM_SEED_REF);
+    MOQ_TEST_CHECK_EQ_INT(seed->recv_fin, 0);
+    MOQ_TEST_CHECK_EQ_INT(seed->ep_kind, (int)MOQ_REQ_SUBSCRIPTION);
+    MOQ_TEST_CHECK_EQ_INT(seed->ep_slot, want_slot);
+    MOQ_TEST_CHECK_EQ_INT(seed->ep_has_stream_ref, 1);
+    MOQ_TEST_CHECK_EQ_INT(seed->ep_has_request_id, 0);
+    MOQ_TEST_CHECK_EQ_U64(seed->ep_stream_ref, (uint64_t)NOM_SEED_REF);
+    MOQ_TEST_CHECK_EQ_U64(seed->ep_request_id, (uint64_t)0);
+    MOQ_TEST_CHECK_EQ_INT(seed->byid0_kind, (int)MOQ_REQ_NONE);
+}
+
+/* The seed-only graph: exactly ONE edge in the whole session -- the seed's
+ * stream-ref registry edge -- and no edge of any kind for the target. */
+static int nom_graph_seed_only(const moq_session_t *s, uint64_t seed_ref,
+                               int seed_slot, uint64_t target_ref,
+                               const nom_blk_t *blk, const char *what)
+{
+    og_graph_t g;
+    og_capture(s, &g);
+    int bad = og_check_integrity(&g, what);
+    bad += og_check_edge(&g, OG_DOM_REQ_STREAMREF, seed_ref,
+                         MOQ_REQ_SUBSCRIPTION, seed_slot, what);
+    const og_edge_spec_t w[] = { { OG_DOM_REQ_STREAMREF, seed_ref } };
+    bad += og_check_owner_edges(&g, MOQ_REQ_SUBSCRIPTION, seed_slot, w, 1,
+                                what);
+    bad += og_check_no_edge(&g, OG_DOM_REQ_STREAMREF, target_ref, what);
+    bad += og_check_no_edge(&g, OG_DOM_NS_REF, seed_ref, what);
+    bad += og_check_no_edge(&g, OG_DOM_NS_REF, target_ref, what);
+    /* The seed is the only SUBSCRIPTION owner. Origin 4 additionally holds a
+     * LIVE announcement blocker keyed by its own stream ref (a distinct
+     * pool/domain-qualified edge); the by-RID index carries neither owner. */
+    size_t want_edges = 1;
+    if (blk && blk->armed) {
+        bad += og_check_edge(&g, OG_DOM_REQ_STREAMREF, blk->ref,
+                             MOQ_REQ_ANNOUNCEMENT, blk->slot, what);
+        const og_edge_spec_t bw[] = { { OG_DOM_REQ_STREAMREF, blk->ref } };
+        bad += og_check_owner_edges(&g, MOQ_REQ_ANNOUNCEMENT, blk->slot,
+                                    bw, 1, what);
+        bad += og_check_no_edge(&g, OG_DOM_REQ_RID, blk->rid, what);
+        want_edges = 2;
+    } else {
+        bad += og_check_no_edge(&g, OG_DOM_REQ_RID, 0, what);
+    }
+    if (g.edge_count != want_edges) {
+        fprintf(stderr, "NOM %s: %zu graph edges, expected exactly %zu\n",
+                what, g.edge_count, want_edges);
+        bad++;
+    }
+    return bad;
+}
+
+/* Conservation across the refused call: every prior edge survives exactly
+ * once, and any ADDED edge is admitted only under a domain-aware,
+ * IDENTITY-QUALIFIED allowance -- the bounded storage-neutral window for an
+ * ownership repair:
+ *
+ *   - a new stream-ref/ns-ref edge must key the saved target ref AND its own
+ *     (kind, slot) must resolve to a live owner whose declared stream
+ *     identity IS that target;
+ *   - a new request-ID edge may key the DECLARED target request id (0 for
+ *     origins 1-3, 2 for origin 4) but must resolve to that same target owner,
+ *     never the seed or an unrelated slot;
+ *   - duplicates, unsupported kinds, wrong slots, unrelated keys, and an
+ *     edge merely repointed at the seed all fail by identity.
+ *
+ * The resolver is local and bounds-safe: it models the two owner families a
+ * request-bidi carrier could live in without broadening the shared ownership
+ * policy. */
+static int nom_edge_owns_target(const moq_session_t *s, const og_edge_t *f,
+                                uint64_t target_ref, const char *what)
+{
+    if (f->kind == MOQ_REQ_SUBSCRIPTION) {
+        if (f->slot < 0 || (size_t)f->slot >= s->sub_cap) {
+            if (!og_quiet) fprintf(stderr, "NOM %s: added edge slot out of range\n", what);
+            return 0;
+        }
+        const moq_sub_entry_t *e = &s->subs[f->slot];
+        if (e->state == MOQ_SUB_FREE ||
+            e->request_stream_ref._v != target_ref) {
+            if (!og_quiet) fprintf(stderr, "NOM %s: added edge's owner does not carry the"
+                    " target identity\n", what);
+            return 0;
+        }
+        return 1;
+    }
+    /* The no-slot path is the GENERIC request-staging path, whose owner
+     * family in source is MOQ_REQ_SUBSCRIPTION; no current route stages such
+     * a request in another pool, so no other kind is blessed here. A future
+     * explicit private carrier kind arrives with the product and its test
+     * model. */
+    if (!og_quiet) fprintf(stderr, "NOM %s: added edge has unsupported kind %d\n", what,
+            f->kind);
+    return 0;
+}
+
+static int nom_graph_conserved(const moq_session_t *s, const og_graph_t *g0,
+                               uint64_t target_ref, uint64_t target_rid,
+                               const char *what)
+{
+    og_graph_t g1;
+    og_capture(s, &g1);
+    int bad = og_check_integrity(&g1, what);
+    for (size_t i = 0; i < g0->edge_count; i++) {
+        const og_edge_t *e = &g0->edges[i];
+        size_t seen = 0;
+        for (size_t j = 0; j < g1.edge_count; j++) {
+            const og_edge_t *f = &g1.edges[j];
+            if (f->domain == e->domain && f->key == e->key &&
+                f->kind == e->kind && f->slot == e->slot)
+                seen++;
+        }
+        if (seen != 1) {
+            if (!og_quiet) fprintf(stderr, "NOM %s: pre-existing edge (%d key %llu) not"
+                    " conserved (%zu matches)\n", what, (int)e->domain,
+                    (unsigned long long)e->key, seen);
+            bad++;
+        }
+    }
+    for (size_t j = 0; j < g1.edge_count; j++) {
+        const og_edge_t *f = &g1.edges[j];
+        int preexisting = 0;
+        for (size_t i = 0; i < g0->edge_count; i++) {
+            const og_edge_t *e = &g0->edges[i];
+            if (f->domain == e->domain && f->key == e->key &&
+                f->kind == e->kind && f->slot == e->slot) {
+                preexisting = 1;
+                break;
+            }
+        }
+        if (preexisting) continue;
+        /* Duplicate added edges on one (domain, key) fail. */
+        size_t dup = 0;
+        for (size_t k = 0; k < g1.edge_count; k++)
+            if (g1.edges[k].domain == f->domain && g1.edges[k].key == f->key)
+                dup++;
+        if (dup != 1) {
+            if (!og_quiet) fprintf(stderr, "NOM %s: added edge (%d key %llu) duplicated\n",
+                    what, (int)f->domain, (unsigned long long)f->key);
+            bad++;
+            continue;
+        }
+        if (f->domain == OG_DOM_REQ_STREAMREF || f->domain == OG_DOM_NS_REF) {
+            if (f->key != target_ref) {
+                if (!og_quiet) fprintf(stderr, "NOM %s: added edge (%d key %llu) does not"
+                        " key the target\n", what, (int)f->domain,
+                        (unsigned long long)f->key);
+                bad++;
+                continue;
+            }
+            if (!nom_edge_owns_target(s, f, target_ref, what)) bad++;
+        } else if (f->domain == OG_DOM_REQ_RID) {
+            if (f->key != target_rid) {
+                if (!og_quiet) fprintf(stderr, "NOM %s: added request-ID edge keys %llu,"
+                        " not the target's declared id %llu\n", what,
+                        (unsigned long long)f->key,
+                        (unsigned long long)target_rid);
+                bad++;
+                continue;
+            }
+            if (!nom_edge_owns_target(s, f, target_ref, what)) bad++;
+        } else {
+            if (!og_quiet) fprintf(stderr, "NOM %s: added edge in unsupported domain %d\n",
+                    what, (int)f->domain);
+            bad++;
+        }
+    }
+    return bad;
+}
+
+/* Normalize every action this matrix can legally see; anything else fails. */
+static bool nom_norm_action(const moq_action_t *a, void *vctx,
+                            txs_norm_vec_t *out)
+{
+    (void)vctx;
+    txs_img_t im;
+    txs_img_init(&im);
+    switch (a->kind) {
+    case MOQ_ACTION_CLOSE_BIDI_STREAM:
+        txs_img_u64(&im, a->u.close_bidi_stream.stream_ref._v);
+        return txs_norm_append_img(out, a->kind, &im);
+    case MOQ_ACTION_STOP_BIDI_STREAM:
+        txs_img_u64(&im, a->u.stop_bidi_stream.stream_ref._v);
+        txs_img_u64(&im, a->u.stop_bidi_stream.error_code);
+        return txs_norm_append_img(out, a->kind, &im);
+    case MOQ_ACTION_RESET_BIDI_STREAM:
+        txs_img_u64(&im, a->u.reset_bidi_stream.stream_ref._v);
+        txs_img_u64(&im, a->u.reset_bidi_stream.error_code);
+        return txs_norm_append_img(out, a->kind, &im);
+    case MOQ_ACTION_SEND_BIDI_STREAM: {
+        const moq_send_bidi_stream_action_t *sb = &a->u.send_bidi_stream;
+        if (sb->len && !sb->data) {
+            fprintf(stderr, "NOM: SEND_BIDI with NULL data\n");
+            return false;
+        }
+        txs_img_u64(&im, sb->stream_ref._v);
+        txs_img_u64(&im, sb->fin ? 1 : 0);
+        /* Decode, never count: envelope, then the complete REQUEST_ERROR. */
+        moq_buf_reader_t r;
+        moq_buf_reader_init(&r, sb->data, sb->len);
+        moq_control_envelope_t env;
+        memset(&env, 0, sizeof(env));
+        if (moq_d18_decode_envelope(&r, &env) != MOQ_OK) {
+            fprintf(stderr, "NOM: undecodable SEND_BIDI envelope\n");
+            return false;
+        }
+        if (moq_buf_reader_remaining(&r) != 0) {
+            fprintf(stderr, "NOM: trailing bytes after envelope\n");
+            return false;
+        }
+        txs_img_u64(&im, env.msg_type);
+        moq_d18_request_error_t er;
+        memset(&er, 0, sizeof(er));
+        if (env.msg_type == (uint64_t)MOQ_D18_REQUEST_ERROR) {
+            if (moq_d18_decode_request_error(env.payload, env.payload_len,
+                                             &er) != MOQ_OK) {
+                fprintf(stderr, "NOM: undecodable REQUEST_ERROR body\n");
+                return false;
+            }
+            if (er.reason.len && !er.reason.data) {
+                fprintf(stderr, "NOM: REQUEST_ERROR reason NULL bytes\n");
+                return false;
+            }
+            txs_img_u64(&im, er.error_code);
+            txs_img_u64(&im, er.retry_interval);
+            txs_img_bytes(&im, er.reason.data, er.reason.len);
+        }
+        return txs_norm_append_img(out, a->kind, &im);
+    }
+    default:
+        fprintf(stderr, "NOM: unnormalized action kind %u\n",
+                (unsigned)a->kind);
+        return false;
+    }
+}
+
+static txs_op_hooks_t nom_hooks = {
+    NULL, NULL, NULL, NULL, no_event_expected, nom_norm_action
+};
+
+/* The DECLARED terminal output for one target completion. */
+static void nom_want_terminal(txs_norm_vec_t *v, bool pre_setup,
+                              uint64_t target_ref)
+{
+    txs_img_t im;
+    if (pre_setup) {
+        txs_img_init(&im);
+        txs_img_u64(&im, target_ref);
+        txs_img_u64(&im, 0x1);                        /* CANCELLED */
+        MOQ_TEST_CHECK(txs_norm_append_img(v, MOQ_ACTION_STOP_BIDI_STREAM,
+                                           &im));
+        txs_img_init(&im);
+        txs_img_u64(&im, target_ref);
+        txs_img_u64(&im, 0x1);
+        MOQ_TEST_CHECK(txs_norm_append_img(v, MOQ_ACTION_RESET_BIDI_STREAM,
+                                           &im));
+    } else {
+        txs_img_init(&im);
+        txs_img_u64(&im, target_ref);
+        txs_img_u64(&im, 1);                          /* FIN */
+        txs_img_u64(&im, (uint64_t)MOQ_D18_REQUEST_ERROR);
+        txs_img_u64(&im, MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+        txs_img_u64(&im, 0);                          /* retry interval */
+        txs_img_bytes(&im, (const uint8_t *)nom_reason, strlen(nom_reason));
+        MOQ_TEST_CHECK(txs_norm_append_img(v, MOQ_ACTION_SEND_BIDI_STREAM,
+                                           &im));
+    }
+}
+
+/* Permanent outcome validator: the ONLY recognized results are MOQ_OK and
+ * MOQ_ERR_WOULD_BLOCK; everything else is an oracle failure. Quiet mode lets
+ * the negative self-check below run without noise. */
+static int nom_outcome_quiet;
+static int nom_outcome_classify(moq_result_t rc, const char *what)
+{
+    if (rc == MOQ_OK) return 0;
+    if (rc == MOQ_ERR_WOULD_BLOCK) return 1;
+    if (!nom_outcome_quiet)
+        fprintf(stderr, "NOM %s: unrecognized outcome %d\n", what, (int)rc);
+    return -1;
+}
+
+static void nom_outcome_selfcheck(void)
+{
+    nom_outcome_quiet = 1;
+    MOQ_TEST_CHECK_EQ_INT(nom_outcome_classify(MOQ_OK, "self"), 0);
+    MOQ_TEST_CHECK_EQ_INT(nom_outcome_classify(MOQ_ERR_WOULD_BLOCK, "self"),
+                          1);
+    MOQ_TEST_CHECK_EQ_INT(nom_outcome_classify(MOQ_ERR_INTERNAL, "self"), -1);
+    MOQ_TEST_CHECK_EQ_INT(nom_outcome_classify(MOQ_ERR_CLOSED, "self"), -1);
+    nom_outcome_quiet = 0;
+}
+
+/* The complete retirement postcondition, shared by both outcome arms, the
+ * second retry, and the post-late-FIN recheck: target carrier fully gone,
+ * seed-only topology, exact pool occupancy, exact session state, exact drain
+ * multiset. */
+/* The blocker announcement's exact edge set: one stream-ref request-registry
+ * edge keyed by NOM_BLK_REF resolving to its announcement slot. */
+static int nom_blk_graph_edges(const moq_session_t *s, const nom_blk_t *b,
+                               const char *what)
+{
+    if (!b || !b->armed) return 0;
+    og_graph_t g;
+    og_capture(s, &g);
+    int bad = og_check_edge(&g, OG_DOM_REQ_STREAMREF, b->ref,
+                            MOQ_REQ_ANNOUNCEMENT, b->slot, what);
+    const og_edge_spec_t w[] = { { OG_DOM_REQ_STREAMREF, b->ref } };
+    bad += og_check_owner_edges(&g, MOQ_REQ_ANNOUNCEMENT, b->slot, w, 1, what);
+    return bad;
+}
+
+/* Conservation of the blocker owner across a phase: the announcement stays
+ * ESTABLISHED/RECEIVER with its declared identity and goaway_sent, and its
+ * stream-ref edge is intact. */
+static int nom_blk_conserved(const moq_session_t *s, const nom_blk_t *b,
+                             const char *what)
+{
+    if (!b || !b->armed) return 0;
+    int bad = 0;
+    if (b->slot < 0 || (size_t)b->slot >= s->ann_cap) {
+        fprintf(stderr, "NOM %s: blocker slot out of range\n", what);
+        return 1;
+    }
+    const moq_ann_entry_t *e = &s->announcements[b->slot];
+    if ((int)e->state != (int)MOQ_ANN_ESTABLISHED ||
+        (int)e->role != (int)MOQ_ANN_ROLE_RECEIVER ||
+        e->generation != b->gen || e->handle._opaque != b->handle ||
+        e->request_id != b->rid || e->request_stream_ref._v != b->ref ||
+        !e->goaway_sent) {
+        fprintf(stderr, "NOM %s: blocker owner record changed\n", what);
+        bad++;
+    }
+    bad += nom_blk_graph_edges(s, b, what);
+    return bad;
+}
+
+static int nom_check_complete(const moq_session_t *s, const nom_seed_t *seed,
+                              uint64_t seed_ref, uint64_t target_ref,
+                              int pre_state, const drain_snap_t *want_ring,
+                              const txs_snapshot_t *base, const nom_blk_t *blk,
+                              const char *what)
+{
+    int bad = 0;
+    size_t want_recv_payload = base->recv_payload_bytes;
+    /* The remaining generic scalars, DERIVED from the pre-target baseline
+     * with the declared completion transitions: all output consumed (both
+     * queues empty), the scratch arena back at its pre-target cursor, and
+     * the drain count equal to the declared ring's. */
+    if ((size_t)(s->event_tail - s->event_head) != 0 ||
+        (size_t)(s->action_tail - s->action_head) != 0) {
+        fprintf(stderr, "NOM %s: queues not drained at completion\n", what);
+        bad++;
+    }
+    if (s->event_scratch_len != base->event_scratch_len) {
+        fprintf(stderr, "NOM %s: event_scratch_len %zu, expected the"
+                " pre-target %zu\n", what, s->event_scratch_len,
+                base->event_scratch_len);
+        bad++;
+    }
+    if (s->drain_ref_count != want_ring->count) {
+        fprintf(stderr, "NOM %s: drain count %zu, expected the declared"
+                " %zu\n", what, s->drain_ref_count, want_ring->count);
+        bad++;
+    }
+    /* The target carrier's ACCOUNTING must be released, not only its edges:
+     * a repair that retains target bytes forever would otherwise pass. */
+    if (s->recv_payload_bytes != want_recv_payload) {
+        fprintf(stderr, "NOM %s: recv_payload_bytes %zu, expected the"
+                " pre-target %zu\n", what, s->recv_payload_bytes,
+                want_recv_payload);
+        bad++;
+    }
+    moq_stream_ref_t tr; tr._v = target_ref;
+    if (request_registry_find_by_streamref(s, tr).kind != MOQ_REQ_NONE) {
+        fprintf(stderr, "NOM %s: target still has a registry owner\n", what);
+        bad++;
+    }
+    bad += nom_graph_seed_only(s, seed_ref, seed->slot, target_ref, blk, what);
+    /* The live blocker owner survives the target's whole lifecycle. */
+    bad += nom_blk_conserved(s, blk, what);
+    bad += nom_seed_equal(s, seed, what);
+    {
+        int busy = 0;
+        for (size_t i = 0; i < s->sub_cap; i++)
+            if (s->subs[i].state != MOQ_SUB_FREE) busy++;
+        if (busy != 1) {
+            fprintf(stderr, "NOM %s: pool occupancy %d, expected 1\n", what,
+                    busy);
+            bad++;
+        }
+    }
+    if ((int)s->state != pre_state) {
+        fprintf(stderr, "NOM %s: session state %d, expected %d\n", what,
+                (int)s->state, pre_state);
+        bad++;
+    }
+    drain_snap_t now;
+    drain_snap(s, &now);
+    bad += drain_multiset_equals(&now, want_ring, what);
+    return bad;
+}
+
+typedef struct nom_case {
+    const char *name;
+    int         origin;       /* 1..4 */
+    bool        fin;          /* the target call carries a FIN */
+    bool        pre_setup;
+    /* The inbound target Request ID, DECLARED per row independently of the
+     * encoded target bytes (draft-18 §10.1). Origin 4's live announcement
+     * blocker commits inbound id 0, so its next request is id 2; origins 1-3
+     * commit no preceding request and use id 0. The no-slot terminal refuses
+     * the target BEFORE its id is validated, so this is a wire-legality
+     * declaration the encoder honours, not a runtime-killable value. */
+    uint64_t    target_rid;
+} nom_case_t;
+
+/* Descriptor self-check: origin 4 requires target id 2, every other origin
+ * requires 0. A missing/defaulted or coherently changed member cannot silently
+ * redefine the fixture. */
+static int nom_case_target_rid_ok(const nom_case_t *c)
+{
+    uint64_t want = (c->origin == 4) ? 2u : 0u;
+    if (c->target_rid != want) {
+        fprintf(stderr, "FAIL: nom %s: declared target_rid %llu, origin %d"
+                " requires %llu\n", c->name, (unsigned long long)c->target_rid,
+                c->origin, (unsigned long long)want);
+        return 1;
+    }
+    return 0;
+}
+
+/* Green-phase perturbation switches (test-local, default off): each forces a
+ * deliberate divergence a load-bearing oracle must catch. Used only by the
+ * temporary kill runs recorded in the task report; they are OFF in the
+ * committed tree and asserted so by the matrix driver. */
+static int nom_perturb;   /* 0=off, else the numbered perturbation */
+
+/* -- Origin 4's LIVE draft-18 request blocker ------------------------
+ *
+ * Origin 4 fills the send buffer with a legal per-request GOAWAY on an
+ * accepted inbound announcement. The GOAWAY is one non-FIN SEND_BIDI_STREAM
+ * whose bytes occupy the send tail so the refused target's REQUEST_ERROR cannot
+ * be encoded. The announcement owner is predeclared and required LIVE through
+ * the whole arc. */
+#define NOM_BLK_REF 3u
+/* Sized so the encoded GOAWAY fills the 64-byte send buffer, leaving a tail too
+ * small for the refused target's REQUEST_ERROR, so the target is retained. */
+static const uint8_t nom_goaway_uri[44] = {
+    'm','o','q',':','/','/','n','o','m','-','a','l','t','.','e','x','a',
+    'm','p','l','e','/','g','o','a','w','a','y','/','n','o','m','/','0',
+    '0','0','0','0','0','0','0','0','0','1'
+};
+
+/* Arm the blocker: feed an inbound PUBLISH_NAMESPACE (id 0), accept it, drain
+ * the accept's REQUEST_OK so the GOAWAY starts from a clean send tail, then
+ * issue the per-request GOAWAY. Must run BEFORE the seed occupies the sole
+ * subscription staging slot -- the d18 request dispatch grabs one transiently. */
+static void nom_arm_goaway_blocker(moq_session_t *s, nom_blk_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    int slot = -1;
+    uint32_t gen = 0;
+    for (size_t i = 0; i < s->ann_cap; i++)
+        if (s->announcements[i].state == MOQ_ANN_FREE) {
+            slot = (int)i;
+            gen = s->announcements[i].generation | 1u;   /* live generation */
+            break;
+        }
+    MOQ_TEST_CHECK(slot >= 0);
+
+    /* The packed announcement handle is MINTED from the pre-ingress
+     * slot/generation/session-tag, never adopted from the entry afterwards, so
+     * the surfaced event handle and the live owner handle are each REQUIRED to
+     * equal this derivation. */
+    uint16_t tag = s->session_tag;
+    uint64_t want_handle =
+        moq_handle_pack(MOQ_HANDLE_POOL_ANNOUNCEMENT, tag, gen, (uint32_t)slot);
+
+    moq_stream_ref_t ref = moq_stream_ref_from_u64(NOM_BLK_REF);
+    uint8_t m[192];
+    size_t n = enc_pns_full(m, sizeof(m), 0, "blk", NULL);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, ref, m, n, false, 1),
+        (int)MOQ_OK);
+    uint64_t h = 0;
+    arm_output_exact(s, MOQ_EVENT_NAMESPACE_PUBLISHED, 1, 0, "nom blk", &h);
+    MOQ_TEST_CHECK_EQ_U64(h, want_handle);
+
+    moq_announcement_t ann;
+    ann._opaque = want_handle;
+    moq_accept_namespace_cfg_t ac;
+    moq_accept_namespace_cfg_init(&ac);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_accept_namespace(s, ann, &ac, 1), (int)MOQ_OK);
+    /* Drain the accept's REQUEST_OK so the empty action queue lets the next
+     * advancing call reset the send tail before the GOAWAY encodes. */
+    {
+        moq_event_t e;
+        while (moq_session_poll_events(s, &e, 1) > 0) moq_event_cleanup(&e);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    }
+
+    moq_request_goaway_cfg_t gc;
+    moq_request_goaway_cfg_init(&gc);
+    gc.new_session_uri.data = nom_goaway_uri;
+    gc.new_session_uri.len = sizeof(nom_goaway_uri);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_request_goaway_namespace(s, ann, &gc, 1), (int)MOQ_OK);
+
+    const moq_ann_entry_t *e = ann_by_ref(s, ref);
+    MOQ_TEST_CHECK(e != NULL);
+    if (e) {
+        out->armed  = 1;
+        out->slot   = slot;               /* the pre-ingress derivation */
+        out->gen    = gen;
+        out->handle = want_handle;        /* MINTED, not read back */
+        out->rid    = e->request_id;
+        out->ref    = ref._v;
+        MOQ_TEST_CHECK_EQ_INT((int)e->state, (int)MOQ_ANN_ESTABLISHED);
+        MOQ_TEST_CHECK_EQ_INT((int)e->role, (int)MOQ_ANN_ROLE_RECEIVER);
+        MOQ_TEST_CHECK(e->goaway_sent);
+        MOQ_TEST_CHECK_EQ_U64(out->rid, (uint64_t)0);
+        /* The live owner's own identity must match the minted derivation. */
+        MOQ_TEST_CHECK_EQ_INT((int)(e - s->announcements), slot);
+        MOQ_TEST_CHECK_EQ_U64((uint64_t)e->generation, (uint64_t)gen);
+        MOQ_TEST_CHECK_EQ_U64(e->handle._opaque, want_handle);
+    }
+}
+
+
+/* The no-slot carrier state for a ref: -1 absent, 0 present (no FIN), 1 present
+ * (FIN). Proves the PRODUCT installs/retires the refused target's carrier with
+ * the row's exact FIN value, through real refusal/recovery. */
+static int nom_carrier_state(const moq_session_t *s, uint64_t ref_v)
+{
+    moq_stream_ref_t ref;
+    ref._v = ref_v;
+    int i = noslot_carrier_find(s, ref);
+    if (i < 0) return -1;
+    return s->noslot_carriers[i].fin ? 1 : 0;
+}
+
+#define NOM_UNREL_CARRIER 0x8888u   /* an unrelated seeded carrier, conserved */
+
+/* At every retired phase: the target carrier is gone, the count is back at the
+ * declared baseline, and the unrelated seeded carrier is ref/FIN exact. */
+static int nom_carrier_retired(const moq_session_t *s, size_t base,
+                               const char *what)
+{
+    int bad = 0;
+    if (nom_carrier_state(s, NOM_TARGET_REF) != -1) {
+        fprintf(stderr, "NOM %s: target carrier still present\n", what);
+        bad++;
+    }
+    if (nom_carrier_state(s, NOM_UNREL_CARRIER) != 0) {
+        fprintf(stderr, "NOM %s: unrelated carrier changed\n", what);
+        bad++;
+    }
+    if (s->noslot_carrier_count != base) {
+        fprintf(stderr, "NOM %s: carrier count %zu, expected the baseline %zu\n",
+                what, s->noslot_carrier_count, base);
+        bad++;
+    }
+    return bad;
+}
+
+/* The shared matrix runner. Blockers by origin:
+ *   1: full drain ring (no action blocker);
+ *   2: pre-setup, max_actions=2, one queued close leaves avail == 1 < 2;
+ *   3: max_actions=1, one queued close fills the ring;
+ *   4: send_buffer_size=64, a per-request GOAWAY fills the send tail.
+ * Recovery drains ONLY the blocker (poll_actions), then the documented empty
+ * re-feed. No target bytes are ever re-delivered. */
+static void run_nom_case(const nom_case_t *c)
+{
+    char what[96];
+    snprintf(what, sizeof(what), "nom %s", c->name);
+    uint32_t max_actions = 0, send_size = 0;
+    if (c->origin == 2) max_actions = 2;
+    if (c->origin == 3) max_actions = 1;
+    if (c->origin == 4) send_size = 64;
+    moq_session_t *s = nom_make_session(!c->pre_setup, max_actions, send_size);
+    if (!s) return;
+
+    failures += nom_case_target_rid_ok(c);
+
+    /* Origin 4's blocker is a LIVE announcement + per-request GOAWAY. It must be
+     * armed BEFORE the seed occupies the sole subscription staging slot, since
+     * the d18 request dispatch grabs one transiently on the announcement
+     * handoff. It commits inbound id 0, so the target is declared at id 2. */
+    nom_blk_t blk;
+    memset(&blk, 0, sizeof(blk));
+    if (c->origin == 4)
+        nom_arm_goaway_blocker(s, &blk);
+
+    /* Seed identity, DERIVED from the free pool AFTER the blocker's transient
+     * staging use (which advances the slot's generation). */
+    int seed_slot = -1;
+    uint32_t seed_gen = 0;
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].state == MOQ_SUB_FREE) {
+            seed_slot = (int)i;
+            seed_gen = s->subs[i].generation | 1u;
+            break;
+        }
+    MOQ_TEST_CHECK_EQ_INT(seed_slot, 0);
+
+    /* Seed: a fragmented SUBSCRIBE occupies the ONE pool slot legally. */
+    uint8_t sub[128];
+    size_t sub_len = nom_encode_subscribe(sub, sizeof(sub));
+    MOQ_TEST_CHECK(sub_len > 8);
+    moq_stream_ref_t seed_ref = moq_stream_ref_from_u64(NOM_SEED_REF);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, seed_ref, sub, sub_len - 4,
+                                              false, 1),
+        (int)MOQ_OK);
+    /* The retained prefix must equal the bytes actually fed BEFORE the
+     * captured record becomes a baseline. */
+    {
+        const moq_sub_entry_t *e = &s->subs[seed_slot];
+        MOQ_TEST_CHECK_EQ_INT((int)e->state, (int)MOQ_SUB_RECVING_REQUEST);
+        MOQ_TEST_CHECK_EQ_U64((uint64_t)e->generation, (uint64_t)seed_gen);
+        MOQ_TEST_CHECK_EQ_SIZE(e->req_recv_len, sub_len - 4);
+        MOQ_TEST_CHECK(e->req_recv_buf != NULL);
+        if (e->req_recv_buf && e->req_recv_len == sub_len - 4)
+            MOQ_TEST_CHECK(memcmp(e->req_recv_buf, sub, sub_len - 4) == 0);
+    }
+    nom_seed_t seed;
+    nom_seed_capture(s, &seed);
+    nom_seed_arm_assert(&seed, seed_slot);
+    failures += nom_graph_seed_only(s, NOM_SEED_REF, seed_slot,
+                                    NOM_TARGET_REF, &blk, "seeded");
+
+    /* Blockers. Origin 4's blocker is the live announcement GOAWAY armed before
+     * the seed; its ref is NOM_BLK_REF, the others' is an unmapped close ref. */
+    size_t blockers = 0;
+    moq_stream_ref_t blocker_ref =
+        moq_stream_ref_from_u64(c->origin == 4 ? NOM_BLK_REF : 0x6000);
+    if (c->origin == 1) {
+        fill_drain_ring(s);
+    } else if (c->origin == 2 || c->origin == 3) {
+        MOQ_TEST_CHECK_EQ_INT((int)queue_close_bidi(s, blocker_ref),
+                              (int)MOQ_OK);
+        blockers = 1;
+        if (c->origin == 3) MOQ_TEST_CHECK(action_queue_full(s));
+        else MOQ_TEST_CHECK_EQ_SIZE(action_queue_avail(s), (size_t)1);
+    } else {
+        /* The GOAWAY's SEND_BIDI_STREAM already occupies the action slot and
+         * fills the send tail; nothing new is queued. Its bytes leave too small
+         * a tail for the refused target's REQUEST_ERROR. */
+        blockers = 1;
+        MOQ_TEST_CHECK(s->send_cap - s->send_len <= 16);
+        MOQ_TEST_CHECK(action_queue_avail(s) >= 2);
+    }
+    drain_snap_t ring0;
+    drain_snap(s, &ring0);
+
+    /* An unrelated no-slot carrier, seeded directly, that every phase must leave
+     * ref/FIN exact. The baseline count is captured with it present. */
+    MOQ_TEST_CHECK(noslot_carrier_install(
+        s, moq_stream_ref_from_u64(NOM_UNREL_CARRIER), false));
+    size_t carrier_base = s->noslot_carrier_count;
+    MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_UNREL_CARRIER), 0);
+    MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_TARGET_REF), -1);
+
+    /* Whole-session and graph baselines, captured BEFORE the target call. */
+    txs_snapshot_t before;
+    txs_capture(s, &seed_ref, 1, &before);
+    expect_after_call_prepare(&before);
+    og_graph_t g0;
+    og_capture(s, &g0);
+
+    /* The target request, complete and FIN'd per the row, at the DECLARED id
+     * (2 for origin 4's post-announcement sequence, 0 otherwise). */
+    uint8_t tgt[128];
+    size_t tgt_len = nom_encode_subscribe_at(tgt, sizeof(tgt), c->target_rid);
+    moq_stream_ref_t target = moq_stream_ref_from_u64(NOM_TARGET_REF);
+    int pre_state = (int)s->state;
+    MOQ_TEST_CHECK(pre_state != (int)MOQ_SESS_CLOSED);
+    if (!c->pre_setup)
+        MOQ_TEST_CHECK_EQ_INT(pre_state, (int)MOQ_SESS_ESTABLISHED);
+    moq_result_t rc = moq_session_on_bidi_stream_bytes(s, target, tgt, tgt_len,
+                                                       c->fin, 1);
+    if (nom_perturb == 6)
+        s->event_scratch_len += 8;   /* an UNRELATED whole-session scalar */
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, pre_state);
+
+    int arm = nom_outcome_classify(rc, what);
+    MOQ_TEST_CHECK(arm >= 0);
+    if (arm < 0) { moq_session_destroy(s); return; }
+
+    /* The declared completion drain multiset. Origin 1's want is DERIVED by
+     * removing exactly the DECLARED filler from the pre-call ring, never from
+     * an observed result. */
+    drain_snap_t comp_want, late_want;
+    if (c->origin == 1) {
+        drain_snap_t less = ring0;
+        size_t k = 0;
+        int removed = 0;
+        for (size_t i = 0; i < ring0.count; i++) {
+            if (!removed && ring0.ref[i] == NOM_FILLER0) { removed = 1; continue; }
+            less.ref[k] = ring0.ref[i];
+            less.reason[k] = ring0.reason[i];
+            k++;
+        }
+        less.count = k;
+        MOQ_TEST_CHECK_EQ_INT(removed, 1);
+        late_want = less;
+        drain_snap_plus(&less, target, MOQ_DRAIN_NORMAL, &comp_want);
+    } else if (c->fin) {
+        comp_want = ring0;
+        late_want = ring0;
+    } else {
+        drain_snap_plus(&ring0, target, MOQ_DRAIN_NORMAL, &comp_want);
+        late_want = ring0;
+    }
+
+    if (arm == 0) {
+        /* Arm A: immediate completion -- the WHOLE obligation queued NOW.
+         * Consume exactly the leading blocker actions so both arms meet the
+         * same convergent output check. Structurally shared; no current or
+         * candidate product reaches it yet. */
+        txs_norm_vec_t lead;
+        txs_norm_init(&lead);
+        size_t taken = 0;
+        moq_action_t a;
+        while (taken < blockers && moq_session_poll_actions(s, &a, 1) > 0) {
+            if (!nom_norm_action(&a, NULL, &lead)) failures++;
+            moq_action_cleanup(&a);
+            taken++;
+        }
+        MOQ_TEST_CHECK_EQ_SIZE(taken, blockers);
+        txs_norm_free(&lead);
+    } else {
+        /* Arm B: conservation at the refused point. The target-specific
+         * carrier is deliberately UNBOUNDED in identity (an ownership repair
+         * may create one) but every allowed delta is bounded:
+         *   - whole-session scalars equal, except recv_payload_bytes which
+         *     may grow by at most the fed target length;
+         *   - graph topology conserved; any added edge keys the target and
+         *     resolves to a live carrier;
+         *   - the seed record, drain multiset, blocker action (kind, ref,
+         *     and for the GOAWAY blocker its exact bytes) unchanged;
+         *   - no event, no new action. */
+        failures += nom_seed_equal(s, &seed, what);
+        {
+            txs_snapshot_t expect = before;
+            const size_t grew = s->recv_payload_bytes;
+            MOQ_TEST_CHECK(grew >= before.recv_payload_bytes);
+            MOQ_TEST_CHECK(grew - before.recv_payload_bytes <= tgt_len);
+            expect.recv_payload_bytes = grew;   /* bounded target carrier */
+            failures += txs_check_eq(s, &seed_ref, 1, &expect, what);
+        }
+        failures += nom_graph_conserved(s, &g0, NOM_TARGET_REF,
+                                        c->target_rid, what);
+        /* Product-path carrier: the refused target is retained in EXACTLY one
+         * carrier with its declared ref and the ROW's FIN value; the count is
+         * baseline + 1; the unrelated carrier stays ref/FIN exact. */
+        MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_TARGET_REF),
+                              c->fin ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_UNREL_CARRIER), 0);
+        MOQ_TEST_CHECK_EQ_SIZE(s->noslot_carrier_count, carrier_base + 1);
+        drain_snap_t now;
+        drain_snap(s, &now);
+        failures += drain_multiset_equals(&now, &ring0, what);
+        {
+            int evs = 0;
+            moq_event_t ev;
+            while (moq_session_poll_events(s, &ev, 1) > 0) {
+                evs++; moq_event_cleanup(&ev);
+            }
+            MOQ_TEST_CHECK_EQ_INT(evs, 0);
+        }
+        MOQ_TEST_CHECK_EQ_SIZE(
+            (size_t)(s->action_tail - s->action_head), blockers);
+        /* The blocker is still the SAME action, byte for byte. */
+        if (blockers == 1) {
+            const moq_action_t *head =
+                &s->actions[s->action_head % s->action_cap];
+            if (c->origin == 4) {
+                /* The blocker is the queued per-request GOAWAY, compared in
+                 * full: a non-FIN SEND_BIDI_STREAM on the announcement's ref
+                 * whose bytes are one complete REQUEST_GOAWAY envelope with no
+                 * trailing bytes and the exact New Session URI. */
+                MOQ_TEST_CHECK_EQ_INT((int)head->kind,
+                                      (int)MOQ_ACTION_SEND_BIDI_STREAM);
+                MOQ_TEST_CHECK_EQ_U64(head->u.send_bidi_stream.stream_ref._v,
+                                      blocker_ref._v);
+                MOQ_TEST_CHECK_EQ_INT(head->u.send_bidi_stream.fin ? 1 : 0, 0);
+                MOQ_TEST_CHECK(head->u.send_bidi_stream.data != NULL);
+                if (head->u.send_bidi_stream.data) {
+                    moq_buf_reader_t gr;
+                    moq_buf_reader_init(&gr, head->u.send_bidi_stream.data,
+                                        head->u.send_bidi_stream.len);
+                    moq_control_envelope_t genv;
+                    memset(&genv, 0, sizeof(genv));
+                    MOQ_TEST_CHECK_EQ_INT(
+                        (int)moq_d18_decode_envelope(&gr, &genv), (int)MOQ_OK);
+                    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_reader_remaining(&gr),
+                                           (size_t)0);
+                    MOQ_TEST_CHECK_EQ_U64(genv.msg_type,
+                                          (uint64_t)MOQ_D18_GOAWAY);
+                    moq_d18_goaway_t gaw;
+                    memset(&gaw, 0, sizeof(gaw));
+                    MOQ_TEST_CHECK_EQ_INT(
+                        (int)moq_d18_decode_goaway_request(genv.payload,
+                            genv.payload_len, &gaw), (int)MOQ_OK);
+                    MOQ_TEST_CHECK(gaw.uri.len == sizeof(nom_goaway_uri) &&
+                                   gaw.uri.data &&
+                                   memcmp(gaw.uri.data, nom_goaway_uri,
+                                          sizeof(nom_goaway_uri)) == 0);
+                }
+            } else {
+                MOQ_TEST_CHECK_EQ_INT((int)head->kind,
+                                      (int)MOQ_ACTION_CLOSE_BIDI_STREAM);
+                MOQ_TEST_CHECK_EQ_U64(head->u.close_bidi_stream.stream_ref._v,
+                                      blocker_ref._v);
+            }
+        }
+
+        /* Recovery: drain ONLY the blocker(s), then the documented empty
+         * re-feed with the row's own FIN fact. */
+        {
+            txs_norm_vec_t got;
+            txs_norm_init(&got);
+            collect_actions(s, &nom_hooks, &got);
+            MOQ_TEST_CHECK_EQ_SIZE(got.count, blockers);
+            txs_norm_free(&got);
+        }
+        if (c->origin == 1) {
+            /* Free ONE drain slot: the DECLARED filler's own legitimate FIN
+             * releases it through the public drain-ring absorb path. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(
+                    s, moq_stream_ref_from_u64(
+                        nom_perturb == 4 ? NOM_FILLER0 + 1 : NOM_FILLER0),
+                    NULL, 0, true, 1),
+                (int)MOQ_OK);
+        }
+        rc = moq_session_on_bidi_stream_bytes(s, target, NULL, 0, c->fin, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    }
+
+    /* Both arms converge: the EXACT terminal obligation, once, and the whole
+     * retirement postcondition. */
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, pre_state);
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        collect_events(s, &nom_hooks, &got);
+        MOQ_TEST_CHECK_EQ_SIZE(got.count, (size_t)0);
+        collect_actions(s, &nom_hooks, &got);
+        nom_want_terminal(&want, c->pre_setup, NOM_TARGET_REF);
+        failures += txs_norm_equals(&got, &want, what);
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+    if (!c->fin) check_drain_ref_reason(s, target, MOQ_DRAIN_NORMAL);
+    failures += nom_check_complete(s, &seed, NOM_SEED_REF, NOM_TARGET_REF,
+                                   pre_state, &comp_want, &before, &blk, what);
+    failures += nom_carrier_retired(s, carrier_base, what);
+    if (nom_perturb == 2) {
+        /* Leave a phantom target owner behind: the completion oracle must
+         * name it. */
+        moq_request_endpoint_t pep;
+        memset(&pep, 0, sizeof(pep));
+        pep.kind = MOQ_REQ_SUBSCRIPTION;
+        pep.slot = seed.slot;
+        request_registry_insert_by_streamref(
+            s, moq_stream_ref_from_u64(NOM_TARGET_REF), pep);
+        failures += nom_check_complete(s, &seed, NOM_SEED_REF, NOM_TARGET_REF,
+                                       pre_state, &comp_want, &before, &blk,
+                                       "perturb-2");
+        request_registry_remove_by_streamref(
+            s, moq_stream_ref_from_u64(NOM_TARGET_REF));
+    }
+
+    /* Exactly once: a second empty re-feed emits nothing, resurrects
+     * nothing, and reproduces the WHOLE postcondition. */
+    rc = moq_session_on_bidi_stream_bytes(s, target, NULL, 0, false, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    check_no_output(s, &nom_hooks);
+    failures += nom_check_complete(s, &seed, NOM_SEED_REF, NOM_TARGET_REF,
+                                   pre_state, &comp_want, &before, &blk, what);
+    failures += nom_carrier_retired(s, carrier_base, "replay");
+    /* The send buffer's accounting end state: the ring is empty and this
+     * advancing call has run, so every queued byte -- blocker and terminal
+     * alike -- must be reclaimed. */
+    MOQ_TEST_CHECK_EQ_SIZE(s->send_len, (size_t)0);
+
+    /* Without a peer FIN the drain ref is RELEASABLE: the later FIN restores
+     * the DECLARED ring (never an observed one), emits nothing, and the whole
+     * retirement + seed postcondition holds again. */
+    if (!c->fin) {
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, target, NULL, 0, true, 1),
+            (int)MOQ_OK);
+        check_no_output(s, &nom_hooks);
+        failures += nom_check_complete(s, &seed, NOM_SEED_REF, NOM_TARGET_REF,
+                                       pre_state, &late_want, &before, &blk,
+                                       what);
+        failures += nom_carrier_retired(s, carrier_base, "late-terminal");
+        MOQ_TEST_CHECK_EQ_SIZE(s->send_len, (size_t)0);
+    }
+    moq_session_destroy(s);
+}
+
+/* Capacity-available controls: the SAME seed and target, no blocker; each
+ * must complete IMMEDIATELY through the exact terminal branch. These pin the
+ * branch the blocked rows defer; a completed target emits no event. */
+static void run_nom_control(bool pre_setup, bool fin)
+{
+    nom_case_t c;
+    memset(&c, 0, sizeof(c));
+    c.name = pre_setup ? (fin ? "control-pre-fin" : "control-pre")
+                       : (fin ? "control-post-fin" : "control-post");
+    c.origin = 0;
+    c.fin = fin;
+    c.pre_setup = pre_setup;
+    char what[96];
+    snprintf(what, sizeof(what), "nom %s", c.name);
+    moq_session_t *s = nom_make_session(!pre_setup, 0, 0);
+    if (!s) return;
+    MOQ_TEST_CHECK(noslot_carrier_install(
+        s, moq_stream_ref_from_u64(NOM_UNREL_CARRIER), false));
+    size_t carrier_base = s->noslot_carrier_count;
+    int seed_slot = -1;
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].state == MOQ_SUB_FREE) { seed_slot = (int)i; break; }
+    uint8_t sub[128];
+    size_t sub_len = nom_encode_subscribe(sub, sizeof(sub));
+    moq_stream_ref_t seed_ref = moq_stream_ref_from_u64(NOM_SEED_REF);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, seed_ref, sub, sub_len - 4,
+                                              false, 1),
+        (int)MOQ_OK);
+    nom_seed_t seed;
+    nom_seed_capture(s, &seed);
+    nom_seed_arm_assert(&seed, seed_slot);
+    failures += nom_graph_seed_only(s, NOM_SEED_REF, seed_slot,
+                                    NOM_TARGET_REF, NULL, "control-seeded");
+    int pre_state = (int)s->state;
+    txs_snapshot_t ctrl_base;
+    txs_capture(s, &seed_ref, 1, &ctrl_base);
+    expect_after_call_prepare(&ctrl_base);
+    drain_snap_t none, wantr;
+    memset(&none, 0, sizeof(none));
+    uint8_t tgt[128];
+    size_t tgt_len = nom_encode_subscribe(tgt, sizeof(tgt));
+    moq_stream_ref_t target = moq_stream_ref_from_u64(NOM_TARGET_REF);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, target, tgt, tgt_len, fin, 1),
+        (int)MOQ_OK);
+    /* Immediate completion creates NO target carrier. */
+    failures += nom_carrier_retired(s, carrier_base, "control-immediate");
+    {
+        txs_norm_vec_t got, want;
+        txs_norm_init(&got);
+        txs_norm_init(&want);
+        collect_events(s, &nom_hooks, &got);
+        MOQ_TEST_CHECK_EQ_SIZE(got.count, (size_t)0);
+        collect_actions(s, &nom_hooks, &got);
+        nom_want_terminal(&want, pre_setup, NOM_TARGET_REF);
+        failures += txs_norm_equals(&got, &want, what);
+        txs_norm_free(&got);
+        txs_norm_free(&want);
+    }
+    if (fin) wantr = none;
+    else drain_snap_plus(&none, target, MOQ_DRAIN_NORMAL, &wantr);
+    (void)seed_slot;
+    failures += nom_check_complete(s, &seed, NOM_SEED_REF, NOM_TARGET_REF,
+                                   pre_state, &wantr, &ctrl_base, NULL, what);
+    failures += nom_carrier_retired(s, carrier_base, "control-complete");
+    moq_session_destroy(s);
+}
+
+/* One legal MONOTONIC product route on the carrier's FIN: refuse the complete
+ * target with NO FIN (carrier false), then -- while the SAME blocker remains --
+ * feed the target's legal empty FIN so the SAME carrier flips to true with the
+ * count unchanged, then recover with an empty fin=false re-feed. Because the FIN
+ * is already observed in the carrier, the completed terminal owes NO drain. */
+static void run_nom_carrier_monotonic(void)
+{
+    const char *what = "nom carrier monotonic";
+    moq_session_t *s = nom_make_session(true, 1, 0);   /* ONE action slot */
+    if (!s) return;
+
+    /* Seed the sole subscription slot with a fragment. */
+    uint8_t sub[128];
+    size_t sub_len = nom_encode_subscribe(sub, sizeof(sub));
+    moq_stream_ref_t seed_ref = moq_stream_ref_from_u64(NOM_SEED_REF);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, seed_ref, sub, sub_len - 4,
+                                              false, 1),
+        (int)MOQ_OK);
+
+    MOQ_TEST_CHECK(noslot_carrier_install(
+        s, moq_stream_ref_from_u64(NOM_UNREL_CARRIER), false));
+    size_t base = s->noslot_carrier_count;
+
+    /* Action-block: fill the ONE slot so the no-slot terminal cannot send. */
+    moq_stream_ref_t blocker = moq_stream_ref_from_u64(0x6000);
+    MOQ_TEST_CHECK_EQ_INT((int)queue_close_bidi(s, blocker), (int)MOQ_OK);
+    MOQ_TEST_CHECK(action_queue_full(s));
+
+    uint8_t tgt[128];
+    size_t tgt_len = nom_encode_subscribe(tgt, sizeof(tgt));
+    moq_stream_ref_t target = moq_stream_ref_from_u64(NOM_TARGET_REF);
+
+    /* 1. Complete target, NO FIN: refused, carrier installed with fin=false. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, target, tgt, tgt_len, false, 1),
+        (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_TARGET_REF), 0);
+    MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_UNREL_CARRIER), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(s->noslot_carrier_count, base + 1);
+
+    /* 2. Legal empty FIN while the blocker remains: the SAME carrier flips to
+     * true, count unchanged. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, target, NULL, 0, true, 1),
+        (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT(nom_carrier_state(s, NOM_TARGET_REF), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(s->noslot_carrier_count, base + 1);
+
+    /* 3. Recover: drain the blocker, then an empty fin=false re-feed completes
+     * the refusal, taking NO drain (the FIN is already carried). */
+    {
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    }
+    drain_snap_t ring_before;
+    drain_snap(s, &ring_before);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, target, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    failures += nom_carrier_retired(s, base, what);
+    drain_snap_t ring_after;
+    drain_snap(s, &ring_after);
+    failures += drain_multiset_equals(&ring_after, &ring_before,
+                                      "monotonic no drain");
+    /* The completion drained its own terminal; a repeat is inert. */
+    {
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(s, target, NULL, 0, false, 1),
+        (int)MOQ_OK);
+    failures += nom_carrier_retired(s, base, "monotonic-idempotent");
+    moq_session_destroy(s);
+}
+
+/* Both sides of the identity-qualified RID allowance, load-bearing against the
+ * REAL graph-conservation oracle at BOTH declared ids (0 for origins 1-3, 2 for
+ * origin 4): a correctly linked target RID edge at the DECLARED id is ACCEPTED;
+ * the same id repointed at the seed is REJECTED by identity; and a wrong-key
+ * edge (id 0 while the row declares 2) is REJECTED by key. Quiet: only failures
+ * print. */
+static void nom_rid_allowance_selfcheck(void)
+{
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                               MOQ_PERSPECTIVE_SERVER);
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    cfg.max_subscriptions = 2;
+    moq_session_t *s = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s), (int)MOQ_OK);
+    if (!s) return;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(s, 0), (int)MOQ_OK);
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    uint8_t setup[16];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, setup, sizeof(setup));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup(&w), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_control_bytes(s, setup, moq_buf_writer_offset(&w),
+                                          0),
+        (int)MOQ_OK);
+    moq_event_t ev;
+    while (moq_session_poll_events(s, &ev, 1) > 0) moq_event_cleanup(&ev);
+    while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    uint8_t sub[128];
+    size_t sub_len = nom_encode_subscribe(sub, sizeof(sub));
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(
+            s, moq_stream_ref_from_u64(NOM_SEED_REF), sub, sub_len - 4,
+            false, 1),
+        (int)MOQ_OK);
+    og_graph_t g0;
+    og_capture(s, &g0);
+    /* A second staging entry whose declared identity IS the target. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)moq_session_on_bidi_stream_bytes(
+            s, moq_stream_ref_from_u64(NOM_TARGET_REF), sub, sub_len - 4,
+            false, 1),
+        (int)MOQ_OK);
+    moq_request_endpoint_t tep = request_registry_find_by_streamref(
+        s, moq_stream_ref_from_u64(NOM_TARGET_REF));
+    MOQ_TEST_CHECK_EQ_INT((int)tep.kind, (int)MOQ_REQ_SUBSCRIPTION);
+    moq_request_endpoint_t sep = request_registry_find_by_streamref(
+        s, moq_stream_ref_from_u64(NOM_SEED_REF));
+    MOQ_TEST_CHECK_EQ_INT((int)sep.kind, (int)MOQ_REQ_SUBSCRIPTION);
+
+    /* id 0 (origins 1-3). POSITIVE: the identity-linked rid-0 edge is accepted;
+     * NEGATIVE: the same id repointed at the SEED owner is rejected. */
+    request_registry_insert_by_id(s, 0, tep);
+    MOQ_TEST_CHECK_EQ_INT(
+        nom_graph_conserved(s, &g0, NOM_TARGET_REF, 0, "rid0-positive"), 0);
+    request_registry_remove_by_id(s, 0);
+    request_registry_insert_by_id(s, 0, sep);
+    og_quiet = 1;
+    MOQ_TEST_CHECK(
+        nom_graph_conserved(s, &g0, NOM_TARGET_REF, 0, "rid0-identity") > 0);
+    og_quiet = 0;
+    request_registry_remove_by_id(s, 0);
+
+    /* id 2 (origin 4). POSITIVE: the identity-linked rid-2 edge is accepted at
+     * the declared id 2. */
+    request_registry_insert_by_id(s, 2, tep);
+    MOQ_TEST_CHECK_EQ_INT(
+        nom_graph_conserved(s, &g0, NOM_TARGET_REF, 2, "rid2-positive"), 0);
+    /* NEGATIVE (wrong key): a rid-2 edge is rejected when the row declares id 0,
+     * and symmetrically a rid-0 edge is rejected when the row declares id 2. */
+    og_quiet = 1;
+    MOQ_TEST_CHECK(
+        nom_graph_conserved(s, &g0, NOM_TARGET_REF, 0, "rid2-wrongkey") > 0);
+    og_quiet = 0;
+    request_registry_remove_by_id(s, 2);
+    request_registry_insert_by_id(s, 0, tep);
+    og_quiet = 1;
+    MOQ_TEST_CHECK(
+        nom_graph_conserved(s, &g0, NOM_TARGET_REF, 2, "rid0-wrongkey") > 0);
+    og_quiet = 0;
+    request_registry_remove_by_id(s, 0);
+    /* NEGATIVE (identity): a rid-2 edge repointed at the SEED is rejected. */
+    request_registry_insert_by_id(s, 2, sep);
+    og_quiet = 1;
+    MOQ_TEST_CHECK(
+        nom_graph_conserved(s, &g0, NOM_TARGET_REF, 2, "rid2-identity") > 0);
+    og_quiet = 0;
+    request_registry_remove_by_id(s, 2);
+    moq_session_destroy(s);
+}
+
+static void test_no_owner_admission_matrix(void)
+{
+    nom_outcome_selfcheck();
+    nom_rid_allowance_selfcheck();
+    MOQ_TEST_CHECK_EQ_INT(nom_perturb, 0);
+
+    /* Controls first: they emit no event and pin the exact terminal branches. */
+    run_nom_control(true, false);
+    run_nom_control(true, true);
+    run_nom_control(false, false);
+    run_nom_control(false, true);
+
+    /* Origin 1 is reachable only without a FIN (the preflight is !fin-gated). */
+    nom_case_t c;
+    memset(&c, 0, sizeof(c));
+    c.origin = 1; c.pre_setup = false; c.fin = false; c.target_rid = 0;
+    c.name = "o1-drain-nofin";       run_nom_case(&c);
+    c.origin = 2; c.pre_setup = true;
+    c.fin = false; c.name = "o2-presetup-nofin"; run_nom_case(&c);
+    c.fin = true;  c.name = "o2-presetup-fin";   run_nom_case(&c);
+    c.origin = 3; c.pre_setup = false;
+    c.fin = false; c.name = "o3-action-nofin";   run_nom_case(&c);
+    c.fin = true;  c.name = "o3-action-fin";     run_nom_case(&c);
+    /* Origin 4's live announcement blocker commits inbound id 0, so its target
+     * is the next id, 2. */
+    c.origin = 4; c.pre_setup = false; c.target_rid = 2;
+    c.fin = false; c.name = "o4-send-nofin";     run_nom_case(&c);
+    c.fin = true;  c.name = "o4-send-fin";       run_nom_case(&c);
+
+    run_nom_carrier_monotonic();
 }
 
 
@@ -8954,11 +10759,11 @@ static void test_ns_sub_local_teardown(void)
  * first and its subgroup slots released rather than left pinned behind a
  * terminated subscription.
  *
- * This terminal's defect is INVERTED relative to the rest of Axis 3. The
- * others take a drain reference unconditionally, ignoring a same-call FIN;
- * this one frees the entry with NO drain reference at all, so a genuinely open
- * peer half has nothing to absorb a late in-flight message, and an exhausted
- * ring cannot make the terminal wait.
+ * Like the rest of Axis 3, this terminal reserves its drain FIN-aware: on a
+ * stream-correlated profile it takes one NORMAL reference only when the peer
+ * half is still open (req_recv_fin false), so a genuinely open peer half can
+ * absorb a late in-flight message, a same-call FIN owes none, and an exhausted
+ * ring makes the terminal wait exactly when a reference is owed.
  */
 
 #define FU_SUBGROUPS 2
@@ -9595,11 +11400,10 @@ static void test_axis3_fin_terminals(void)
     }
     run_ns_goaway_latched();
 
-    /* session_subscribe.c:2226 -- the failed REQUEST_UPDATE termination. Its
-     * expectation is the SAME unified rule as every other row: a genuinely
-     * open peer half owes exactly one releasable normal reference, a same-call
-     * FIN owes none, and an exhausted ring must refuse rather than terminate
-     * without one. It is the row where today's behaviour is the opposite. */
+    /* session_subscribe.c:2226 -- the failed REQUEST_UPDATE termination. It
+     * follows the SAME unified rule as every other row: a genuinely open peer
+     * half owes exactly one releasable normal reference, a same-call FIN owes
+     * none, and an exhausted ring refuses rather than terminating without one. */
     {
         static const terminal_case_t failed_update = {
             .name = "failed subscription update",
@@ -9627,17 +11431,20 @@ static void test_axis3_fin_terminals(void)
  * which queues REQUEST_ERROR with FIN, drains the request bidi and frees the
  * transient entry.
  *
- * The drain is reserved and taken on `uses_request_streams` ALONE (`:366-372`,
- * `:401`) -- the peer's FIN never reaches the decision -- so the two same-call
- * FIN rows are this family's REDs, exactly as elsewhere on Axis 3.
+ * The drain is reserved FIN-aware: `ns_sub_send_request_error` takes a reference
+ * only when `uses_request_streams && stream_ref && !peer_fin_observed`
+ * (`session_namespace_sub.c:386`), where `peer_fin_observed` folds the current
+ * FIN, the durable `pending_fin` latch and the `handoff_fin_pending` marker. So
+ * a same-call FIN owes no drain and those rows are drainless under the unified
+ * rule.
  *
  * Retention here is a ONE-owner story. The handoff transfers ownership of the
  * bidi to the `MOQ_NS_SUB_RECVING_PUBLISHER` entry and frees the generic
  * staging owner even on `MOQ_ERR_WOULD_BLOCK` (`session_subscribe.c:1310`),
  * because retries route through `idx_ns_by_ref` and never back through the
- * staging slot. The comment at `profile_d18.c:1590` still says the staging
- * buffer survives; it is stale, and is recorded for correction with the
- * product change rather than edited here.
+ * staging slot. The inline comment at `profile_d18.c:1590` is about
+ * `ns_sub_on_new_bidi()` refusing before handoff on ns-sub pool exhaustion and
+ * is accurate.
  */
 
 static size_t enc_sns(uint8_t *buf, size_t cap, uint64_t rid, const char *field,
@@ -10898,8 +12705,10 @@ static txs_op_hooks_t durable_abort_hooks = {
 
 /*
  * A locally-issued SUBSCRIBE the peer accepted, optionally closing its half in
- * the same SUBSCRIBE_OK. `subscribe_request_bidi_cancel` reserves and takes
- * its drain UNCONDITIONALLY, so the latch rows are RED.
+ * the same SUBSCRIBE_OK. `subscribe_request_bidi_cancel` reserves its drain
+ * FIN-aware: it takes a NORMAL reference only when the peer half is still open
+ * (req_recv_fin false), so a same-call FIN owes none and the latch rows are
+ * drainless under the unified rule.
  */
 
 #define R6_TRACK_ALIAS   0x63
@@ -11199,7 +13008,8 @@ static void want_bidi_cancel(txs_norm_vec_t *v, moq_stream_ref_t ref,
  * `control_response_seen`/`control_ok` WITHOUT leaving MOQ_FETCH_PENDING_FETCHER
  * (session_fetch.c:975) -- which is the only state the public cancel guards on
  * (:1534). So a valid FETCH_OK carrying FIN leaves a cancellable owner whose
- * durable latch the terminal then ignores. */
+ * durable latch the terminal consults: `fetch_request_bidi_cancel` reserves a
+ * drain only when the peer half is still open, so a same-call FIN owes none. */
 #define R5_END_OF_TRACK 1
 /* Non-default, and INSIDE the requested range: draft-18 §10.13 permits the
  * response end to equal the requested end or shrink when published data ends
@@ -11548,9 +13358,9 @@ static void want_fetch_cancel(txs_norm_vec_t *v, moq_stream_ref_t ref,
 
 /* -- Route: done SUBSCRIBE (session_subscribe.c:3250, moq_session_done_subscribe)
  *
- * The terminal reserves and takes its drain from `req_stream` alone; the FIN
- * source it could consult, `e->req_recv_fin`, is available on the entry and
- * ignored. */
+ * The terminal reserves its drain FIN-aware: it consults `e->req_recv_fin`, so
+ * it takes a reference only when the peer half is still open and a same-call FIN
+ * owes none. */
 #define R7_STATUS   0x2
 #define R7_STREAMS  0x9
 #define R7_TRACK_ALIAS 0x74
@@ -12193,8 +14003,8 @@ static void want_finish_publish(txs_norm_vec_t *v, moq_stream_ref_t ref,
 /* -- Route: announcement error (session_namespace.c:582)
  *
  * The announcer's own PUBLISH_NAMESPACE is answered with a terminal
- * REQUEST_ERROR. The retirement reserves and takes its drain from the live
- * request stream alone (:594), never consulting the FIN the same call carries
+ * REQUEST_ERROR. The retirement reserves its drain FIN-aware
+ * (`req_stream && !ann_peer_fin_observed`, :594), so a same-call FIN owes none
  * -- the ordinary Axis 3 shape on the announcer side. */
 #define R3_ERROR_CODE  MOQ_REQUEST_ERROR_NOT_SUPPORTED
 #define R3_RETRY_MS    4500
@@ -12690,26 +14500,27 @@ static txs_op_hooks_t r1_hooks = {
  *
  * The P4 marker consumer, and a DIFFERENT route from the announcer-side caller
  * already signed off: same helper, opposite role, reached by revoking a
- * namespace WE accepted rather than withdrawing one we announced. The helper
- * reserves and takes its drain from the live stream ref alone (:87-88), never
- * from any FIN fact.
+ * namespace WE accepted rather than withdrawing one we announced. Under the
+ * unified FIN-aware rule the helper reserves a NORMAL drain only when the peer
+ * half is genuinely open; a same-call FIN owes none.
  *
  * Two arms, and they differ in WHERE the peer FIN comes from -- which the
- * fixture asserts rather than assumes, because the two are not the same fact:
+ * fixture asserts rather than assumes, because the two are not the same fact.
+ * Both are GREEN: whichever way the FIN arrives, it ends up in the DURABLE
+ * latch, and the FIN rows are drainless under the unified rule.
  *
  *   T5-MARKER      the FIN rides the inbound PUBLISH_NAMESPACE that CREATES the
- *                  entry. Under the frozen carrier ruling that is P4's handoff
- *                  marker, and #249 records that the commit currently drops it
- *                  -- so the arm asserts `req_recv_fin` is FALSE and the rows
- *                  are RED against the unified rule.
+ *                  entry. The commit hands it to the announcement owner as
+ *                  transitional ownership (the P4 handoff marker), and the
+ *                  family's own handler consumes it into the durable latch -- so
+ *                  a FIN-fed arm holds `req_recv_fin` TRUE and no marker.
  *   T5-DISCRIM     the FIN arrives as a legal empty FIN AFTER acceptance, which
  *                  `handle_announcement_stream_bytes` latches on the entry
- *                  (:121). That IS a durable latch, asserted TRUE, and it
- *                  isolates this terminal's selector from P4's broken handoff.
+ *                  (:121) -- a durable latch reached by a different route.
  *
- * Neither arm copies the same-call FIN into `req_recv_fin`: the carrier ruling
- * requires the destination marker, and a fixture that forged the latch would be
- * pinning the rejected repair. */
+ * Neither arm forges the latch from a same-call FIN by hand: the landed handoff
+ * consumes the transitional marker into the latch, and both arms assert
+ * `handoff_fin_pending` is cleared to prove that consumption is synchronous. */
 #define T5_TOK_TYPE 11
 static const uint8_t k_t5_tok[] = { 'r','c','v','t','o','k' };
 static const uint8_t k_t5_ns0[] = { 'e','x','.','c','o','m' };
@@ -13732,8 +15543,8 @@ static void test_axis4_announce_torn_down_blocked_retry(void)
 
 static void test_axis3_durable_terminals(void)
 {
-    /* session_namespace.c:792 -> :85 -- the withdrawal reserves and takes its
-     * drain unconditionally, never consulting the latch. */
+    /* session_namespace.c:792 -> :85 -- the withdrawal reserves its drain
+     * FIN-aware, consulting the latch: none when the peer half already closed. */
     static const durable_case_t announcer_teardown = {
         .name = "announcer teardown", .make = make_session_client,
         .arm = arm_announcer_established,
@@ -13744,8 +15555,8 @@ static void test_axis3_durable_terminals(void)
     };
     run_durable_matrix(&announcer_teardown);
 
-    /* session_subscribe.c:3012 -- the cancel reserves and takes its drain
-     * unconditionally, never consulting the latch. */
+    /* session_subscribe.c:3012 -- the cancel reserves its drain FIN-aware,
+     * consulting the latch: none when the peer half already closed. */
     {
         static const durable_case_t sub_cancel = {
             .name = "subscriber unsubscribe", .make = make_session_client,
@@ -13757,8 +15568,8 @@ static void test_axis3_durable_terminals(void)
         run_durable_matrix(&sub_cancel);
     }
 
-    /* session_fetch.c:1485 -- the cancel reserves and takes its drain from the
-     * live stream ref alone. */
+    /* session_fetch.c:1485 -- the cancel reserves its drain FIN-aware,
+     * consulting the latch: none when the peer half already closed. */
     {
         static const durable_case_t fetch_cancel = {
             .name = "fetch cancel", .make = make_session_client,
@@ -13770,8 +15581,8 @@ static void test_axis3_durable_terminals(void)
         run_durable_matrix(&fetch_cancel);
     }
 
-    /* session_subscribe.c:3250 -- the terminal reserves and takes its drain
-     * from the live request stream alone, never from the entry's own latch. */
+    /* session_subscribe.c:3250 -- the terminal reserves its drain FIN-aware,
+     * consulting the entry's own latch: none when the peer half already closed. */
     {
         static const durable_case_t done_sub = {
             .name = "done subscribe", .make = make_session_default,
@@ -14421,6 +16232,7 @@ int main(void)
     test_axis4_announce_torn_down_retirement();
     test_axis4_announce_torn_down_blocked_retry();
     test_ns_sub_local_teardown();
+    test_no_owner_admission_matrix();
     if (failures) { printf("FAILURES: %d\n", failures); return 1; }
     MOQ_TEST_PASS("d18_fin_handoff");
     return 0;

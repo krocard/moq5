@@ -187,6 +187,17 @@ typedef struct moq_session_cfg {
      * negotiated delivery timeouts. Read only when struct_size covers this
      * field; older callers get the library default. */
     uint64_t           done_wait_timeout_us;
+
+    /* Appended (ABI-additive): the maximum number of simultaneously active
+     * peer-announced namespace suffixes tracked for one namespace subscription.
+     * This is a per-subscription active-suffix cap; it does not replace the
+     * session-wide receive-byte budget -- both apply. When a peer announces a
+     * new unique suffix after this cap is full, the library does NOT close the
+     * session: it surfaces NAMESPACE_GONE for the already-active suffixes,
+     * retires only the offending namespace-subscription stream, and the session
+     * stays ESTABLISHED. 0 selects the library default (4096). Read only when
+     * struct_size covers this field; older callers get the default. */
+    uint32_t           max_namespace_suffixes_per_subscription;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus

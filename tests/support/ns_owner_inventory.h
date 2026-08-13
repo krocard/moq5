@@ -26,12 +26,10 @@
 
 /* The receive-budget charge of one tracked suffix is its canonical key
  * length: one count byte, then a two-byte length plus the bytes of each part
- * (session_namespace_sub.c:27-33). The tracker's initial array capacity is
- * charged once, on the first insert, and stays charged until the owner is
- * freed -- so a per-suffix delta is calculable without reading the private
- * set. NS_SUF_INIT_CAP * sizeof(ns_suffix_key_t) is that one-off charge. */
-#define NF_SUFFIX_ARRAY_CHARGE (4u * (sizeof(void *) + sizeof(size_t)))
-
+ * (session_namespace_sub.c:27-33). The membership structure is a private
+ * ordered tree; its per-node overhead is bounded by the per-subscription
+ * suffix cap, not the byte budget, so the budget delta per suffix is exactly
+ * this key length -- calculable without reading the private set. */
 NF_UNUSED static size_t nf_suffix_charge(const char *field2)
 {
     return 1u + (2u + 4u) + (2u + strlen(field2));   /* "room" + field2 */
@@ -367,6 +365,7 @@ typedef struct nf_inv {
     int      prefix_valid;
 
     int      got_response, parse_complete, pending_fin, handoff_fin_pending,
+             local_teardown_pending,
              closing_remote_error, forward, auth_processed, auth_committed;
     uint64_t auth_reject_code;
 
@@ -449,6 +448,7 @@ NF_UNUSED static void nf_inv_read(const moq_session_t *s, int slot, nf_inv_t *o)
     o->parse_complete       = e->parse_complete;
     o->pending_fin          = e->pending_fin;
     o->handoff_fin_pending  = e->handoff_fin_pending;
+    o->local_teardown_pending = e->local_teardown_pending;
     o->closing_remote_error = e->closing_remote_error;
     o->forward              = e->forward;
     o->auth_processed       = e->auth_processed;
@@ -576,6 +576,7 @@ NF_UNUSED static int nf_inv_equals(const nf_inv_t *got, const nf_inv_t *want,
     NF_F(prefix_valid, "%d");
     NF_F(got_response, "%d");     NF_F(parse_complete, "%d");
     NF_F(pending_fin, "%d");      NF_F(handoff_fin_pending, "%d");
+    NF_F(local_teardown_pending, "%d");
     NF_F(closing_remote_error, "%d"); NF_F(forward, "%d");
     NF_F(auth_processed, "%d");   NF_F(auth_committed, "%d");
     NF_U64(auth_reject_code);
@@ -679,8 +680,9 @@ NF_UNUSED static int nf_expect_no_actions(moq_session_t *c, const char *what)
  * CLEARED: state -> FREE, stream_kind -> UNKNOWN, the whole request_ep,
  * recv_len, parse_complete, got_response, pending_fin, closing_remote_error,
  * forward, auth_processed, auth_committed, auth_reject_code, token_count,
- * goaway_sent, handoff_fin_pending, the suffix tracker and its inbound flag,
- * and all prefix storage; generation advances by EXACTLY one.
+ * goaway_sent, handoff_fin_pending, local_teardown_pending, the suffix tracker
+ * and its inbound flag, and all prefix storage; generation advances by EXACTLY
+ * one.
  *
  * PRESERVED: handle, request_id, stream_ref, namespace_interest, and the
  * receive buffer's identity and capacity -- the pooled storage the selective
@@ -710,7 +712,8 @@ NF_UNUSED static void nf_inv_apply_free(nf_inv_t *w)
     memset(w->part_ptr, 0, sizeof(w->part_ptr));
 
     w->got_response = 0; w->parse_complete = 0; w->pending_fin = 0;
-    w->handoff_fin_pending = 0; w->closing_remote_error = 0; w->forward = 0;
+    w->handoff_fin_pending = 0; w->local_teardown_pending = 0;
+    w->closing_remote_error = 0; w->forward = 0;
     w->auth_processed = 0; w->auth_committed = 0; w->auth_reject_code = 0;
 
     w->token_count = 0; w->tok_bytes_len = 0;

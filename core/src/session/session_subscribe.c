@@ -1164,6 +1164,129 @@ static bool request_stream_handoff_fin_install(moq_session_t *s,
     }
 }
 
+/* -- No-slot admission carriers (#245b) ----------------------------- *
+ * A bounded, session-owned record of a no-slot request-bidi terminal that is
+ * owed but not yet emittable. Storage is arena-backed in the session slab at
+ * create time (never lazily allocated), so installing one during ingress cannot
+ * fail on the allocator; the cap is bounded by the total request-owner/drain
+ * lifecycle capacity. The carrier holds only the stream ref and FIN fact --
+ * never peer bytes -- because the terminal is content-independent. */
+int noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    if (!s->noslot_carriers || ref._v == 0) return -1;
+    for (size_t i = 0; i < s->noslot_carrier_cap; i++)
+        if (s->noslot_carriers[i].stream_ref == ref._v) return (int)i;
+    return -1;
+}
+
+bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin)
+{
+    if (ref._v == 0) return false;
+    int existing = noslot_carrier_find(s, ref);
+    if (existing >= 0) {
+        /* An already-owed terminal: update its FIN fact monotonically (a later
+         * FIN observation must not be lost) and keep the same carrier. */
+        if (fin) s->noslot_carriers[existing].fin = true;
+        return true;
+    }
+    /* Arena-backed at session create: no allocation happens here, so a fresh
+     * install can only fail on genuine pool exhaustion, never on an allocator
+     * failure that would strand a retainable WOULD_BLOCK. */
+    if (s->noslot_carrier_cap == 0 || !s->noslot_carriers) return false;
+    for (size_t i = 0; i < s->noslot_carrier_cap; i++) {
+        if (s->noslot_carriers[i].stream_ref == 0) {
+            s->noslot_carriers[i].stream_ref = ref._v;
+            s->noslot_carriers[i].fin = fin;
+            s->noslot_carrier_count++;
+            return true;
+        }
+    }
+    return false;   /* pool exhausted -- genuine concurrent-request pressure */
+}
+
+void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref)
+{
+    int i = noslot_carrier_find(s, ref);
+    if (i < 0) return;
+    s->noslot_carriers[i].stream_ref = 0;
+    s->noslot_carriers[i].fin = false;
+    if (s->noslot_carrier_count) s->noslot_carrier_count--;
+}
+
+/* True when the WHOLE per-stream STOP+RESET terminal transaction can be admitted
+ * right now without mutating anything: two action slots (STOP_SENDING +
+ * RESET_STREAM) and, for a FIN-unobserved stream, one NORMAL drain slot to
+ * absorb the peer's terminal. Partial admission would lose the peer-terminal
+ * identity, so callers must gate the whole transaction on this. */
+static bool noslot_stream_reset_admissible(const moq_session_t *s, bool eff_fin)
+{
+    if (action_queue_avail(s) < 2) return false;
+    if (!eff_fin && s->drain_ref_count >= s->drain_ref_cap) return false;
+    return true;
+}
+
+/* Drop a no-owner request bidi by resetting only this stream (draft-18 §3.3
+ * permits resetting an early/unbufferable request bidi). Reserves two action
+ * slots (STOP_SENDING + RESET_STREAM); a no-FIN request additionally installs a
+ * NORMAL drain reference to absorb the peer's terminal. The caller MUST have
+ * confirmed the whole transaction is admissible (noslot_stream_reset_admissible)
+ * so no partial mutation is possible. Any retry carrier for this stream is
+ * retired -- the operation is now resolved, not retained. */
+static moq_result_t noslot_stream_reset(moq_session_t *s,
+                                        moq_stream_ref_t stream_ref,
+                                        bool eff_fin)
+{
+    moq_action_t stop;
+    memset(&stop, 0, sizeof(stop));
+    stop.kind = MOQ_ACTION_STOP_BIDI_STREAM;
+    stop.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    stop.borrow_epoch = s->borrow_epoch;
+    stop.u.stop_bidi_stream.stream_ref = stream_ref;
+    stop.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED */
+    moq_result_t rrc = push_action(s, &stop);
+    if (rrc < 0) return rrc;
+    moq_action_t reset;
+    memset(&reset, 0, sizeof(reset));
+    reset.kind = MOQ_ACTION_RESET_BIDI_STREAM;
+    reset.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
+    reset.borrow_epoch = s->borrow_epoch;
+    reset.u.reset_bidi_stream.stream_ref = stream_ref;
+    reset.u.reset_bidi_stream.error_code = 0x1;
+    rrc = push_action(s, &reset);
+    if (rrc < 0) return rrc;
+    if (!eff_fin) {
+        /* The caller pre-admitted this slot; a failure here would strand the
+         * peer terminal, so it is a hard internal error, never a silent drop. */
+        if (!drain_ref_add(s, stream_ref))
+            return MOQ_ERR_INTERNAL;
+    }
+    noslot_carrier_remove(s, stream_ref);
+    return MOQ_OK;
+}
+
+/* The no-owner carrier pool is exhausted, so this refused request has no durable
+ * retry identity -- returning WOULD_BLOCK now would leave the bridge unable to
+ * find an owner and fatalize the connection. Resolve it without that: drop just
+ * this stream with a STOP+RESET, but ONLY when the ENTIRE transaction fits (two
+ * action slots plus, for a FIN-unobserved stream, one NORMAL drain slot). When
+ * neither durable carrier storage NOR the whole per-stream terminal transaction
+ * is admissible (e.g. a full carrier pool AND a full drain ring, even with
+ * action slots free), close the session gracefully -- a partial reset would lose
+ * the peer-terminal identity, and a bridge fatal bypasses close semantics. The
+ * close carries the draft-18 SESSION termination code INTERNAL_ERROR (0x1) --
+ * NOT the request-error INTERNAL_ERROR (0x0, a different code space) and NOT
+ * UNAUTHORIZED (0x2). Never returns WOULD_BLOCK. */
+static moq_result_t noslot_carrier_exhausted(moq_session_t *s,
+                                             moq_stream_ref_t stream_ref,
+                                             bool eff_fin)
+{
+    if (noslot_stream_reset_admissible(s, eff_fin))
+        return noslot_stream_reset(s, stream_ref, eff_fin);
+    return close_with_error(s, 0x1 /* SESSION INTERNAL_ERROR */,
+                            "no-owner admission carrier storage and per-stream"
+                            " terminal both inadmissible");
+}
+
 /* -- Request bidi bytes (stream-correlated profiles) --------------- *
  * Buffers bytes arriving on a request bidi and dispatches them via the profile.
  * Two phases share this path, keyed by the entry state behind the stream_ref:
@@ -1256,48 +1379,52 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
     int slot = (ep.kind == MOQ_REQ_SUBSCRIPTION) ? ep.slot : -1;
 
     if (slot < 0) {
-        if (len == 0 && !fin) return MOQ_OK;
-        if (len == 0 && fin)
-            return close_with_error(s, 0x3,
-                "empty FIN on request stream without request");
-        /* Reserve a slot to buffer the inbound request. */
-        slot = sub_find_free(s);
+        /* A no-slot terminal already owed on this bidi (#245b): re-drive it
+         * from the durable carrier, folding in whatever FIN was recorded, and
+         * without ever re-staging or redelivering peer bytes. Checked BEFORE
+         * the empty-input early return so the documented empty re-feed reaches
+         * the terminal. */
+        int car = noslot_carrier_find(s, stream_ref);
+        if (car < 0) {
+            if (len == 0 && !fin) return MOQ_OK;
+            if (len == 0 && fin)
+                return close_with_error(s, 0x3,
+                    "empty FIN on request stream without request");
+            /* Reserve a slot to buffer the inbound request. */
+            slot = sub_find_free(s);
+        }
         if (slot < 0) {
-            /* Staging/subscription pool exhausted. Local resource pressure is NOT
-             * peer protocol misbehavior, so the SESSION always survives -- never a
-             * PROTOCOL_VIOLATION close. A drain ref absorbs the peer's trailing
-             * bytes/FIN via the drain-ring check at the top of this handler.
-             * Nothing was staged, so there is nothing to free. */
-            if (!fin && s->drain_ref_count >= s->drain_ref_cap)
+            /* Staging/subscription pool exhausted, or a re-fed carrier. Local
+             * resource pressure is NOT peer protocol misbehavior, so the
+             * SESSION always survives -- never a PROTOCOL_VIOLATION close. The
+             * terminal is fixed and content-independent; when it cannot be
+             * emitted yet, the OPERATION is retained in a carrier (holding only
+             * the stream ref and FIN fact) so an empty re-feed completes it and
+             * moq_session_has_transport_stream() keeps the bridge from
+             * fatalizing. Nothing was staged, so there is nothing to free. */
+            bool eff_fin = fin || (car >= 0 && s->noslot_carriers[car].fin);
+            if (!eff_fin && s->drain_ref_count >= s->drain_ref_cap) {
+                /* Wait for drain capacity to free. The carrier is the retry
+                 * identity moq_session_has_transport_stream() reports; if the
+                 * carrier pool is exhausted the operation cannot be retained, so
+                 * resolve it now instead of a fatalizing bare WOULD_BLOCK. */
+                if (!noslot_carrier_install(s, stream_ref, eff_fin))
+                    return noslot_carrier_exhausted(s, stream_ref, eff_fin);
                 return MOQ_ERR_WOULD_BLOCK;   /* retry when drain capacity frees */
+            }
             if (defer_dispatch) {
                 /* Pre-setup: no control stream yet, so an application-level
                  * REQUEST_ERROR cannot be sent. draft-18 §3.3 permits resetting an
                  * early request bidi that we do not want to (or cannot) buffer, so
                  * RESET only this stream and keep the session. Needs two action
                  * slots (STOP_SENDING + RESET_STREAM) plus the drain ref checked
-                 * above -- all no-mutation until reserved, so WOULD_BLOCK retries. */
-                if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
-                moq_action_t stop;
-                memset(&stop, 0, sizeof(stop));
-                stop.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-                stop.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
-                stop.borrow_epoch = s->borrow_epoch;
-                stop.u.stop_bidi_stream.stream_ref = stream_ref;
-                stop.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED */
-                moq_result_t rrc = push_action(s, &stop);
-                if (rrc < 0) return rrc;
-                moq_action_t reset;
-                memset(&reset, 0, sizeof(reset));
-                reset.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-                reset.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-                reset.borrow_epoch = s->borrow_epoch;
-                reset.u.reset_bidi_stream.stream_ref = stream_ref;
-                reset.u.reset_bidi_stream.error_code = 0x1;
-                rrc = push_action(s, &reset);
-                if (rrc < 0) return rrc;
-                if (!fin) (void)drain_ref_add(s, stream_ref);
-                return MOQ_OK;
+                 * above -- all no-mutation until reserved. */
+                if (action_queue_avail(s) < 2) {
+                    if (!noslot_carrier_install(s, stream_ref, eff_fin))
+                        return noslot_carrier_exhausted(s, stream_ref, eff_fin);
+                    return MOQ_ERR_WOULD_BLOCK;
+                }
+                return noslot_stream_reset(s, stream_ref, eff_fin);
             }
             /* Post-setup: graceful stream-correlated rejection -- REQUEST_ERROR
              * (INTERNAL_ERROR) + FIN on the request bidi. */
@@ -1312,9 +1439,15 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
             if (erc < 0) return erc;
             erc = queue_send_bidi(s, stream_ref, perr,
                                   moq_buf_writer_offset(&pw), true);
+            if (erc == MOQ_ERR_WOULD_BLOCK) {
+                if (!noslot_carrier_install(s, stream_ref, eff_fin))
+                    return noslot_carrier_exhausted(s, stream_ref, eff_fin);
+                return erc;
+            }
             if (erc < 0) return erc;
             /* Absorb the peer's trailing FIN unless it already arrived here. */
-            if (!fin) (void)drain_ref_add(s, stream_ref);
+            if (!eff_fin) (void)drain_ref_add(s, stream_ref);
+            noslot_carrier_remove(s, stream_ref);
             return MOQ_OK;
         }
         moq_sub_entry_t *re = &s->subs[slot];

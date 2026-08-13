@@ -23,6 +23,7 @@
 #define MOQ_DEFAULT_MAX_OBJ_PAYLOAD  (4u * 1024 * 1024)
 #define MOQ_DEFAULT_MAX_RECV_BUF (16u * 1024 * 1024)
 #define MOQ_DEFAULT_MAX_NS_SUBS 16
+#define MOQ_DEFAULT_MAX_NS_SUFFIXES 4096
 /* Slot count for the pre-SUBSCRIBE_OK datagram reordering buffer (held bytes
  * are separately bounded by the receive-buffer budget).
  *
@@ -932,6 +933,16 @@ typedef struct moq_auth_txn {
 
 #define MOQ_DECODED_MAX_TOKENS 16
 
+/* -- No-slot admission carrier (#245b) ------------------------------- *
+ * The minimal durable record of a no-slot request-bidi terminal owed but not
+ * yet emittable for local resource pressure. The terminal is fixed and
+ * content-independent, so only the stream identity and the observed FIN fact
+ * are retained -- never the peer's request bytes. */
+typedef struct moq_noslot_carrier {
+    uint64_t stream_ref;   /* 0 == free slot */
+    bool     fin;          /* the peer's send half already FIN'd */
+} moq_noslot_carrier_t;
+
 /* -- Namespace sub entry (publisher side, one per bidi stream) ------- */
 
 typedef struct moq_ns_sub_entry {
@@ -964,6 +975,13 @@ typedef struct moq_ns_sub_entry {
      * refusal and an empty re-feed completes it. This pool's free is SELECTIVE,
      * so it is cleared there by name. */
     bool                handoff_fin_pending;
+    /* A publisher-side extra-byte teardown was attempted and refused for
+     * capacity. Draft-18 §10.9.1 makes such a teardown close the request bidi,
+     * not buffer the bytes, so the obligation -- not the raw bytes -- is what
+     * must survive: this durable marker re-drives ns_sub_local_teardown on the
+     * documented empty re-feed, with no peer-byte redelivery. Cleared in the
+     * selective free (#245c). */
+    bool                local_teardown_pending;
     bool                closing_remote_error;
     bool                forward;
     bool                auth_processed;
@@ -985,6 +1003,14 @@ typedef struct moq_ns_sub_entry {
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    bool suffix_cap_terminating;  /* the per-subscription active-suffix cap was
+                                   * exceeded: the offending bidi is being retired
+                                   * by synthesizing NAMESPACE_GONE for the active
+                                   * suffixes (the tree is the durable cursor). Set
+                                   * before the first GONE so an event/action-
+                                   * capacity block resumes the terminal on the
+                                   * next empty re-feed instead of re-decoding the
+                                   * over-cap NAMESPACE. Cleared on slot free. */
 } moq_ns_sub_entry_t;
 
 void ns_sub_destroy_all(moq_session_t *s);
@@ -1307,6 +1333,11 @@ static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
     return fin || e->pending_fin || e->handoff_fin_pending;
 }
 
+/* No-slot admission carriers (#245b). */
+int  noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref);
+bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin);
+void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref);
+
 /* -- Request registry ---------------------------------------------- */
 
 static inline int32_t req_pack(moq_request_kind_t kind, int slot) {
@@ -1506,6 +1537,20 @@ struct moq_session {
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
+    /* No-slot admission carriers (#245b). A draft-18 request bidi that arrives
+     * with the subscription pool full owes a fixed, content-independent
+     * terminal (pre-setup STOP+RESET, post-setup REQUEST_ERROR+FIN). When drain/
+     * action/send capacity cannot admit that terminal yet, the OPERATION -- not
+     * the peer bytes -- is retained here: just the stream ref and the observed
+     * FIN fact, so the documented empty re-feed re-drives the terminal with no
+     * peer-byte redelivery, and moq_session_has_transport_stream() reports the
+     * stream live so the bridge retains rather than fatalizes. Arena-backed in
+     * the session slab at create time (installation cannot allocation-fail); cap
+     * is bounded by the total request-owner/drain lifecycle capacity. */
+    moq_noslot_carrier_t *noslot_carriers;
+    size_t           noslot_carrier_cap;
+    size_t           noslot_carrier_count;
+
     uint64_t            goaway_timeout_us;
     uint64_t            goaway_deadline_us;
     uint64_t            subgroup_deadline_us;
@@ -1585,6 +1630,10 @@ struct moq_session {
 
     moq_ns_sub_entry_t *ns_subs;
     size_t              ns_sub_cap;
+    /* Per-subscription active peer-announced suffix cap (cfg-resolved, default
+     * MOQ_DEFAULT_MAX_NS_SUFFIXES). Bounds the inbound suffix tree of one
+     * SUBSCRIBE_NAMESPACE independently of the session-wide receive budget. */
+    size_t              max_ns_suffixes;
     moq_index_entry_t  *idx_ns_by_ref;
     size_t              idx_ns_mask;
 

@@ -47,26 +47,57 @@ static void ns_suffix_key_build(const moq_namespace_t *ns,
     }
 }
 
-static bool ns_suffix_key_eq(const ns_suffix_key_t *a,
-                               const uint8_t *b, size_t b_len)
+#if defined(MOQ_SESSION_SWEEP_TESTING)
+/* Non-exported membership-work probe (see session_transport.h). Bumped for the
+ * inbound and outbound sets alike; tests read deltas around an inbound
+ * workload. Compiled only into moq-core-test-internals; absent from shipping. */
+uint64_t session_ns_suffix_probe_count;
+#endif
+
+/* Total order over canonical suffix keys: lexicographic on the raw bytes, then
+ * length. Bumps the membership-work probe once per key comparison (inbound and
+ * outbound sets alike) so the complexity oracle counts comparisons, not tree
+ * operations. */
+static int ns_suffix_key_cmp(const uint8_t *a, size_t alen,
+                             const uint8_t *b, size_t blen)
 {
-    return a->len == b_len && memcmp(a->data, b, b_len) == 0;
+#if defined(MOQ_SESSION_SWEEP_TESTING)
+    session_ns_suffix_probe_count++;
+#endif
+    size_t m = alen < blen ? alen : blen;
+    int c = m ? memcmp(a, b, m) : 0;
+    if (c != 0) return c < 0 ? -1 : 1;
+    if (alen != blen) return alen < blen ? -1 : 1;
+    return 0;
 }
 
-/* -- Announced suffix tracker ------------------------------------- */
+/* -- Announced suffix tracker: private height-balanced (AVL) tree over the
+ * canonical suffix key bytes. O(log N) membership/insert/remove replaces the
+ * former linear scan, so a peer enumerating N namespaces costs O(N log N), not
+ * O(N^2). No process-secret entropy exists in this layer, so an ordered tree
+ * (not a keyed hash) is the right structure and keeps the complexity oracle
+ * representation-neutral for any balanced tree. ------------------- */
 
-#define NS_SUF_INIT_CAP 4
+typedef struct ns_suffix_node {
+    uint8_t               *data;   /* owned copy of the canonical key bytes */
+    size_t                 len;
+    struct ns_suffix_node *left;
+    struct ns_suffix_node *right;
+    int                    height;
+} ns_suffix_node_t;
 
 typedef struct {
-    ns_suffix_key_t *keys;
-    size_t           count;
-    size_t           cap;
+    ns_suffix_node_t *root;
+    size_t            count;
     /* Bytes charged to the session receive budget (s->recv_payload_bytes) for
-     * this set: copied key storage plus key-array capacity. Only ever nonzero
-     * for the inbound, peer-controlled set; the outbound publisher-side set
-     * leaves this 0. Capacity growth is charged once and not released on key
-     * removal (the array is not shrunk), so this tracks live allocation. */
-    size_t           counted_bytes;
+     * this set: the peer-controlled copied key bytes of every node (recomputed
+     * exactly from each removed node's own key length). Only ever nonzero for
+     * the inbound, peer-controlled set; the outbound publisher-side set leaves
+     * this 0. This is a two-axis bound: the receive-byte budget caps the
+     * peer-controlled key bytes, and the per-subscription suffix cap
+     * (s->max_ns_suffixes) caps the node COUNT -- so the fixed per-node
+     * overhead is bounded by the cap, not the byte budget. */
+    size_t            counted_bytes;
 } ns_suffix_set_t;
 
 /* a + b with overflow detection; a wrapped sum must refuse the insert. */
@@ -77,13 +108,161 @@ static bool ns_size_add(size_t a, size_t b, size_t *out)
     return true;
 }
 
+static int ns_node_height(const ns_suffix_node_t *n)
+{
+    return n ? n->height : 0;
+}
+
+static void ns_node_fix_height(ns_suffix_node_t *n)
+{
+    int hl = ns_node_height(n->left), hr = ns_node_height(n->right);
+    n->height = 1 + (hl > hr ? hl : hr);
+}
+
+static int ns_node_balance(const ns_suffix_node_t *n)
+{
+    return n ? ns_node_height(n->left) - ns_node_height(n->right) : 0;
+}
+
+static ns_suffix_node_t *ns_rotate_right(ns_suffix_node_t *y)
+{
+    ns_suffix_node_t *x = y->left;
+    y->left = x->right;
+    x->right = y;
+    ns_node_fix_height(y);
+    ns_node_fix_height(x);
+    return x;
+}
+
+static ns_suffix_node_t *ns_rotate_left(ns_suffix_node_t *x)
+{
+    ns_suffix_node_t *y = x->right;
+    x->right = y->left;
+    y->left = x;
+    ns_node_fix_height(x);
+    ns_node_fix_height(y);
+    return y;
+}
+
+static ns_suffix_node_t *ns_rebalance(ns_suffix_node_t *n)
+{
+    ns_node_fix_height(n);
+    int b = ns_node_balance(n);
+    if (b > 1) {
+        if (ns_node_balance(n->left) < 0) n->left = ns_rotate_left(n->left);
+        return ns_rotate_right(n);
+    }
+    if (b < -1) {
+        if (ns_node_balance(n->right) > 0) n->right = ns_rotate_right(n->right);
+        return ns_rotate_left(n);
+    }
+    return n;
+}
+
+/* Allocate a node owning a copy of the key, all-or-nothing: either a fully
+ * initialized node or NULL with nothing allocated. */
+static ns_suffix_node_t *ns_node_create(const moq_alloc_t *alloc,
+                                        const uint8_t *key, size_t key_len)
+{
+    ns_suffix_node_t *n =
+        (ns_suffix_node_t *)alloc->alloc(sizeof(*n), alloc->ctx);
+    if (!n) return NULL;
+    uint8_t *copy = (uint8_t *)alloc->alloc(key_len, alloc->ctx);
+    if (!copy) {
+        alloc->free(n, sizeof(*n), alloc->ctx);
+        return NULL;
+    }
+    memcpy(copy, key, key_len);
+    n->data = copy;
+    n->len = key_len;
+    n->left = n->right = NULL;
+    n->height = 1;
+    return n;
+}
+
+static void ns_node_destroy(const moq_alloc_t *alloc, ns_suffix_node_t *n)
+{
+    alloc->free(n->data, n->len, alloc->ctx);
+    alloc->free(n, sizeof(*n), alloc->ctx);
+}
+
+static void ns_node_free_all(const moq_alloc_t *alloc, ns_suffix_node_t *n)
+{
+    if (!n) return;
+    ns_node_free_all(alloc, n->left);
+    ns_node_free_all(alloc, n->right);
+    ns_node_destroy(alloc, n);
+}
+
 static bool ns_suffix_set_contains(const ns_suffix_set_t *set,
                                     const uint8_t *key, size_t key_len)
 {
-    for (size_t i = 0; i < set->count; i++)
-        if (ns_suffix_key_eq(&set->keys[i], key, key_len))
-            return true;
+    const ns_suffix_node_t *n = set->root;
+    while (n) {
+        int c = ns_suffix_key_cmp(key, key_len, n->data, n->len);
+        if (c == 0) return true;
+        n = c < 0 ? n->left : n->right;
+    }
     return false;
+}
+
+/* Link a pre-created node whose key is known absent (caller checked via
+ * contains). Rebalancing only reshapes existing nodes, so this never allocates
+ * and cannot fail. */
+static ns_suffix_node_t *ns_node_insert(ns_suffix_node_t *root,
+                                        ns_suffix_node_t *node)
+{
+    if (!root) return node;
+    int c = ns_suffix_key_cmp(node->data, node->len, root->data, root->len);
+    if (c < 0) root->left = ns_node_insert(root->left, node);
+    else       root->right = ns_node_insert(root->right, node);
+    return ns_rebalance(root);
+}
+
+static ns_suffix_node_t *ns_node_min(ns_suffix_node_t *n)
+{
+    while (n && n->left) n = n->left;
+    return n;
+}
+
+/* Detach the node matching (key,key_len) from the subtree; sets *removed to the
+ * detached node (caller frees) and returns the rebalanced subtree root. No
+ * allocation. */
+static ns_suffix_node_t *ns_node_remove(ns_suffix_node_t *root,
+                                        const uint8_t *key, size_t key_len,
+                                        ns_suffix_node_t **removed)
+{
+    if (!root) return NULL;
+    int c = ns_suffix_key_cmp(key, key_len, root->data, root->len);
+    if (c < 0) {
+        root->left = ns_node_remove(root->left, key, key_len, removed);
+    } else if (c > 0) {
+        root->right = ns_node_remove(root->right, key, key_len, removed);
+    } else {
+        if (!root->left || !root->right) {
+            ns_suffix_node_t *child = root->left ? root->left : root->right;
+            *removed = root;      /* detach; caller frees */
+            root = child;
+        } else {
+            /* Two children: swap key ownership with the in-order successor
+             * (min of the right subtree), then delete the successor node -- so
+             * the detached node carries the original target's key bytes. */
+            ns_suffix_node_t *succ = ns_node_min(root->right);
+            uint8_t *td = root->data; size_t tl = root->len;
+            root->data = succ->data; root->len = succ->len;
+            succ->data = td;         succ->len = tl;
+            root->right = ns_node_remove(root->right, td, tl, removed);
+        }
+    }
+    if (!root) return NULL;
+    return ns_rebalance(root);
+}
+
+/* The minimum key node (deterministic cursor for terminal synthesis), or NULL
+ * on an empty set. */
+static const ns_suffix_node_t *ns_suffix_set_min(const ns_suffix_set_t *set)
+{
+    return ns_node_min(set->root);
 }
 
 static bool ns_suffix_set_add(ns_suffix_set_t *set,
@@ -92,27 +271,10 @@ static bool ns_suffix_set_add(ns_suffix_set_t *set,
                                bool *out_inserted)
 {
     if (out_inserted) *out_inserted = false;
-    if (ns_suffix_set_contains(set, key, key_len)) return true;
-    if (set->count >= set->cap) {
-        size_t new_cap = set->cap ? set->cap * 2 : NS_SUF_INIT_CAP;
-        size_t new_size = new_cap * sizeof(ns_suffix_key_t);
-        ns_suffix_key_t *nk;
-        if (set->keys) {
-            nk = (ns_suffix_key_t *)alloc->realloc(
-                set->keys, set->cap * sizeof(ns_suffix_key_t),
-                new_size, alloc->ctx);
-        } else {
-            nk = (ns_suffix_key_t *)alloc->alloc(new_size, alloc->ctx);
-        }
-        if (!nk) return false;
-        set->keys = nk;
-        set->cap = new_cap;
-    }
-    uint8_t *copy = (uint8_t *)alloc->alloc(key_len, alloc->ctx);
-    if (!copy) return false;
-    memcpy(copy, key, key_len);
-    set->keys[set->count].data = copy;
-    set->keys[set->count].len = key_len;
+    if (ns_suffix_set_contains(set, key, key_len)) return true;  /* dup: no change */
+    ns_suffix_node_t *node = ns_node_create(alloc, key, key_len);
+    if (!node) return false;                                     /* all-or-nothing */
+    set->root = ns_node_insert(set->root, node);
     set->count++;
     if (out_inserted) *out_inserted = true;
     return true;
@@ -122,27 +284,20 @@ static bool ns_suffix_set_remove(ns_suffix_set_t *set,
                                   const moq_alloc_t *alloc,
                                   const uint8_t *key, size_t key_len)
 {
-    for (size_t i = 0; i < set->count; i++) {
-        if (ns_suffix_key_eq(&set->keys[i], key, key_len)) {
-            alloc->free(set->keys[i].data, set->keys[i].len, alloc->ctx);
-            set->keys[i] = set->keys[--set->count];
-            return true;
-        }
-    }
-    return false;
+    ns_suffix_node_t *removed = NULL;
+    set->root = ns_node_remove(set->root, key, key_len, &removed);
+    if (!removed) return false;
+    set->count--;
+    ns_node_destroy(alloc, removed);
+    return true;
 }
 
 static void ns_suffix_set_free(ns_suffix_set_t *set,
                                 const moq_alloc_t *alloc)
 {
-    for (size_t i = 0; i < set->count; i++)
-        alloc->free(set->keys[i].data, set->keys[i].len, alloc->ctx);
-    if (set->keys)
-        alloc->free(set->keys, set->cap * sizeof(ns_suffix_key_t),
-                     alloc->ctx);
-    set->keys = NULL;
+    ns_node_free_all(alloc, set->root);
+    set->root = NULL;
     set->count = 0;
-    set->cap = 0;
     set->counted_bytes = 0;
 }
 
@@ -155,9 +310,9 @@ static void ns_suffix_set_free(ns_suffix_set_t *set,
 typedef enum {
     NS_SUF_DUP        = 0,   /* already present; no change, no charge */
     NS_SUF_INSERTED   = 1,   /* inserted; receive budget charged */
-    /* Allocation failure. The set, its capacity, the counters and the receive
-     * budget are exactly as they were on entry, but nothing the session can do
-     * makes memory appear, so this is an error rather than a wait. */
+    /* Allocation failure. The set, its counters and the receive budget are
+     * exactly as they were on entry, but nothing the session can do makes
+     * memory appear, so this is an error rather than a wait. */
     NS_SUF_NOMEM      = -1,
     NS_SUF_OVER_BUDGET = -2, /* would exceed receive budget (caller must close) */
 } ns_suffix_add_status_t;
@@ -169,81 +324,50 @@ static void ns_recv_budget_release(moq_session_t *s, size_t n)
                                 ? s->recv_payload_bytes - n : 0;
 }
 
-/* Insert one counted key, all-or-nothing: either the key is present and the
- * capacity growth plus key bytes are charged, or the set, its counters and the
- * receive budget are exactly as they were on entry.
- *
- * The whole requirement -- the capacity delta this insert needs and the copied
- * key bytes -- is weighed against the budget once, before either allocation, so
- * an insert can never grow the array and then refuse the key it grew for. The
- * key copy is taken FIRST: a growth failure after it can free the copy, while a
- * copy failure after a committed realloc could not put the old array back. */
+/* Insert one counted key, all-or-nothing: either the key is present and its
+ * copied key bytes are charged to the receive budget (the node count is bounded
+ * separately by the per-subscription suffix cap), or the set, its counters and
+ * the receive budget are exactly as they were on entry. The charge is weighed
+ * against the budget once, BEFORE the single node allocation, so an insert can
+ * never allocate and then refuse the key it allocated for. */
 static ns_suffix_add_status_t ns_suffix_set_add_counted(
     moq_session_t *s, ns_suffix_set_t *set,
     const uint8_t *key, size_t key_len)
 {
     if (ns_suffix_set_contains(set, key, key_len)) return NS_SUF_DUP;
 
-    size_t new_cap = set->cap;
-    size_t grow = 0;
-    if (set->count >= set->cap) {
-        new_cap = set->cap ? set->cap * 2 : NS_SUF_INIT_CAP;
-        if (new_cap < set->cap ||
-            new_cap > SIZE_MAX / sizeof(ns_suffix_key_t))
-            return NS_SUF_OVER_BUDGET;
-        grow = (new_cap - set->cap) * sizeof(ns_suffix_key_t);
-    }
-    size_t need, projected;
-    if (!ns_size_add(grow, key_len, &need) ||
-        !ns_size_add(s->recv_payload_bytes, need, &projected) ||
+    /* Charge the copied key bytes to the receive budget (the node count is
+     * bounded separately by the per-subscription suffix cap). */
+    size_t need = key_len, projected;
+    if (!ns_size_add(s->recv_payload_bytes, need, &projected) ||
         projected > s->max_recv_buf)
         return NS_SUF_OVER_BUDGET;
 
-    /* A key always carries at least its part count, so a zero-length key cannot
-     * reach here and a NULL copy is a real allocation failure. */
-    uint8_t *copy = (uint8_t *)s->alloc.alloc(key_len, s->alloc.ctx);
-    if (!copy) return NS_SUF_NOMEM;
-    memcpy(copy, key, key_len);
+    ns_suffix_node_t *node = ns_node_create(&s->alloc, key, key_len);
+    if (!node) return NS_SUF_NOMEM;   /* set and counters untouched */
 
-    if (grow > 0) {
-        size_t new_size = new_cap * sizeof(ns_suffix_key_t);
-        ns_suffix_key_t *nk = set->keys
-            ? (ns_suffix_key_t *)s->alloc.realloc(set->keys,
-                  set->cap * sizeof(ns_suffix_key_t), new_size, s->alloc.ctx)
-            : (ns_suffix_key_t *)s->alloc.alloc(new_size, s->alloc.ctx);
-        if (!nk) {
-            s->alloc.free(copy, key_len, s->alloc.ctx);
-            return NS_SUF_NOMEM;   /* old array and counters untouched */
-        }
-        set->keys = nk;
-        set->cap = new_cap;
-    }
-
-    set->keys[set->count].data = copy;
-    set->keys[set->count].len = key_len;
+    set->root = ns_node_insert(set->root, node);
     set->count++;
     set->counted_bytes += need;
     s->recv_payload_bytes += need;
     return NS_SUF_INSERTED;
 }
 
-/* Remove a counted key, releasing its copied-key bytes from the receive budget.
- * Array capacity stays allocated (and counted) until the set is freed. */
+/* Remove a counted key, releasing exactly its charged key bytes from the receive
+ * budget (recomputed from the removed node's own key length). */
 static bool ns_suffix_set_remove_counted(moq_session_t *s, ns_suffix_set_t *set,
                                          const uint8_t *key, size_t key_len)
 {
-    for (size_t i = 0; i < set->count; i++) {
-        if (ns_suffix_key_eq(&set->keys[i], key, key_len)) {
-            size_t klen = set->keys[i].len;
-            s->alloc.free(set->keys[i].data, klen, s->alloc.ctx);
-            set->keys[i] = set->keys[--set->count];
-            set->counted_bytes = klen <= set->counted_bytes
-                                     ? set->counted_bytes - klen : 0;
-            ns_recv_budget_release(s, klen);
-            return true;
-        }
-    }
-    return false;
+    ns_suffix_node_t *removed = NULL;
+    set->root = ns_node_remove(set->root, key, key_len, &removed);
+    if (!removed) return false;
+    size_t charge = removed->len;      /* same amount charged on insert */
+    set->count--;
+    set->counted_bytes = charge <= set->counted_bytes
+                             ? set->counted_bytes - charge : 0;
+    ns_recv_budget_release(s, charge);
+    ns_node_destroy(&s->alloc, removed);
+    return true;
 }
 
 /* -- Prefix helpers (shared with the track-sub pool) --------------- */
@@ -470,12 +594,19 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot)
         e->announced_suffixes = NULL;
     }
     e->announced_suffixes_inbound = false;
+    e->suffix_cap_terminating = false;  /* selective free: the cap-terminal marker
+                                         * must never follow the slot to its next
+                                         * owner (proves no stale cap state on
+                                         * reuse) */
     e->goaway_sent = false;   /* selective free: clear the migration marker so a
                                * reused slot is never seen as already migrated */
     e->handoff_fin_pending = false;   /* same reason: this pool resets named
                                        * fields, so the transitional FIN fact
                                        * must not follow the slot to its next
                                        * owner */
+    e->local_teardown_pending = false;   /* selective free: a completed or
+                                          * reused slot must not carry a stale
+                                          * teardown obligation (#245c) */
     e->state = MOQ_NS_SUB_FREE;
     e->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
     memset(&e->request_ep, 0, sizeof(e->request_ep));
@@ -680,12 +811,12 @@ moq_result_t moq_session_subscribe_namespace(
  * `peer_fin_observed` is the caller's cumulative fact for this owner.
  *
  * This helper mutates nothing before its capacity reservations succeed, so a
- * WOULD_BLOCK leaves the session exactly as it was. That is NOT the same as the
- * ingress operation being retryable: the caller neither retains the extra bytes
- * that reached this terminal nor records the teardown obligation anywhere, so
- * the documented empty re-feed cannot resume the operation -- and no peer bytes
- * are ever re-delivered to recover it either. Giving the operation a durable
- * carrier -- retained bytes, or a private marker -- is a separate correction. */
+ * WOULD_BLOCK leaves the session exactly as it was. The obligation to retry is
+ * durable in the OWNER, not here: the caller latches `local_teardown_pending`
+ * (and, for a same-call FIN, the cumulative `pending_fin`) before this helper's
+ * capacity refusal, so the documented empty re-feed re-enters and completes the
+ * teardown with no peer bytes re-delivered (#245c). The extra bytes that reached
+ * this terminal are deliberately NOT buffered -- the marker is the carrier. */
 static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot,
                                           bool peer_fin_observed)
 {
@@ -1124,12 +1255,27 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
          * has no post-request message, so extra bytes are a protocol violation. */
         if (e->state == MOQ_NS_SUB_PENDING_PUBLISHER ||
             e->state == MOQ_NS_SUB_ESTABLISHED) {
-            if (len > 0) {
-                if (moq_session_uses_request_streams(s))
+            /* Extra bytes -- or a re-feed of a teardown already owed. The
+             * teardown closes just this bidi (§10.9.1), so the bytes are NOT
+             * buffered; instead the OBLIGATION is made durable before the
+             * attempt, and the documented empty re-feed re-drives it with no
+             * peer-byte redelivery (#245c). The cumulative FIN is part of that
+             * obligation: it drives the teardown's drain selection (#249), so it
+             * too is latched in session-owned state before any capacity refusal
+             * -- otherwise the empty re-feed (fin=false) would recompute a drain
+             * the peer's already-closed send half made unnecessary and stall it
+             * against a full ring forever. */
+            if (len > 0 || e->local_teardown_pending) {
+                if (moq_session_uses_request_streams(s)) {
+                    e->local_teardown_pending = true;
+                    if (fin) e->pending_fin = true;
                     return ns_sub_local_teardown(s, (size_t)ns_slot,
                                                  ns_sub_fin_observed(e, fin));
-                return close_with_error(s, 0x3,
-                    "extra bytes on bidi stream after request");
+                }
+                if (len > 0)
+                    return close_with_error(s, 0x3,
+                        "extra bytes on bidi stream after request");
+                return MOQ_OK;
             }
             /* §2249: the subscriber cancels SUBSCRIBE_NAMESPACE by closing its
              * send half with a FIN or RESET. A stream-correlated profile
@@ -1492,26 +1638,43 @@ static bool ns_suffix_key_decode(const ns_suffix_key_t *key,
     return true;
 }
 
-/* §10.18: a FIN or a reset on the SUBSCRIBE_NAMESPACE response stream is
- * treated as though every still-active namespace received a NAMESPACE_DONE.
+/* Terminal synthesis for the inbound SUBSCRIBE_NAMESPACE response stream: every
+ * still-active suffix receives a NAMESPACE_GONE, then the owner is retired. Two
+ * triggers share this deterministic cursor, with different physical-stream
+ * obligations:
+ *
+ *  - §10.18 FIN/reset: the peer's send half is already gone, so no drain carrier
+ *    is owed (`install_drain` false). `close_half` is true only for FIN -- a
+ *    reset's ingress owns the physical teardown.
+ *  - the per-subscription suffix-cap terminal: WE proactively retire the bidi
+ *    while the peer's send half may still be live. Unless the over-cap message
+ *    itself carried FIN, the caller passes `install_drain` true so a normal drain
+ *    reference on the freed ref absorbs late peer bytes (the generic request path
+ *    consults the drain ring first) and a late FIN releases it -- the session
+ *    stays ESTABLISHED. If the over-cap message carried FIN, the peer half is
+ *    already gone and no carrier is owed.
  *
  * The active suffix set is the durable cursor: each outcome is queued first and
- * the suffix deactivated only then, so an event-capacity refusal resumes
- * exactly where it stopped without repeating or losing one. `close_half` is
- * true only for FIN -- a reset's ingress owns the physical teardown -- and
- * neither path takes a drain reference, because the peer's send half is
- * already gone. */
+ * the suffix deactivated only then, so an event-capacity refusal resumes exactly
+ * where it stopped without repeating or losing one. Both the close action slot
+ * and the drain slot are reserved BEFORE the first outcome, so a refusal (full
+ * action queue or full drain ring) emits nothing. */
 static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
-                                             bool close_half)
+                                             bool close_half, bool install_drain)
 {
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
 
-    /* The close is owed as soon as the terminal completes, so its action slot
-     * is reserved before the first outcome: the bidi must never close while
-     * outcomes are still owed, and a refusal here must not have emitted any. */
-    bool want_close = close_half && moq_session_uses_request_streams(s) &&
-                      e->stream_ref._v != 0;
+    bool req_streams = moq_session_uses_request_streams(s) &&
+                       e->stream_ref._v != 0;
+    /* The close and the drain carrier are owed as soon as the terminal
+     * completes, so both slots are reserved before the first outcome: the bidi
+     * must never close (or leave a live peer half uncarried) while outcomes are
+     * still owed, and a refusal here must not have emitted any. */
+    bool want_close = close_half && req_streams;
+    bool want_drain = install_drain && req_streams;
     if (want_close && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (want_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
 
     /* Only the inbound, peer-announced set is synthesized. The publisher-side
      * set records what we announced to a subscriber and owes nothing here. */
@@ -1521,9 +1684,15 @@ static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
     while (set && set->count > 0) {
         if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
+        /* Deterministic cursor: the minimum key. Each round queues its GONE and
+         * removes exactly that key, so an event-capacity refusal resumes at the
+         * next minimum without repeating or losing one. */
+        const ns_suffix_node_t *m = ns_suffix_set_min(set);
+        ns_suffix_key_t k0 = { m->data, m->len };
+
         moq_bytes_t parts[MOQ_DECODED_MAX_NAMESPACE_PARTS];
         moq_namespace_t suffix;
-        if (!ns_suffix_key_decode(&set->keys[0], parts,
+        if (!ns_suffix_key_decode(&k0, parts,
                                   MOQ_DECODED_MAX_NAMESPACE_PARTS, &suffix))
             return close_with_error(s, 0x1, "corrupt namespace suffix key");
 
@@ -1548,13 +1717,13 @@ static moq_result_t ns_sub_response_terminal(moq_session_t *s, size_t slot,
             s->event_scratch_len = scratch_save;
             return rc;
         }
-        /* Removal swaps the last key into the freed slot, so the next round
-         * reads the live set rather than a stale index. */
-        ns_suffix_set_remove_counted(s, set, set->keys[0].data,
-                                     set->keys[0].len);
+        /* Remove exactly the key just surfaced; the next round recomputes the
+         * minimum of the live tree. m stays valid until this call frees it. */
+        ns_suffix_set_remove_counted(s, set, m->data, m->len);
     }
 
     if (want_close) (void)queue_close_bidi(s, e->stream_ref);
+    if (want_drain) (void)drain_ref_add(s, e->stream_ref);   /* slot reserved above */
     ns_sub_free_entry(s, slot);
     return MOQ_OK;
 }
@@ -1579,6 +1748,15 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                                                 int32_t slot)
 {
     moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+
+    /* A per-subscription suffix-cap terminal in progress owns this entry: resume
+     * synthesizing NAMESPACE_GONE from the tree cursor rather than re-decoding
+     * the buffered over-cap NAMESPACE (whose bytes are abandoned with the
+     * entry). Set before the first GONE, so an event/action-capacity block that
+     * returned WOULD_BLOCK resumes here on the empty re-feed. */
+    if (e->suffix_cap_terminating)
+        return ns_sub_response_terminal(s, (size_t)slot, true,
+                                        !e->pending_fin);
 
     while (e->recv_len > 0) {
         moq_decoded_ns_sub_response_t resp;
@@ -1736,6 +1914,27 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                 }
             }
 
+            /* Per-subscription active-suffix cap (in addition to the receive
+             * budget). A NEW unique NAMESPACE that would exceed the cap is not
+             * admitted and surfaces no FOUND; instead the offending bidi is
+             * retired by synthesizing NAMESPACE_GONE for the active suffixes,
+             * with the session staying ESTABLISHED. A duplicate NAMESPACE (or a
+             * NAMESPACE_DONE) never grows the set, so it is unaffected. */
+            if (resp.kind == MOQ_NS_RESP_NAMESPACE) {
+                ns_suffix_set_t *set =
+                    (ns_suffix_set_t *)e->announced_suffixes;
+                if (set && set->count >= s->max_ns_suffixes &&
+                    !ns_suffix_set_contains(set, skey_buf, skey_len)) {
+                    s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                    e->suffix_cap_terminating = true;
+                    /* No drain if the over-cap message itself carried FIN (peer
+                     * send half already gone); otherwise a drain carrier absorbs
+                     * the still-live peer half. */
+                    return ns_sub_response_terminal(s, (size_t)slot, true,
+                                                    !e->pending_fin);
+                }
+            }
+
             if (event_queue_full(s)) {
                 s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
                 return MOQ_ERR_WOULD_BLOCK;
@@ -1842,7 +2041,7 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
      * subscription (§10.18); the latch survives every refusal, so an ordinary
      * empty re-feed resumes the terminal. */
     if (e->pending_fin)
-        return ns_sub_response_terminal(s, (size_t)slot, true);
+        return ns_sub_response_terminal(s, (size_t)slot, true, false);
     return MOQ_OK;
 }
 
@@ -1914,8 +2113,17 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
          * refusal here is retried through the same reset input. STOP_SENDING
          * keeps retiring the owner outright. */
         if (reset)
-            return ns_sub_response_terminal(s, (size_t)ns_slot, false);
+            return ns_sub_response_terminal(s, (size_t)ns_slot, false, false);
         ns_sub_free_entry(s, (size_t)ns_slot);
+        return MOQ_OK;
+    }
+    /* A no-owner no-slot admission carrier (#245b): the request had no request
+     * registry owner, only a bounded carrier holding its retry identity. The
+     * peer's RESET/STOP terminates that request (§3.3.2, §11.4.1), so retire the
+     * exact carrier and send no now-obsolete REQUEST_ERROR/STOP+RESET terminal.
+     * Only this ref's carrier is touched; an unrelated carrier is left intact. */
+    if (noslot_carrier_find(s, stream_ref) >= 0) {
+        noslot_carrier_remove(s, stream_ref);
         return MOQ_OK;
     }
     return request_stream_teardown(s, stream_ref);

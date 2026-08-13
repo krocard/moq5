@@ -1589,9 +1589,10 @@ static moq_result_t d18_process_request_stream(
         /* Hand the request off to the namespace-sub pool, then drive the shared
          * ns_sub commit. Buffer the full message into a fresh ns_sub entry (keyed
          * in idx_ns_by_ref, which owns the bidi from here) and process it; the
-         * core releases this generic staging slot once the bytes are reported
-         * consumed. A WOULD_BLOCK keeps the staging buffer and the (already
-         * created) ns_sub entry for a re-feed -- the idx_ns_by_ref lookup makes
+         * core releases this generic staging slot once the ns_sub entry owns the
+         * bidi -- including on a WOULD_BLOCK, which the index-first router sends
+         * to the ns_sub path, never back here. The retry is therefore carried by
+         * the ns_sub entry, not this staging slot; the idx_ns_by_ref lookup makes
          * the create idempotent. The decode (and any malformed-token close) lives
          * in the ns_sub profile op driven by the shared handler. */
         size_t msg_len = moq_buf_reader_offset(&r);

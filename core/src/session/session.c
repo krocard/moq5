@@ -1740,6 +1740,13 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (ns_sub_cap > 0xFFFF) return MOQ_ERR_INVAL;
     size_t ns_sub_recv_cap = recv_cap < 4096 ? recv_cap : 4096;
 
+    /* Per-subscription active peer-announced suffix cap; 0 = default. Applies
+     * in addition to the receive-byte budget, not instead of it. */
+    size_t max_ns_suffixes = cfg_read_u32(cfg,
+        offsetof(moq_session_cfg_t, max_namespace_suffixes_per_subscription),
+        sizeof(cfg->max_namespace_suffixes_per_subscription));
+    if (!max_ns_suffixes) max_ns_suffixes = MOQ_DEFAULT_MAX_NS_SUFFIXES;
+
     size_t track_sub_cap = cfg_read_u32(cfg,
         offsetof(moq_session_cfg_t, max_track_subscriptions),
         sizeof(cfg->max_track_subscriptions));
@@ -1920,7 +1927,19 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
                                     _Alignof(max_align_t));
     size_t prof_align  = profile->state_align > 0 ? profile->state_align : 1;
     size_t off_profile = ALIGN_UP(off_evscratch + scratch_cap, prof_align);
-    size_t total       = off_profile + profile->state_size;
+    /* No-owner admission carriers (#245b). Allocated in the session arena at
+     * create time so installing one during ingress can NEVER fail on
+     * allocation: a refused no-owner request bidi always has a durable,
+     * discoverable retry identity, so the bridge never fatalizes a retainable
+     * WOULD_BLOCK. Bounded by the same total request-owner lifecycle capacity
+     * as the drain ring -- the carrier's own landing spot for a no-FIN refusal
+     * -- rather than an arbitrary floor. */
+    size_t off_noslot_carrier = ALIGN_UP(off_profile + profile->state_size,
+                                         _Alignof(moq_noslot_carrier_t));
+    size_t noslot_carrier_cap = drain_ref_cap;
+    size_t noslot_carrier_bytes =
+        noslot_carrier_cap * sizeof(moq_noslot_carrier_t);
+    size_t total       = off_noslot_carrier + noslot_carrier_bytes;
 
 #undef ALIGN_UP
 
@@ -1971,7 +1990,10 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         off_scratch < off_pub_req_recv ||
         off_evscratch < off_scratch ||
         off_profile < off_evscratch ||
-        total < off_profile ||
+        noslot_carrier_bytes / sizeof(moq_noslot_carrier_t) !=
+            noslot_carrier_cap ||
+        off_noslot_carrier < off_profile ||
+        total < off_noslot_carrier ||
         total > (size_t)64 * 1024 * 1024)
         return MOQ_ERR_INVAL;
 
@@ -1997,6 +2019,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->recv_cap   = recv_cap;
     s->subs       = (moq_sub_entry_t *)(mem + off_subs);
     s->sub_cap    = sub_cap;
+    /* No-slot admission carriers (#245b): arena-backed (never allocation-fails
+     * during ingress), bounded by the total request-owner lifecycle capacity. */
+    s->noslot_carriers      = (moq_noslot_carrier_t *)(mem + off_noslot_carrier);
+    s->noslot_carrier_cap   = noslot_carrier_cap;
+    s->noslot_carrier_count = 0;
     s->announcements = (moq_ann_entry_t *)(mem + off_ann);
     s->ann_cap    = ann_cap;
     s->fetches    = (moq_fetch_entry_t *)(mem + off_fetch);
@@ -2036,6 +2063,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         s->idx_rx_by_ref[i].slot = -1;
     s->ns_subs        = (moq_ns_sub_entry_t *)(mem + off_ns_sub);
     s->ns_sub_cap     = ns_sub_cap;
+    s->max_ns_suffixes = max_ns_suffixes;
     s->idx_ns_by_ref  = (moq_index_entry_t *)(mem + off_idx_ns);
     s->idx_ns_mask    = idx_ns_cap - 1;
     for (size_t i = 0; i < idx_ns_cap; i++)
@@ -2224,6 +2252,8 @@ void moq_session_destroy(moq_session_t *s)
     }
     ns_sub_destroy_all(s);
     track_sub_destroy_all(s);
+    /* noslot_carriers is arena-backed (part of the session slab); no separate
+     * free -- the slab free below reclaims it. */
     moq_alloc_t alloc = s->alloc;
     alloc.free(s, s->alloc_size, alloc.ctx);
 }
@@ -2676,6 +2706,45 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
         return true;
     if (moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v) >= 0)
+        return true;
+    /* A stream-correlated (draft-18) request bidi whose staging/response owner
+     * is keyed by stream ref: recognised through the request registry's
+     * by-streamref lookup, which returns the packed endpoint the registry holds
+     * for that ref. Without this, a retained request-stream WOULD_BLOCK is
+     * fatalized by the bridge (#245a). The lookup reports whatever ownership the
+     * registry carries for the ref; it does not independently revalidate a
+     * stale slot (the ordinal-0 cross-owner question is #252, out of scope). */
+    if (request_registry_find_by_streamref(s, ref).kind != MOQ_REQ_NONE)
+        return true;
+    /* A no-slot admission carrier (#245b): the request has no owner yet, but a
+     * fixed terminal is durably owed on this stream, so the bridge must retain
+     * its retry rather than fatalize it. */
+    if (noslot_carrier_find(s, ref) >= 0)
+        return true;
+    /* A locally-terminated request bidi still in the drain ring: the owner is
+     * gone but the stream stays live until the peer's FIN/RESET, which the
+     * drain ring absorbs. */
+    if (drain_ref_contains(s, ref))
+        return true;
+    return false;
+}
+
+/* The bridge's narrower question for the local-closed retirement decision: is
+ * the PEER's terminal still owed here? This excludes a live request-registry
+ * owner -- a local-origin request bidi the app itself FIN'd must retire even
+ * while its owner lingers awaiting a response -- but keeps the peer-origin
+ * receive paths and the two #245 peer-terminal-awaiting signals. */
+bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
+                                             moq_stream_ref_t ref)
+{
+    if (!s) return false;
+    if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
+        return true;
+    if (moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v) >= 0)
+        return true;
+    if (noslot_carrier_find(s, ref) >= 0)
+        return true;
+    if (drain_ref_contains(s, ref))
         return true;
     return false;
 }

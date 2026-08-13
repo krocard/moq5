@@ -1032,7 +1032,7 @@ static int nf_rows(void)
         want.suffixes = (const void *)1;
         want.suffixes_inbound = 1;
         const size_t want_budget =
-            budget0 + NF_SUFFIX_ARRAY_CHARGE + nf_suffix_charge(kA1);
+            budget0 + nf_suffix_charge(kA1);
 
         failures += nf_announce(&f, kA0, kA1, "R1 announce");
 
@@ -1086,12 +1086,13 @@ static int nf_rows(void)
         nf_drain_t d1;
         MOQ_TEST_CHECK(nf_drain_snap(f.c, &d1) == 0);
         failures += nf_drain_equals(&d1, &d0, "R2");
-        /* Deactivating a suffix returns its key bytes; the tracker's array
-         * growth stays charged until the owner is freed
-         * (session_namespace_sub.c:462-468), so the budget lands strictly
-         * between the two -- and R3/R4 pin the exact return at retirement. */
+        /* Deactivating a suffix returns exactly its charged key bytes. The
+         * ordered-tree membership charges only key bytes (its per-node overhead
+         * is bounded by the suffix cap, not the byte budget), so removing the
+         * only tracked suffix returns the budget fully to its pre-announce
+         * value. */
         MOQ_TEST_CHECK(f.c->recv_payload_bytes < budget_active);
-        MOQ_TEST_CHECK(f.c->recv_payload_bytes > budget0);
+        MOQ_TEST_CHECK_EQ_SIZE(f.c->recv_payload_bytes, budget0);
 
         /* Membership probe in the negative direction: the suffix is gone, so
          * a repeat NAMESPACE_DONE is the §10.18 ordering violation. */
@@ -1462,7 +1463,7 @@ static int nf_rows(void)
         want.suffixes_inbound = 1;
         want.recv_len = 0;
         want.recv_bytes_len = 0;
-        const size_t charge = NF_SUFFIX_ARRAY_CHARGE + nf_suffix_charge(kA1);
+        const size_t charge = nf_suffix_charge(kA1);
         MOQ_TEST_CHECK(charge <= SIZE_MAX - budget0);
         const size_t budget_want = budget0 + charge;
 
