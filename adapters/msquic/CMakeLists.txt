@@ -357,6 +357,31 @@ if(MOQ_BUILD_TESTS)
                 TIMEOUT 120)
         endif()
 
+        # Managed settings policy: the listener's pinned path MTU. Compiles
+        # the adapter + managed sources directly (test seams on) so it asserts
+        # the SAME settings construction the create path hands to
+        # ConfigurationOpen(), not a reconstruction. Pure assertions -- no
+        # socket, no certificates, no transport.
+        add_executable(test_msquic_settings
+            tests/test_msquic_settings.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_settings PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_settings PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_settings PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_settings PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_settings COMMAND test_msquic_settings)
+        set_tests_properties(msquic_settings PROPERTIES
+            LABELS "msquic" TIMEOUT 30)
+
         # Cross-lane doorbell wake delivery: the check->wait race, prompt
         # sub-idle-cap consumption, bidirectional wakes, coalescing, cause
         # classification, and wake-vs-stop. Needs the doorbell

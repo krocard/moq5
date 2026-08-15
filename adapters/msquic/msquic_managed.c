@@ -1080,6 +1080,82 @@ void moq_msquic_managed_cfg_init_sized(moq_msquic_managed_cfg_t *cfg,
     cfg->struct_size = (uint32_t)size;
 }
 
+/*
+ * Path MTU the managed LISTENER pins, in IP-packet bytes.
+ *
+ * 1280 is a PATH MTU, not a UDP payload size. Subtracting the protocol headers
+ * gives the UDP payloads it actually caps:
+ *
+ *     IPv4: 1280 - 20 (IPv4 header) - 8 (UDP header) = 1252
+ *     IPv6: 1280 - 40 (IPv6 header) - 8 (UDP header) = 1232
+ *
+ * Those are the RFC's own numbers: §14 assumes a minimum IP packet size of
+ * 1280 bytes, which is where 1252 and 1232 come from.
+ *
+ * Why a listener needs it. A client may open with an Initial that carries no
+ * ClientHello, so the server's first reply goes out before any peer transport
+ * parameter has been received -- there is no advertised max_udp_payload_size to
+ * consult yet, and §14 warns that sending above 1200 bytes before learning it
+ * risks loss. At MsQuic's default the reply measured 1260 bytes of UDP payload.
+ * The observed peer sent exclusively 1252-byte datagrams and did not process
+ * that reply; its handshake stalled and it retransmitted until it gave up.
+ * Dropping server datagrams above 1252 in a proxy, with no source change, took
+ * that peer from 0/6 to 6/6, and pinning this path MTU reproduces the same
+ * 1252-byte IPv4 cap in the listener itself.
+ *
+ * RFC 9000 §18.2 defines max_udp_payload_size as the largest UDP payload an
+ * endpoint is willing to receive and notes that larger datagrams are unlikely
+ * to be processed; §14 permits a receiver to discard datagrams that exceed its
+ * size constraints and forbids closing the connection solely for that. So the
+ * peer's behavior is permitted, not mandated -- the fix is ours to make because
+ * a conservative listener interoperates and an oversized one does not.
+ *
+ * Why BOTH bounds are set: MaximumMtu and MinimumMtu are both IP-path MTUs, and
+ * this MsQuic revision defaults MinimumMtu to 1288 (QUIC_INITIAL_PACKET_LENGTH
+ * 1240 + 40 IPv6 + 8 UDP). Lowering only the maximum would leave a minimum
+ * greater than the maximum. Pinning both also bounds later DPLPMTUD probing.
+ */
+/* Static in production; externally visible only under the testing seam so a
+ * focused test can assert the SAME construction the create path calls. */
+#ifdef MOQ_MSQUIC_TESTING
+#  define MGD_SETTINGS_LINKAGE
+#else
+#  define MGD_SETTINGS_LINKAGE static
+#endif
+
+#define MGD_LISTENER_PATH_MTU 1280u
+
+/*
+ * The one settings construction the create path uses. Kept as a single
+ * function so the listener MTU policy cannot drift from what is actually
+ * handed to ConfigurationOpen(), and taking the configuration alone so the
+ * perspective it acts on is the configuration's own.
+ *
+ * Precondition, established by moq_msquic_managed_create() before it calls
+ * this: cfg is non-NULL and its perspective is CLIENT or SERVER.
+ */
+MGD_SETTINGS_LINKAGE void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg,
+                                             QUIC_SETTINGS *out)
+{
+    moq_msquic_settings_init(out);
+    if (cfg->idle_timeout_ms != 0) {
+        /* bounds both idle phases, so a dead peer fails within the
+         * configured window whether or not the handshake started */
+        out->IdleTimeoutMs = cfg->idle_timeout_ms;
+        out->IsSet.IdleTimeoutMs = TRUE;
+        out->HandshakeIdleTimeoutMs = cfg->idle_timeout_ms;
+        out->IsSet.HandshakeIdleTimeoutMs = TRUE;
+    }
+    if (cfg->perspective == MOQ_PERSPECTIVE_SERVER) {
+        out->MinimumMtu = MGD_LISTENER_PATH_MTU;
+        out->IsSet.MinimumMtu = TRUE;
+        out->MaximumMtu = MGD_LISTENER_PATH_MTU;
+        out->IsSet.MaximumMtu = TRUE;
+    }
+    /* The managed CLIENT declares no MTU policy: both IsSet bits stay clear so
+     * MsQuic's own defaults apply, exactly as before this listener fix. */
+}
+
 moq_result_t moq_msquic_managed_create(
     const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out)
 {
@@ -1187,15 +1263,7 @@ moq_result_t moq_msquic_managed_create(
     }
 
     QUIC_SETTINGS settings;
-    moq_msquic_settings_init(&settings);
-    if (cfg->idle_timeout_ms != 0) {
-        /* bounds both idle phases, so a dead peer fails within the
-         * configured window whether or not the handshake started */
-        settings.IdleTimeoutMs = cfg->idle_timeout_ms;
-        settings.IsSet.IdleTimeoutMs = TRUE;
-        settings.HandshakeIdleTimeoutMs = cfg->idle_timeout_ms;
-        settings.IsSet.HandshakeIdleTimeoutMs = TRUE;
-    }
+    mgd_build_settings(cfg, &settings);
     QUIC_BUFFER alpn = {
         (uint32_t)strlen(m->alpn),
         (uint8_t *)(uintptr_t)m->alpn,
