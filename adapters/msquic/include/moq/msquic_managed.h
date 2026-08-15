@@ -220,6 +220,29 @@ typedef struct moq_msquic_managed_cfg {
 MOQ_API void moq_msquic_managed_cfg_init_sized(
     moq_msquic_managed_cfg_t *cfg, size_t size);
 
+/* Process-global MTU note (SERVER perspective): creating a managed SERVER
+ * lowers MsQuic's PROCESS-GLOBAL minimum MTU floor to a 1280-byte IP path MTU
+ * (a one-time SetParam on QUIC_PARAM_GLOBAL_SETTINGS). This is required because
+ * a server's first reply to a bare Initial is sized on the pre-configuration
+ * CONNECTION path: the new connection copies MsQuic's library-global settings
+ * and seeds its path MTU before a configuration is attached, so that first reply
+ * is sized from the process-global default (1288) -- the listener configuration
+ * alone does NOT govern it.
+ *
+ * There is no registration-scoped settings parameter, so the floor is
+ * necessarily process-wide. LibMoQ performs NO destroy-time restore: the floor
+ * remains in force while MsQuic stays initialized and another open API table or
+ * registration may depend on it. (MsQuic itself owns global-settings lifetime --
+ * it loads them at the first MsQuicOpen2 reference and may reset them on a later
+ * MsQuicOpen2 after the last MsQuicClose; the next managed-server create simply
+ * reapplies the floor. LibMoQ adds no refcount and no restore.)
+ *
+ * A managed CLIENT create does NOT issue this write, but a client created in the
+ * same process AFTER a managed server inherits the conservative 1280 initial
+ * floor; the client's own configuration still declares no MTU override and no
+ * process-global MAXIMUM is imposed, so DPLPMTUD can still grow the path. If the
+ * global write is rejected, the SERVER create fails closed (MOQ_ERR_INTERNAL,
+ * *out left NULL). */
 MOQ_API moq_result_t moq_msquic_managed_create(
     const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out);
 

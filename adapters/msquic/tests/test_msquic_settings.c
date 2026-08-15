@@ -31,6 +31,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* the managed settings builder (msquic_managed.c, MOQ_MSQUIC_TESTING only) --
@@ -41,6 +42,87 @@
  * that does not carry it. */
 extern void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg,
                                QUIC_SETTINGS *out);
+
+/* 0024: the process-global server MTU floor. `mgd_build_global_server_floor` is
+ * the pure builder for the ONE global write a managed server issues. The seams
+ * below are MOQ_MSQUIC_TESTING-only (absent from the production symbol surface):
+ *
+ *  - moq_msq_test_after_global_write: a post-write probe the create path invokes
+ *    with the LIVE api table immediately after the REAL api->SetParam. It does
+ *    NOT replace the production call, so a mutation of that call (no-op, wrong
+ *    parameter, extra global bound) is caught by reading the settings back with
+ *    GetParam rather than by inspecting a hook's captured arguments.
+ *  - moq_msq_test_force_global_status_active / _force_global_status: override the
+ *    real write's returned status to drive the fail-closed path.
+ *  - moq_msq_test_abort_after_global: tear the create down right after the
+ *    global-floor decision (before RegistrationOpen / any socket).
+ *  - moq_msq_test_registration_reached: set just before RegistrationOpen, so a
+ *    rejected/aborted floor is proven to stop before the registration is opened.
+ */
+extern void mgd_build_global_server_floor(QUIC_SETTINGS *out);
+extern void (*moq_msq_test_after_global_write)(const QUIC_API_TABLE *api);
+extern bool        moq_msq_test_force_global_status_active;
+extern QUIC_STATUS moq_msq_test_force_global_status;
+extern bool        moq_msq_test_abort_after_global;
+extern bool        moq_msq_test_registration_reached;
+
+/* A tracking allocator: exact outstanding-allocation and live-byte balance, so a
+ * create that aborts or fails must drive BOTH back to zero. `*out == NULL` alone
+ * does not prove the facade, lane, and string allocations were released. */
+typedef struct {
+    long   outstanding; /* alloc calls minus free calls */
+    size_t live_bytes;  /* sum of live allocation sizes */
+} track_state_t;
+
+static void *track_alloc(size_t size, void *ctx)
+{
+    track_state_t *t = ctx;
+    void *p = malloc(size);
+    if (p != NULL) { t->outstanding++; t->live_bytes += size; }
+    return p;
+}
+
+static void *track_realloc(void *ptr, size_t old_size, size_t new_size, void *ctx)
+{
+    track_state_t *t = ctx;
+    void *p = realloc(ptr, new_size);
+    if (p != NULL && new_size != 0) {
+        if (ptr == NULL) t->outstanding++;
+        t->live_bytes = t->live_bytes - old_size + new_size;
+    }
+    return p;
+}
+
+static void track_free(void *ptr, size_t size, void *ctx)
+{
+    track_state_t *t = ctx;
+    if (ptr != NULL) { t->outstanding--; t->live_bytes -= size; free(ptr); }
+}
+
+/* Global-settings readback captured by the post-write probe (positive path) from
+ * the live api table, plus the pristine baseline captured before any server
+ * create writes the floor. */
+static int          g_probe_calls;
+static bool         g_probe_readback_ok;
+static QUIC_SETTINGS g_probe_readback;
+
+static void after_global_write_probe(const QUIC_API_TABLE *api)
+{
+    g_probe_calls++;
+    QUIC_SETTINGS got;
+    memset(&got, 0, sizeof(got));
+    uint32_t len = (uint32_t)sizeof(got);
+    QUIC_STATUS st = api->GetParam(NULL, QUIC_PARAM_GLOBAL_SETTINGS, &len, &got);
+    g_probe_readback_ok = QUIC_SUCCEEDED(st) && len == sizeof(got);
+    if (g_probe_readback_ok)
+        g_probe_readback = got;
+}
+
+static int no_pump(moq_msquic_managed_t *m, moq_msquic_managed_lane_t *lane,
+                   uint64_t now_us, void *user)
+{
+    (void)m; (void)lane; (void)now_us; (void)user; return 0;
+}
 
 /* Expected values, owned by this test and written from the interop evidence
  * rather than read back from the product's own constants. */
@@ -193,6 +275,201 @@ int main(void)
         CHECK(s.IsSet.MaximumMtu == TRUE);
         CHECK_EQ_U32(s.MinimumMtu, TS_PATH_MTU);
         CHECK_EQ_U32(s.MaximumMtu, TS_PATH_MTU);
+    }
+
+    /* -- 0024: the PROCESS-GLOBAL server MTU floor (pre-configuration path) -- */
+
+    /* Pure oracle: the global write declares ONLY MinimumMtu = 1280 and nothing
+     * else. The exhaustive memcmp against a hand-zeroed reference (only those two
+     * fields) proves no unrelated bit leaks -- in particular NOT
+     * SendBufferingEnabled, which mgd_build_settings() / moq_msquic_settings_init()
+     * would set. */
+    {
+        QUIC_SETTINGS floor;
+        mgd_build_global_server_floor(&floor);
+        CHECK(floor.IsSet.MinimumMtu == TRUE);
+        CHECK_EQ_U32(floor.MinimumMtu, TS_PATH_MTU);
+        /* no global maximum: DPLPMTUD stays available */
+        CHECK(floor.IsSet.MaximumMtu == FALSE);
+        /* the init helper's bit must NOT leak globally */
+        CHECK(floor.IsSet.SendBufferingEnabled == FALSE);
+        QUIC_SETTINGS ref;
+        memset(&ref, 0, sizeof(ref));
+        ref.MinimumMtu = TS_PATH_MTU;
+        ref.IsSet.MinimumMtu = TRUE;
+        /* exactly one bit, one value, nothing else */
+        CHECK(memcmp(&floor, &ref, sizeof(floor)) == 0);
+    }
+
+    /* Create-path load-bearing, socket-free. The positive probe runs the REAL
+     * api->SetParam and then reads the process-global settings back with
+     * GetParam, so it proves the production call's effect rather than a hook's
+     * captured arguments. A tracking allocator proves each abort/failure
+     * releases everything it allocated. */
+    {
+        moq_msquic_managed_cfg_t scfg;
+        memset(&scfg, 0, sizeof(scfg));
+        scfg.struct_size = (uint32_t)sizeof(scfg);
+        scfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        scfg.on_lane_pump = no_pump;
+        /* never loaded: the create aborts before credential handling */
+        scfg.cert_path = "/nonexistent/cert.pem";
+        scfg.key_path = "/nonexistent/key.pem";
+
+        moq_msquic_managed_cfg_t ccfg;
+        memset(&ccfg, 0, sizeof(ccfg));
+        ccfg.struct_size = (uint32_t)sizeof(ccfg);
+        ccfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        ccfg.on_lane_pump = no_pump;
+        ccfg.host = "127.0.0.1";
+        ccfg.port = 47999;
+        ccfg.insecure_skip_verify = true;
+
+        const moq_alloc_t base_alloc = {
+            .ctx = NULL,
+            .alloc = track_alloc,
+            .realloc = track_realloc,
+            .free = track_free,
+        };
+
+        /* Capture the PRISTINE global-settings baseline from a private api table
+         * before any server create writes the floor. Kept open across the create
+         * tests so MsQuic stays initialized (global state stable), closed at the
+         * end. */
+        const QUIC_API_TABLE *baseline_api = NULL;
+        QUIC_SETTINGS baseline;
+        bool baseline_valid = false;
+        memset(&baseline, 0, sizeof(baseline));
+        if (QUIC_SUCCEEDED(MsQuicOpen2(&baseline_api)) && baseline_api != NULL) {
+            uint32_t len = (uint32_t)sizeof(baseline);
+            if (QUIC_SUCCEEDED(baseline_api->GetParam(
+                    NULL, QUIC_PARAM_GLOBAL_SETTINGS, &len, &baseline)) &&
+                len == sizeof(baseline))
+                baseline_valid = true;
+        }
+        CHECK(baseline_valid);
+
+        /* A: a SERVER create runs the real global write; the post-write probe
+         * reads it back and proves the partial update took effect. Then the
+         * create aborts, and the tracking allocator must balance to zero. */
+        moq_msq_test_after_global_write = after_global_write_probe;
+        moq_msq_test_force_global_status_active = false;
+        moq_msq_test_abort_after_global = true;
+        moq_msq_test_registration_reached = false;
+        g_probe_calls = 0;
+        g_probe_readback_ok = false;
+        track_state_t tsrv = { 0, 0 };
+        moq_alloc_t srv_alloc = base_alloc;
+        srv_alloc.ctx = &tsrv;
+        scfg.alloc = &srv_alloc;
+        moq_msquic_managed_t *sm = (moq_msquic_managed_t *)(uintptr_t)0x1; /* poison */
+        moq_result_t rs = moq_msquic_managed_create(&scfg, &sm);
+        CHECK(rs != MOQ_OK);                /* aborted after the write */
+        CHECK(sm == NULL);                  /* fail-closed: *out cleared */
+        /* aborted before RegistrationOpen */
+        CHECK(moq_msq_test_registration_reached == false);
+        /* the real write ran; the probe saw it */
+        CHECK(g_probe_calls == 1);
+        CHECK(g_probe_readback_ok == true);
+        /* declaration active */
+        CHECK(g_probe_readback.IsSet.MinimumMtu == TRUE);
+        CHECK_EQ_U32(g_probe_readback.MinimumMtu, TS_PATH_MTU); /* 1280 now in effect */
+        /* the pre-existing global MAXIMUM is unchanged -- read back, not inferred
+         * from the object we sent (which set no maximum). 1500 is the fresh
+         * default; the load-bearing invariant is that our partial write did not
+         * move it. */
+        CHECK_EQ_U32(g_probe_readback.MaximumMtu, baseline.MaximumMtu);
+        CHECK_EQ_U32(baseline.MaximumMtu, 1500u);
+        /* no unrelated global setting changed: neutralize the ONE field we set in
+         * both snapshots and require the remainder to be byte-identical. */
+        {
+            QUIC_SETTINGS a = baseline, b = g_probe_readback;
+            a.MinimumMtu = 0; b.MinimumMtu = 0;
+            a.IsSet.MinimumMtu = 0; b.IsSet.MinimumMtu = 0;
+            CHECK(memcmp(&a, &b, sizeof(a)) == 0);
+        }
+        CHECK(tsrv.outstanding == 0);   /* every facade/lane/string alloc freed */
+        CHECK(tsrv.live_bytes == 0);
+
+        /* B: a CLIENT create issues NO global write (the probe never fires) and
+         * likewise releases everything on the same post-global abort. */
+        moq_msq_test_after_global_write = after_global_write_probe;
+        moq_msq_test_abort_after_global = true;
+        g_probe_calls = 0;
+        track_state_t tcli = { 0, 0 };
+        moq_alloc_t cli_alloc = base_alloc;
+        cli_alloc.ctx = &tcli;
+        ccfg.alloc = &cli_alloc;
+        moq_msquic_managed_t *cm = (moq_msquic_managed_t *)(uintptr_t)0x1;
+        moq_result_t rc = moq_msquic_managed_create(&ccfg, &cm);
+        CHECK(rc != MOQ_OK);
+        CHECK(cm == NULL);
+        CHECK(g_probe_calls == 0);      /* client never touches process-global policy */
+        CHECK(tcli.outstanding == 0);
+        CHECK(tcli.live_bytes == 0);
+
+        /* C: an injected SetParam failure maps to create FAILURE + cleanup. The
+         * real write still runs; only its returned status is overridden. */
+        moq_msq_test_after_global_write = NULL;
+        /* the injected failure is the abort */
+        moq_msq_test_abort_after_global = false;
+        moq_msq_test_force_global_status_active = true;
+        moq_msq_test_force_global_status = QUIC_STATUS_INTERNAL_ERROR;
+        moq_msq_test_registration_reached = false;
+        track_state_t tfail = { 0, 0 };
+        moq_alloc_t fail_alloc = base_alloc;
+        fail_alloc.ctx = &tfail;
+        scfg.alloc = &fail_alloc;
+        moq_msquic_managed_t *fm = (moq_msquic_managed_t *)(uintptr_t)0x1;
+        moq_result_t rf = moq_msquic_managed_create(&scfg, &fm);
+        CHECK(rf != MOQ_OK);    /* rejected floor aborts the create */
+        CHECK(fm == NULL);
+        /* never reaches RegistrationOpen */
+        CHECK(moq_msq_test_registration_reached == false);
+        CHECK(tfail.outstanding == 0);
+        CHECK(tfail.live_bytes == 0);
+
+        moq_msq_test_after_global_write = NULL;
+        moq_msq_test_force_global_status_active = false;
+        moq_msq_test_force_global_status = QUIC_STATUS_SUCCESS;
+        moq_msq_test_abort_after_global = false;
+
+        /* API-table closure oracle. The tracking allocator cannot see an
+         * MsQuicOpen2 reference, so prove each abort/failure closed its own API
+         * table via MsQuic's verified v2.5.9 global lifetime: with the three
+         * temporary creates done and their tables closed, `baseline_api` holds
+         * the LAST open reference. Closing it uninitializes MsQuic's global
+         * state; a fresh open then reloads the pristine defaults, so the 1280
+         * floor is GONE and the settings equal the pristine baseline again. A
+         * leaked API-table reference keeps MsQuic initialized, the floor stays
+         * installed, and this readback fails -- which is what makes each real
+         * mgd_close_transport() load-bearing. */
+        if (baseline_valid && baseline_api != NULL) {
+            MsQuicClose(baseline_api);
+            baseline_api = NULL;
+            const QUIC_API_TABLE *reset_api = NULL;
+            QUIC_SETTINGS after;
+            memset(&after, 0, sizeof(after));
+            bool reset_ok = false;
+            if (QUIC_SUCCEEDED(MsQuicOpen2(&reset_api)) && reset_api != NULL) {
+                uint32_t len = (uint32_t)sizeof(after);
+                if (QUIC_SUCCEEDED(reset_api->GetParam(
+                        NULL, QUIC_PARAM_GLOBAL_SETTINGS, &len, &after)) &&
+                    len == sizeof(after))
+                    reset_ok = true;
+            }
+            CHECK(reset_ok);
+            /* the floor is gone: MinimumMtu is back at the default, not 1280 */
+            CHECK(after.MinimumMtu != TS_PATH_MTU);
+            CHECK_EQ_U32(after.MinimumMtu, baseline.MinimumMtu);
+            CHECK_EQ_U32(after.MaximumMtu, baseline.MaximumMtu);
+            /* whole-settings identity to the pristine baseline */
+            CHECK(memcmp(&after, &baseline, sizeof(after)) == 0);
+            if (reset_api != NULL)
+                MsQuicClose(reset_api);
+        } else if (baseline_api != NULL) {
+            MsQuicClose(baseline_api);
+        }
     }
 
     if (failures != 0) {

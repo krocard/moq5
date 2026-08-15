@@ -1354,8 +1354,18 @@ static void mgd_copy_cfg(moq_msquic_managed_t *m,
  * The observed peer sent exclusively 1252-byte datagrams and did not process
  * that reply; its handshake stalled and it retransmitted until it gave up.
  * Dropping server datagrams above 1252 in a proxy, with no source change, took
- * that peer from 0/6 to 6/6, and pinning this path MTU reproduces the same
- * 1252-byte IPv4 cap in the listener itself.
+ * that peer from 0/6 to 6/6.
+ *
+ * This configuration caps every CONNECTION-SCOPED datagram once ALPN/SNI has
+ * selected it, but it does NOT govern the server's very first reply: the new
+ * connection copies MsQuic's library-global settings and seeds its path MTU on
+ * the pre-configuration CONNECTION path, before any configuration is attached,
+ * so that first reply is sized from the process-global default MinimumMtu and
+ * stayed 1260 bytes with this configuration alone in place. The pre-configuration
+ * connection reply is lowered separately by the process-global floor a managed
+ * SERVER installs at create time (see mgd_build_global_server_floor /
+ * mgd_apply_global_server_floor below); the two together reproduce the 1252-byte
+ * IPv4 cap on both the first reply and every later datagram.
  *
  * RFC 9000 §18.2 defines max_udp_payload_size as the largest UDP payload an
  * endpoint is willing to receive and notes that larger datagrams are unlikely
@@ -1408,6 +1418,80 @@ MGD_SETTINGS_LINKAGE void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg
     }
     /* The managed CLIENT declares no MTU policy: both IsSet bits stay clear so
      * MsQuic's own defaults apply, exactly as before this listener fix. */
+}
+
+/*
+ * The listener CONFIGURATION above governs connection-scoped datagrams once
+ * ALPN/SNI has selected it. But a server's FIRST reply to a client Initial that
+ * carries no ClientHello is sized on the pre-configuration CONNECTION path: the
+ * new connection copies MsQuic's library-global settings and seeds its path MTU
+ * from the process-global default MinimumMtu (1288 in this revision) before any
+ * configuration is attached -- so it measured 1260 bytes and the peer discarded
+ * it. There is no registration-scoped settings parameter, so the only lever for
+ * that first packet is the process-global floor.
+ *
+ * This builds the SINGLE global write the managed SERVER create issues: a zeroed
+ * QUIC_SETTINGS declaring ONLY MinimumMtu = 1280. It deliberately does NOT go
+ * through mgd_build_settings()/moq_msquic_settings_init(), which would also
+ * declare SendBufferingEnabled -- that must not leak into process-global policy.
+ * No global MaximumMtu is set, so clients and other registrations keep the
+ * ability to grow via DPLPMTUD; only the conservative minimum moves.
+ */
+MGD_SETTINGS_LINKAGE void
+mgd_build_global_server_floor(QUIC_SETTINGS *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->MinimumMtu = MGD_LISTENER_PATH_MTU;
+    out->IsSet.MinimumMtu = TRUE;
+}
+
+#ifdef MOQ_MSQUIC_TESTING
+/* Test-only post-write probe. Invoked with the LIVE api table immediately after
+ * the real global SetParam succeeds and before the create tears anything down,
+ * so a socket-free test can GetParam(QUIC_PARAM_GLOBAL_SETTINGS) and prove the
+ * partial update actually took effect (MinimumMtu 1280 active, the pre-existing
+ * global MaximumMtu unchanged, nothing else moved). It does NOT replace the real
+ * SetParam -- that call always runs. Absent from production builds. */
+void (*moq_msq_test_after_global_write)(const QUIC_API_TABLE *api) = NULL;
+/* Test-only fail-closed injector. When active, the real SetParam still runs, but
+ * its returned status is overridden with this forced value so the create's
+ * fail-closed path can be exercised without a real global-write failure. Left
+ * inactive by the positive probe, whose readback stays authoritative. Absent
+ * from production builds. */
+bool        moq_msq_test_force_global_status_active = false;
+QUIC_STATUS moq_msq_test_force_global_status = QUIC_STATUS_SUCCESS;
+/* Test-only: when true, the create path aborts (cleanly) right after the
+ * global-floor decision point, before RegistrationOpen and any socket. Absent
+ * from production builds. */
+bool moq_msq_test_abort_after_global = false;
+/* Test-only: set TRUE by the create path just before RegistrationOpen. Lets a
+ * socket-free test prove the global-floor decision is honored BEFORE the
+ * registration is opened -- so a SERVER whose global write fails (or which
+ * aborts at the decision point) never reaches RegistrationOpen. Absent from
+ * production builds. */
+bool moq_msq_test_registration_reached = false;
+#endif
+
+/*
+ * Install the process-global minimum-MTU floor for a managed SERVER, issued
+ * immediately after MsQuicOpen2 and before RegistrationOpen. Fails closed: a
+ * rejected global write aborts the create rather than starting a listener that
+ * reproduces the oversized pre-configuration connection reply.
+ */
+static moq_result_t
+mgd_apply_global_server_floor(moq_msquic_managed_t *m)
+{
+    QUIC_SETTINGS floor;
+    mgd_build_global_server_floor(&floor);
+    QUIC_STATUS st = m->api->SetParam(NULL, QUIC_PARAM_GLOBAL_SETTINGS,
+                                      (uint32_t)sizeof(floor), &floor);
+#ifdef MOQ_MSQUIC_TESTING
+    if (QUIC_SUCCEEDED(st) && moq_msq_test_after_global_write != NULL)
+        moq_msq_test_after_global_write(m->api);
+    if (moq_msq_test_force_global_status_active)
+        st = moq_msq_test_force_global_status;
+#endif
+    return QUIC_FAILED(st) ? MOQ_ERR_INTERNAL : MOQ_OK;
 }
 
 moq_result_t moq_msquic_managed_create(
@@ -1472,6 +1556,36 @@ moq_result_t moq_msquic_managed_create(
         mgd_free(m);
         return MOQ_ERR_INTERNAL;
     }
+    /* A managed SERVER lowers the PROCESS-GLOBAL minimum MTU floor to 1280 here,
+     * after MsQuicOpen2 and before RegistrationOpen, so the pre-configuration
+     * connection reply is not sized from MsQuic's 1288 default (the new
+     * connection seeds its path MTU from the library-global settings before a
+     * configuration is attached). This is process-wide (there is no
+     * registration-scoped settings param): clients later created in the same
+     * process inherit the conservative 1280 initial floor, though their own
+     * configuration declares no MTU override and no global maximum is imposed.
+     * A managed CLIENT does NOT issue this write. */
+    if (!is_client && mgd_apply_global_server_floor(m) != MOQ_OK) {
+        mgd_close_transport(m); /* closes the opened API table (nothing else open yet) */
+        mgd_free(m);
+        return MOQ_ERR_INTERNAL;
+    }
+#ifdef MOQ_MSQUIC_TESTING
+    /* Test-only: abort immediately after the perspective-gated global-floor
+     * decision, before RegistrationOpen and any socket. Lets a focused test
+     * prove -- socket-free -- that a SERVER ran the real global write (verified
+     * by reading the settings back with GetParam in the post-write probe) and a
+     * CLIENT did not, then tears the create down cleanly. Compiled only under
+     * MOQ_MSQUIC_TESTING; absent from the production symbol surface. */
+    if (moq_msq_test_abort_after_global) {
+        mgd_close_transport(m);
+        mgd_free(m);
+        return MOQ_ERR_INTERNAL;
+    }
+#endif
+#ifdef MOQ_MSQUIC_TESTING
+    moq_msq_test_registration_reached = true;
+#endif
     QUIC_REGISTRATION_CONFIG rcfg = {
         .AppName = "moq-msquic-managed",
         .ExecutionProfile = QUIC_EXECUTION_PROFILE_LOW_LATENCY,

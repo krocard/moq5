@@ -119,6 +119,49 @@ server); server code reaches its sessions through lane iteration.
   services session deadlines).
 - Service-tier (moq-service endpoint) wiring is deferred.
 
+## Managed server MTU policy (process-global)
+
+A managed **server** conservatively caps its initial path MTU to a
+1280-byte IP path MTU (a 1252-byte IPv4 UDP payload) so it interoperates
+with peers that discard larger early datagrams. This happens at two
+layers, deliberately:
+
+- The listener **configuration** pins `MinimumMtu = MaximumMtu = 1280`,
+  which caps every **connection-scoped** datagram once ALPN/SNI has
+  selected the configuration.
+- The configuration does **not** govern the server's very first,
+  pre-configuration reply to a bare Initial. That reply is sized on the
+  pre-configuration **connection** path: the new connection copies
+  MsQuic's library-global settings and seeds its path MTU before any
+  configuration is attached, so it is sized from the **process-global**
+  default `MinimumMtu` (1288 in this MsQuic revision) and stayed 1260
+  bytes with the configuration alone in place. So a managed server also
+  installs a **process-global** floor once at create time — a single
+  `SetParam(NULL, QUIC_PARAM_GLOBAL_SETTINGS, …)` declaring only
+  `MinimumMtu = 1280`, issued after `MsQuicOpen2` and before
+  `RegistrationOpen`.
+
+Consequences to be honest about:
+
+- The global floor is **process-wide** — MsQuic exposes no
+  registration-scoped settings parameter. A managed **client** created in
+  the same process **after** a managed server therefore inherits the
+  conservative 1280 initial floor. The client's own configuration still
+  declares no MTU override, and no process-global **maximum** is set, so
+  DPLPMTUD can still grow either endpoint's path.
+- It is **not restored** on destroy. MsQuic itself owns global-settings
+  lifetime: it loads them at the first `MsQuicOpen2` reference and may
+  reset them on a later `MsQuicOpen2` after the last `MsQuicClose`. So the
+  floor remains in force while MsQuic stays initialized and another open
+  API table or registration may depend on it; if MsQuic later resets its
+  globals, the next managed-server create simply reapplies the floor.
+  LibMoQ adds **no** refcount and **no** destroy-time restore. Only the
+  conservative minimum moves; the maximum is never pinned globally.
+- A managed **client** create does **not** issue the global write. If the
+  global write is rejected on a server create, the create **fails closed**
+  (`MOQ_ERR_INTERNAL`, `*out` left NULL) rather than starting a listener
+  that reproduces the oversized reply.
+
 ## Tests
 
 ### Which command to run
