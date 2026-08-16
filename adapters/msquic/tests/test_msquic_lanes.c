@@ -142,6 +142,8 @@ static int server_lane_pump(moq_msquic_managed_t *m,
                        !cs->closed_seen) {
                 cs->closed_seen = true;
                 atomic_fetch_add(&sv->closed_seen, 1);
+                /* terminal consumed: release the child for reclamation */
+                (void)moq_msquic_managed_conn_ack_terminal(c);
             }
             moq_event_cleanup(&ev);
         }

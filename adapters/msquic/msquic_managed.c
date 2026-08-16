@@ -72,8 +72,15 @@ struct moq_msquic_managed_conn {
     moq_session_t *session;
     moq_msquic_conn_t *conn;
     void *user; /* application slot; the facade never touches it */
-    bool reapable; /* terminal transport complete; reclaim after the
-                      lane pump that observes its final events runs */
+    bool reapable; /* the TRANSPORT half only: this connection's terminal
+                      completed. Reclamation additionally needs the
+                      application half for a server child — see
+                      mgd_child_reclaimable. */
+    bool app_terminal_acked; /* the application asserted, from this
+                                connection's own lane pump, that it is done
+                                with the child. A SERVER child is not
+                                reclaimed until this is set; the single
+                                client connection does not use it. */
     uint64_t pump_pre_token; /* doorbell scratch: event-progress token snapshot
                                 taken before on_lane_pump, for the re-drive
                                 predicate after the post-pump service pass */
@@ -295,8 +302,8 @@ static void mgd_guard_leave(void *user)
 
 /* --- hook: per-connection service bookkeeping (lane->mu held) -------- *
  * The app's on_lane_pump does NOT run here — it runs coalesced on the
- * lane doorbell (guard_leave arms it). The hook only latches
- * reapability and the client terminal compat view. */
+ * lane doorbell (guard_leave arms it). The hook only latches the
+ * transport terminal and the client terminal compat view. */
 
 static void mgd_hook(moq_msquic_conn_t *conn, void *user)
 {
@@ -304,9 +311,10 @@ static void mgd_hook(moq_msquic_conn_t *conn, void *user)
     moq_msquic_managed_t *m = mc->owner;
 
     (void)conn;
-    /* a terminal connection stays visible through the lane pump that
-     * delivers its final events; once fully done (and the lane pump has
-     * run) it may be reclaimed by the lane doorbell */
+    /* Latch the TRANSPORT terminal, and only that. Whether the child may be
+     * reclaimed is mgd_child_reclaimable's decision: for a server it also
+     * needs the application's acknowledgment, so a terminal connection stays
+     * visible to its lane's pump for as long as the application needs it. */
     if (!mc->reapable && mc->conn->shutdown_complete &&
         (moq_msquic_conn_is_fatal(mc->conn) ||
          moq_msquic_conn_is_closed(mc->conn))) {
@@ -577,9 +585,58 @@ void moq_msq_test_lane_arm_pump(moq_msquic_managed_lane_t *lane)
 {
     lane->pump_pending = true;
 }
+
+/* Test-only: how many of this lane's children have reached the TRANSPORT
+ * terminal and quiesced. That is one of the two facts reclamation needs — it
+ * deliberately says nothing about the application acknowledgment, so a test can
+ * observe a child that is transport-done and still legitimately retained. Pure
+ * observation: it takes the lane lock, reads, and changes no scheduling or
+ * lifetime state. Lets a test distinguish "the transport terminal has
+ * completed" from the earlier state where the session is already closed but
+ * SHUTDOWN_COMPLETE has not arrived, without inferring it from elapsed time.
+ * Call with lane->mu NOT held. */
+size_t moq_msq_test_lane_reapable(moq_msquic_managed_lane_t *lane)
+{
+    size_t n = 0;
+
+    pthread_mutex_lock(&lane->mu);
+    for (const moq_msquic_managed_conn_t *mc = lane->conns; mc != NULL;
+         mc = mc->next)
+        if (mc->reapable && mc->conn->shutdown_complete)
+            n++;
+    pthread_mutex_unlock(&lane->mu);
+    return n;
+}
 #endif
 
-/* Reclaim this lane's fully quiesced children (lane->mu held on entry).
+/* May this child be reclaimed? (lane->mu held.)
+ *
+ * TWO independent facts, and both are required for a SERVER child:
+ *   - the TRANSPORT terminal completed and quiesced (reapable +
+ *     shutdown_complete), so no callback can still touch it; and
+ *   - the APPLICATION acknowledged it (moq_msquic_managed_conn_ack_terminal),
+ *     so a bounded consumer that has not finished with the child cannot have
+ *     it destroyed underneath it.
+ *
+ * A pump OPPORTUNITY is not the second fact: nothing obliges an application to
+ * poll on any particular pump, and a consumer that returns before draining
+ * SESSION_CLOSED still needs its child, its session and its per-connection
+ * state on a later pump.
+ *
+ * The single CLIENT connection is exempt. It is not a per-child reclamation
+ * surface — the facade owns its lifetime, moq_msquic_managed_session() is
+ * pump-scoped and simply reads NULL once the child is gone, so a client that
+ * follows the documented handle rules cannot retain a destroyed session. */
+static bool mgd_child_reclaimable(const moq_msquic_managed_conn_t *mc)
+{
+    if (!mc->reapable || !mc->conn->shutdown_complete)
+        return false;
+    if (mc->owner->cfg.perspective == MOQ_PERSPECTIVE_CLIENT)
+        return true;
+    return mc->app_terminal_acked;
+}
+
+/* Reclaim this lane's reclaimable children (lane->mu held on entry).
  * Unlink under lane->mu; the blocking ConnectionClose + reserve release
  * run with NO locks. Restart after relocking — the list may change.
  *
@@ -590,10 +647,9 @@ void moq_msq_test_lane_arm_pump(moq_msquic_managed_lane_t *lane)
  * whose pump was armed INSIDE it and has not run. After relocking, yield whenever
  * lane work is armed and let the doorbell pump first; the next pass reaps.
  *
- * This is a pump-opportunity guarantee, NOT proof that the application consumed
- * the terminal: nothing here requires the app to poll, and an app that ignores
- * its events still gets the child reclaimed. Explicit terminal facts and an
- * application acknowledgment before reclamation are separate, later work. */
+ * That rule is about ORDER WITHIN a pass; mgd_child_reclaimable is what decides
+ * eligibility at all. Forced facade teardown (stop()) reclaims every remaining
+ * child regardless, after every doorbell has been joined. */
 static void doorbell_reap(moq_msquic_managed_lane_t *lane)
 {
     moq_msquic_managed_t *m = lane->owner;
@@ -603,7 +659,7 @@ static void doorbell_reap(moq_msquic_managed_lane_t *lane)
 
         for (moq_msquic_managed_conn_t *mc = lane->conns; mc != NULL;
              mc = mc->next)
-            if (mc->reapable && mc->conn->shutdown_complete) {
+            if (mgd_child_reclaimable(mc)) {
                 victim = mc;
                 break;
             }
@@ -1710,6 +1766,35 @@ void moq_msquic_managed_conn_set_user(moq_msquic_managed_conn_t *conn,
 void *moq_msquic_managed_conn_user(const moq_msquic_managed_conn_t *conn)
 {
     return conn != NULL ? conn->user : NULL;
+}
+
+moq_result_t moq_msquic_managed_conn_ack_terminal(
+    moq_msquic_managed_conn_t *conn)
+{
+    if (conn == NULL)
+        return MOQ_ERR_INVAL;
+    /* The single client connection is not reclaimed per-child, so there is
+     * nothing to acknowledge — refuse rather than record a fact the reap
+     * gate never reads. */
+    if (conn->owner->cfg.perspective == MOQ_PERSPECTIVE_CLIENT)
+        return MOQ_ERR_WRONG_STATE;
+    /* Owning lane's pump only: that window is what makes `conn` a valid
+     * handle at all, and it is the lock domain this flag lives in. */
+    if (!mgd_in_lane_pump(conn->lane))
+        return MOQ_ERR_WRONG_STATE;
+    /* The terminal must already have been TRANSFERRED to the application by a
+     * poll of this connection's session. A queued-but-unpolled SESSION_CLOSED
+     * is not enough, and neither is a completed transport shutdown: the two
+     * facts are unordered, and reclaiming on the transport one is exactly the
+     * defect this gate closes. Observation is a durable session fact, so the
+     * acknowledging pump need not be the one that polled. */
+    bool observed = false;
+
+    (void)moq_transport_bridge_terminal_facts(conn->conn->bridge, &observed);
+    if (!observed)
+        return MOQ_ERR_WRONG_STATE;
+    conn->app_terminal_acked = true; /* monotonic; a duplicate is accepted */
+    return MOQ_OK;
 }
 
 void moq_msquic_managed_conn_close(moq_msquic_managed_conn_t *conn,

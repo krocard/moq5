@@ -121,6 +121,17 @@ int main(void)
     if (moq_msquic_managed_conn_user(NULL) != NULL)
         return 1;
     moq_msquic_managed_conn_set_user(NULL, NULL);
+    if (moq_msquic_managed_conn_ack_terminal(NULL) != MOQ_ERR_INVAL)
+        return 1;
+    {
+        /* the acknowledgment's exact shape: a token or lane parameter, or a
+         * void return, would fail to compile here */
+        moq_result_t (*ack)(moq_msquic_managed_conn_t *) =
+            moq_msquic_managed_conn_ack_terminal;
+
+        if (ack == NULL)
+            return 1;
+    }
     moq_msquic_managed_drain(NULL);
     if (moq_msquic_managed_conn_count(NULL) != 0)
         return 1;

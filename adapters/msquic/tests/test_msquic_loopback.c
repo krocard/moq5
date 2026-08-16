@@ -607,18 +607,23 @@ static int multi_server_pump(moq_msquic_managed_t *m,
         }
 
         moq_event_t ev;
+        bool closed = false;
         while (moq_session_poll_events(s, &ev, 1) > 0) {
             if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
                 sv->slots[slot].sub = ev.u.subscribe_request.sub;
                 sv->slots[slot].have_sub = true;
             } else if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
                 sv->session_closed++;
+                closed = true;
                 if (sv->first_closed_conn_count == 0)
                     sv->first_closed_conn_count =
                         moq_msquic_managed_conn_count(m);
             }
             moq_event_cleanup(&ev);
         }
+        /* terminal consumed: release the child so it can be reclaimed */
+        if (closed)
+            (void)moq_msquic_managed_conn_ack_terminal(conn);
         if (sv->slots[slot].have_sub && !sv->slots[slot].published) {
             sv->slots[slot].published = true;
             sv->published++;

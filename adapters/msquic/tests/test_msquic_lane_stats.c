@@ -83,6 +83,34 @@ static int noop_pump(moq_msquic_managed_t *m,
     return 0;
 }
 
+/* Drains its lane's sessions and releases a child once it has taken that
+ * child's terminal — the minimum a server must do for a terminal connection
+ * to be reclaimed while the facade is still running. */
+static int draining_pump(moq_msquic_managed_t *m,
+                         moq_msquic_managed_lane_t *lane, uint64_t now_us,
+                         void *user)
+{
+    moq_msquic_managed_conn_t *c = NULL;
+
+    (void)m; (void)now_us; (void)user;
+    while ((c = moq_msquic_lane_next_conn(lane, c)) != NULL) {
+        moq_session_t *s = moq_msquic_managed_conn_session(c);
+        moq_event_t ev;
+        bool closed = false;
+
+        if (s == NULL)
+            continue;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SESSION_CLOSED)
+                closed = true;
+            moq_event_cleanup(&ev);
+        }
+        if (closed)
+            (void)moq_msquic_managed_conn_ack_terminal(c);
+    }
+    return 0;
+}
+
 static moq_msquic_managed_t *mk_server(const char *cert, const char *key,
                                        int (*pump)(moq_msquic_managed_t *,
                                                    moq_msquic_managed_lane_t *,
@@ -329,7 +357,7 @@ static void *poll_main(void *arg)
 static void t_flush_and_polling(const char *cert, const char *key)
 {
     int before = failures;
-    moq_msquic_managed_t *srv = mk_server(cert, key, noop_pump, NULL);
+    moq_msquic_managed_t *srv = mk_server(cert, key, draining_pump, NULL);
     CHECK(srv != NULL);
     if (srv == NULL)
         return;

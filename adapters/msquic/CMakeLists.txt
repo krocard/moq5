@@ -453,6 +453,41 @@ if(MOQ_BUILD_TESTS)
                 TIMEOUT 120)
         endif()
 
+        # Terminal-child lifetime pin: a bounded application pump that leaves
+        # SESSION_CLOSED unconsumed must still be given its child, its session
+        # and its own per-connection state on a later pump. Kept out of
+        # test_msquic_reap so that binary's narrower scope — a pump OPPORTUNITY
+        # precedes further batch reclamation — stays separately reportable.
+        # Uses the reap-gap and prewait seams to observe the doorbell's own
+        # decision points, so it compiles the adapter + managed sources with the
+        # testing seams on and links no production adapter library.
+        add_executable(test_msquic_terminal_ack
+            tests/test_msquic_terminal_ack.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_terminal_ack PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_terminal_ack PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_terminal_ack PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_terminal_ack PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        if(MOQ_OPENSSL)
+            add_test(NAME msquic_terminal_ack
+                COMMAND test_msquic_terminal_ack
+                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
+                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
+            set_tests_properties(msquic_terminal_ack PROPERTIES
+                FIXTURES_REQUIRED msquic_certs
+                LABELS "network;msquic"
+                TIMEOUT 120)
+        endif()
+
         # Production-contract conformance over real MsQuic loopback:
         # every MoQ session call runs inside the managed on_lane_pump,
         # driven by per-side event-triggered scripts (see

@@ -64,16 +64,27 @@
  * listener. Each accepted connection is placed on a lane and, inside
  * that lane's on_lane_pump, the application iterates the lane's
  * connections via moq_msquic_lane_next_conn() and drives their
- * sessions. A connection whose transport reached its terminal stays
- * visible to its lane's pump for the batch that delivers its final
- * events (poll SESSION_CLOSED there), and is then reclaimed.
+ * sessions.
+ *
+ * Terminal children (SERVER): a connection whose transport reached its
+ * terminal stays visible to its lane's pump — across as many pumps as the
+ * application needs — until the application both polls its SESSION_CLOSED
+ * and acknowledges it with moq_msquic_managed_conn_ack_terminal(). Only
+ * then may it be reclaimed. A BOUNDED pump may therefore return without
+ * draining that event and still find the same child, its session and its
+ * `user` state on a later pump. Until it acknowledges, the child keeps
+ * consuming one of cfg.max_connections; see that function for the full
+ * contract and for what forced teardown does.
  *
  * Compatibility view (CLIENT ONLY): the facade-level accessors
  * (_session, is_fatal/is_closed/codes) describe the single client
  * connection. On a SERVER they are NOT a per-connection correctness
  * API — a server observes terminal by polling SESSION_CLOSED inside the
  * lane pump. The pending probes aggregate across all live connections
- * (zero at quiescence) and are valid for both.
+ * (zero at quiescence) and are valid for both. The client connection is
+ * likewise not acknowledged: the facade owns its lifetime, and
+ * moq_msquic_managed_session() is pump-scoped and simply reads NULL once
+ * that connection is gone.
  *
  * Version: exact-version. The facade offers exactly one MoQ ALPN,
  * chosen by cfg.version (default draft-16 / "moqt-16"), and creates
@@ -345,6 +356,54 @@ MOQ_API void moq_msquic_managed_conn_set_user(
 MOQ_API void *moq_msquic_managed_conn_user(
     const moq_msquic_managed_conn_t *conn);
 
+/* SERVER: tell the facade this terminal child may be reclaimed.
+ *
+ * WHAT IT ASSERTS. Terminal processing for this connection is complete: the
+ * application no longer needs the child to remain iterable, and it will not use
+ * the borrowed conn/session handles after the acknowledging callback returns.
+ * Independently owned application state and retained moq_rcbuf_t are
+ * unaffected, and nothing reference-counted is released by the call. The
+ * assertion is not mechanically verifiable — the library records that it was
+ * made.
+ *
+ * WHY IT EXISTS. A lane pump is free to be BOUNDED: to service part of its work
+ * and return before draining every session. Without an acknowledgment the
+ * facade could only guess, from a pump having had the OPPORTUNITY to poll, that
+ * the terminal was consumed — and reclaim a child whose session a bounded
+ * consumer was still going to read.
+ *
+ * WHEN IT MAY BE CALLED. Only from the owning lane's on_lane_pump, and only for
+ * a connection that callback was presented. MOQ_EVENT_SESSION_CLOSED must
+ * ALREADY have been transferred to the application by a poll of this
+ * connection's session: a queued-but-unpolled terminal is not enough, and
+ * neither is a completed transport shutdown. Because observation is a durable
+ * session fact rather than a queue read, the acknowledging callback need NOT be
+ * the one that polled — a later pump is fine.
+ *
+ * RESULTS.
+ *   MOQ_OK               accepted; also returned for a duplicate call while the
+ *                        handle is still valid in the current callback.
+ *   MOQ_ERR_INVAL        conn == NULL.
+ *   MOQ_ERR_WRONG_STATE  the single client connection (it is not reclaimed
+ *                        per-child); outside the owning lane's pump; or the
+ *                        terminal has not been observed yet.
+ *
+ * HANDLE LIFETIME. The handle is valid only for the current callback. After a
+ * successful acknowledgment the connection may be reclaimed as soon as that
+ * callback returns — do not retain the pointer. A stale or released handle is
+ * invalid input: no rejection is promised and none is attempted.
+ *
+ * IF IT IS NEVER CALLED. A terminal server child stays linked, iterable and
+ * counted against cfg.max_connections; it is never reclaimed because time
+ * passed, so once the reserve is exhausted new accepts are refused at the
+ * listener. Every accepted child has a MoQ session from the moment it exists
+ * (it is created before the transport is wired), so there is no
+ * nothing-to-acknowledge class here. Forced facade teardown (stop()/destroy())
+ * still reclaims without acknowledgment, behind the documented callback/pump
+ * exclusion barrier; that is the forced path, not the normal one. */
+MOQ_API moq_result_t moq_msquic_managed_conn_ack_terminal(
+    moq_msquic_managed_conn_t *conn);
+
 /* Shut one connection's transport down (async, orderly; code is the
  * application close code). The connection's final events arrive on a
  * later pump. */
@@ -357,7 +416,10 @@ MOQ_API size_t moq_msquic_managed_conn_count(
 
 /* Graceful drain: refuse new connections; existing ones continue until
  * they close on their own (watch conn_count and the pending probes).
- * Safe from any thread, idempotent. */
+ * Safe from any thread, idempotent. A terminal SERVER child still counts
+ * until the application acknowledges it, so conn_count reaches zero only
+ * for a server that calls moq_msquic_managed_conn_ack_terminal; stop() is
+ * the unconditional path. */
 MOQ_API void moq_msquic_managed_drain(moq_msquic_managed_t *m);
 
 /* Server: the bound listen port (after create). */
