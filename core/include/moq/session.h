@@ -264,6 +264,22 @@ MOQ_API moq_session_state_t moq_session_state(const moq_session_t *s);
 MOQ_API moq_perspective_t moq_session_perspective(const moq_session_t *s);
 
 /*
+ * True when the negotiated draft permits a Track Namespace with ZERO fields —
+ * the root namespace (draft-18 yes, draft-16 no, which requires 1..32). Pure
+ * query: a caller forwarding a namespace onto this session asks the capability
+ * instead of testing a draft version, so version details never leak into caller
+ * logic. Observing — no advancement, no output, no borrow invalidation.
+ *
+ * This describes the Track Namespace only. It says nothing about Track
+ * Namespace PREFIX cardinality: an empty prefix on a namespace subscription
+ * stays legal in draft-16.
+ *
+ * False for a NULL session, and for a session that has no profile bound.
+ */
+MOQ_API bool moq_session_supports_zero_field_track_namespace(
+    const moq_session_t *s);
+
+/*
  * Record that an Object at {group_id, object_id} has been published or
  * received on the given track, advancing that track's largest-location
  * history (see moq_session_cfg_t.max_track_history_records). The library

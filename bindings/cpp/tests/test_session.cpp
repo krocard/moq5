@@ -767,6 +767,23 @@ int main()
         }
         MOQ_CHECK(saw_root_publish_namespace);
         MOQ_CHECK(!c.poll_action().has_value());
+
+        // The C capability query, reached through the C++ session's raw
+        // handle. There is no C++ wrapper for it and none is invented here:
+        // the point is that the public C symbol links and answers correctly
+        // from C++. Both arms are asserted from C++, so this coverage
+        // discriminates a profile-derived answer from a constant: the
+        // established draft-18 session above permits the root namespace,
+        // while a default (draft-16) session does not.
+        MOQ_CHECK(moq_session_supports_zero_field_track_namespace(c.raw()));
+        MOQ_CHECK(!moq_session_supports_zero_field_track_namespace(nullptr));
+        {
+            auto [d16c, d16s] = establish_pair(failures);
+            MOQ_CHECK(
+                !moq_session_supports_zero_field_track_namespace(d16c.raw()));
+            MOQ_CHECK(
+                !moq_session_supports_zero_field_track_namespace(d16s.raw()));
+        }
     }
 
     MOQ_PASS("test_cpp_session");

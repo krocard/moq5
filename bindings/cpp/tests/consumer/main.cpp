@@ -283,6 +283,21 @@ int main()
         }
     }
 
+    // -- 8. profile capability query, from an out-of-tree consumer ----
+    // This same consumer is built twice against the exported package: by the
+    // ordinary cpp_consumer CTest, which points CMAKE_PREFIX_PATH at the BUILD
+    // TREE export, and by a separate installed-prefix gate that consumes a real
+    // `cmake --install` tree. The declaration must therefore be reachable, and
+    // the symbol resolvable, through the package's public surface rather than
+    // only from inside the project's own targets.
+    {
+        CHECK(!moq_session_supports_zero_field_track_namespace(nullptr), 80);
+        // `client` is the established default-version (draft-16) session from
+        // section 3, which requires 1..32 namespace fields.
+        CHECK(!moq_session_supports_zero_field_track_namespace(client.raw()),
+              81);
+    }
+
     std::printf("PASS: moq_consumer_test\n");
     return 0;
 }

@@ -10,6 +10,7 @@
 #include <moq/publisher.h>
 #include "test_support.h"
 #include "../../core/src/session/profile.h"
+#include "../../core/src/session/session_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -646,6 +647,85 @@ static int test_profile_wire_boundaries(void)
     return failures;
 }
 
+/*
+ * The public capability query a forwarder asks before handing a namespace to
+ * this session. Draft-16 requires 1..32 fields, draft-18 permits the root, and
+ * the answer must come from the session's own profile -- never from a draft
+ * number the caller tests itself.
+ */
+static int test_zero_field_namespace_capability(void)
+{
+    int failures = 0;
+
+    /* NULL is false, and asking is safe. */
+    MOQ_TEST_CHECK(!moq_session_supports_zero_field_track_namespace(NULL));
+
+    /* Draft-16: the root namespace is not representable. */
+    {
+        moq_session_t *s = make_established_d16();
+        MOQ_TEST_CHECK(s != NULL);
+        if (s) {
+            MOQ_TEST_CHECK(!moq_session_supports_zero_field_track_namespace(s));
+            moq_session_destroy(s);
+        }
+    }
+
+    /* Draft-18: it is. Both perspectives -- the capability is the profile's,
+     * not a role's. */
+    {
+        const moq_perspective_t persp[2] = { MOQ_PERSPECTIVE_CLIENT,
+                                             MOQ_PERSPECTIVE_SERVER };
+        for (size_t i = 0; i < 2; i++) {
+            moq_session_t *s = make_established_d18(persp[i]);
+            MOQ_TEST_CHECK(s != NULL);
+            if (!s) continue;
+            MOQ_TEST_CHECK(moq_session_supports_zero_field_track_namespace(s));
+            moq_session_destroy(s);
+        }
+    }
+
+    /* Observing: repeated queries change no session state and produce no
+     * output. State, borrow epoch and both queue depths are captured before
+     * and compared after, and the answer is stable across the calls. */
+    {
+        moq_session_t *s = make_established_d18(MOQ_PERSPECTIVE_CLIENT);
+        MOQ_TEST_CHECK(s != NULL);
+        if (s) {
+            moq_session_state_t st0 = moq_session_state(s);
+            uint64_t epoch0 = s->borrow_epoch;
+            size_t events0 = s->event_tail - s->event_head;
+            size_t actions0 = s->action_tail - s->action_head;
+
+            for (int i = 0; i < 4; i++)
+                MOQ_TEST_CHECK(
+                    moq_session_supports_zero_field_track_namespace(s));
+
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(s), (int)st0);
+            MOQ_TEST_CHECK_EQ_U64(s->borrow_epoch, epoch0);
+            MOQ_TEST_CHECK_EQ_SIZE(s->event_tail - s->event_head, events0);
+            MOQ_TEST_CHECK_EQ_SIZE(s->action_tail - s->action_head, actions0);
+
+            moq_event_t ev;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_poll_events(s, &ev, 1), 0);
+            moq_action_t act;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_poll_actions(s, &act, 1), 0);
+            moq_session_destroy(s);
+        }
+    }
+
+    /* The capability tracks the profile field it is derived from, so the two
+     * cannot drift apart silently. */
+    {
+        const moq_profile_ops_t *d16 = moq_profile_lookup(MOQ_VERSION_DRAFT_16);
+        const moq_profile_ops_t *d18 = moq_profile_lookup(MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(d16 != NULL && d18 != NULL);
+        if (d16) MOQ_TEST_CHECK(d16->min_track_namespace_fields > 0);
+        if (d18) MOQ_TEST_CHECK_EQ_SIZE(d18->min_track_namespace_fields, 0);
+    }
+
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -653,6 +733,7 @@ int main(void)
     failures += test_d16_public_requests();
     failures += test_d16_publisher_facade();
     failures += test_profile_wire_boundaries();
+    failures += test_zero_field_namespace_capability();
     MOQ_TEST_PASS("namespace_cardinality");
     return failures;
 }

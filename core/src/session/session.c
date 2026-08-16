@@ -573,6 +573,17 @@ bool moq_session_uses_uni_control(const moq_session_t *s)
     return s->profile->uses_uni_control_channel;
 }
 
+/* Public: derived from the profile's own Track Namespace floor rather than a
+ * second capability bit, so the two can never disagree. Unlike its neighbours
+ * above -- core-internal, always called on a fully built session -- this one is
+ * reachable from application code, so it tolerates a NULL session and a session
+ * with no profile bound instead of dereferencing. */
+bool moq_session_supports_zero_field_track_namespace(const moq_session_t *s)
+{
+    if (!s || !s->profile) return false;
+    return s->profile->min_track_namespace_fields == 0;
+}
+
 uint64_t moq_session_event_progress_token(const moq_session_t *s)
 {
     return s->event_progress_token;
