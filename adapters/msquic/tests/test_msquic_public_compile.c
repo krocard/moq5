@@ -139,10 +139,7 @@ int main(void)
         moq_msquic_managed_is_closed(NULL))
         return 1;
     /* appended max_open_subgroups: zero (session default) after a full-size
-     * init, settable, and appended LAST — AFTER the app_deadline block, so the
-     * newest field is the struct tail. Pin field ORDER and TAIL placement, not
-     * an exact byte growth: the append cost (u32 + alignment padding) is
-     * ABI-dependent. */
+     * init, settable, and appended after the app_deadline block. */
     moq_msquic_managed_cfg_init_sized(&mcfg, sizeof(mcfg));
     if (mcfg.max_open_subgroups != 0)
         return 1;
@@ -153,11 +150,6 @@ int main(void)
      * i.e. the app_deadline block is preserved ahead of it */
     if (offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) <
         offsetof(moq_msquic_managed_cfg_t, app_deadline_ctx) + sizeof(void *))
-        return 1;
-    /* tail: the type is large enough to hold the appended field at its offset */
-    if (sizeof(moq_msquic_managed_cfg_t) <
-        offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) +
-            sizeof(mcfg.max_open_subgroups))
         return 1;
     /* a caller sized THROUGH the app_deadline block but excluding the newer
      * max_open_subgroups: the prior prefix initializes (app_deadline_ctx and
@@ -173,6 +165,56 @@ int main(void)
     if (mcfg.app_deadline_ctx != NULL) /* the immediate predecessor zeroed */
         return 1;
     if (mcfg.max_open_subgroups == 0) /* poison untouched */
+        return 1;
+    /* appended versions/version_count: one ABI block at the struct tail. */
+    {
+        static const moq_version_t drafts[] = {
+            MOQ_VERSION_DRAFT_18,
+            MOQ_VERSION_DRAFT_16,
+        };
+
+        moq_msquic_managed_cfg_init_sized(&mcfg, sizeof(mcfg));
+        if (mcfg.versions != NULL || mcfg.version_count != 0)
+            return 1;
+        mcfg.versions = drafts;
+        mcfg.version_count = 2;
+        if (mcfg.versions != drafts || mcfg.version_count != 2)
+            return 1;
+        if (MOQ_MSQUIC_MANAGED_MAX_VERSIONS < 2u)
+            return 1;
+        if (offsetof(moq_msquic_managed_cfg_t, versions) <
+            offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) +
+                sizeof(mcfg.max_open_subgroups))
+            return 1;
+        if (offsetof(moq_msquic_managed_cfg_t, version_count) <=
+            offsetof(moq_msquic_managed_cfg_t, versions))
+            return 1;
+        if (sizeof(moq_msquic_managed_cfg_t) <
+            offsetof(moq_msquic_managed_cfg_t, version_count) +
+                sizeof(mcfg.version_count))
+            return 1;
+
+        memset(&mcfg, 0xff, sizeof(mcfg));
+        moq_msquic_managed_cfg_init_sized(
+            &mcfg, offsetof(moq_msquic_managed_cfg_t, versions));
+        if (mcfg.struct_size !=
+            (uint32_t)offsetof(moq_msquic_managed_cfg_t, versions))
+            return 1;
+        if (mcfg.max_open_subgroups != 0)
+            return 1;
+        {
+            unsigned char poison[sizeof(mcfg.versions)];
+
+            memcpy(poison,
+                   (const unsigned char *)&mcfg +
+                       offsetof(moq_msquic_managed_cfg_t, versions),
+                   sizeof(poison));
+            for (size_t i = 0; i < sizeof(poison); i++)
+                if (poison[i] != 0xffu)
+                    return 1;
+        }
+    }
+    if (moq_msquic_managed_conn_negotiated_version(NULL) != 0)
         return 1;
 
 #endif

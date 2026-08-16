@@ -26,9 +26,7 @@ int main()
     if (moq_msquic_managed_port(nullptr) != 0)
         return 1;
     /* appended max_open_subgroups: the C++ view agrees — zero after a
-     * full-size init, settable, and the struct tail (LAST, after the
-     * app_deadline block). Pin field ORDER and TAIL placement, not an exact
-     * byte growth: the append cost (u32 + alignment padding) is ABI-dependent. */
+     * full-size init, settable, and after the app_deadline block. */
     if (mcfg.max_open_subgroups != 0)
         return 1;
     mcfg.max_open_subgroups = 7;
@@ -38,10 +36,21 @@ int main()
                       offsetof(moq_msquic_managed_cfg_t, app_deadline_ctx) +
                           sizeof(void *),
                   "max_open_subgroups must follow the app_deadline block");
-    static_assert(sizeof(moq_msquic_managed_cfg_t) >=
+    static_assert(offsetof(moq_msquic_managed_cfg_t, versions) >=
                       offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) +
                           sizeof(mcfg.max_open_subgroups),
-                  "max_open_subgroups must be contained at the struct tail");
+                  "versions must follow max_open_subgroups");
+    static_assert(offsetof(moq_msquic_managed_cfg_t, version_count) >
+                      offsetof(moq_msquic_managed_cfg_t, versions),
+                  "version_count must follow versions");
+    static_assert(sizeof(moq_msquic_managed_cfg_t) >=
+                      offsetof(moq_msquic_managed_cfg_t, version_count) +
+                          sizeof(mcfg.version_count),
+                  "version_count must be contained at the struct tail");
+    if (mcfg.versions != nullptr || mcfg.version_count != 0)
+        return 1;
+    if (moq_msquic_managed_conn_negotiated_version(nullptr) != 0)
+        return 1;
 
 #endif
     if (cfg.struct_size != sizeof(cfg))

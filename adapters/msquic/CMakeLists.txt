@@ -370,6 +370,22 @@ if(MOQ_BUILD_TESTS)
             LABELS "network;msquic"
             TIMEOUT 120)
 
+        add_executable(test_msquic_multi_alpn
+            tests/test_msquic_multi_alpn.c)
+        target_link_libraries(test_msquic_multi_alpn PRIVATE
+            moq::adapter-msquic-managed Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_multi_alpn PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_multi_alpn
+            COMMAND test_msquic_multi_alpn
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_multi_alpn PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 120)
+
         # Decisive lane-partition pin: accepts synthesized through the exact
         # production listener callback over a borrowed fake API table, so
         # placement, lane-scoped iteration, wake selectivity, deadline cause

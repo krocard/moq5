@@ -71,6 +71,7 @@ struct moq_msquic_managed_conn {
     HQUIC connection;
     moq_session_t *session;
     moq_msquic_conn_t *conn;
+    moq_version_t negotiated_version;
     void *user; /* application slot; the facade never touches it */
     bool reapable; /* the TRANSPORT half only: this connection's terminal
                       completed. Reclamation additionally needs the
@@ -183,8 +184,11 @@ struct moq_msquic_managed_lane {
 struct moq_msquic_managed {
     moq_alloc_t alloc;
     moq_msquic_managed_cfg_t cfg; /* shallow; strings owned below */
-    moq_version_t version;        /* resolved (0 -> draft-16) */
-    const char *alpn;             /* static string from the version map */
+    moq_version_t version;        /* exact endpoint version, or 0 for multi-server */
+    moq_version_t versions[MOQ_MSQUIC_MANAGED_MAX_VERSIONS];
+    size_t version_count;
+    QUIC_BUFFER alpns[MOQ_MSQUIC_MANAGED_MAX_VERSIONS];
+    uint32_t alpn_count;
     size_t max_connections;       /* resolved cap (0 -> 1), facade-wide */
     char *host;
     char *cert_path;
@@ -255,6 +259,74 @@ static void mgd_strfree(const moq_alloc_t *alloc, char *s)
 {
     if (s != NULL)
         alloc->free(s, strlen(s) + 1, alloc->ctx);
+}
+
+#define MGD_CFG_FIELD_END(field) \
+    (offsetof(moq_msquic_managed_cfg_t, field) + \
+     sizeof(((moq_msquic_managed_cfg_t *)0)->field))
+
+static bool mgd_cfg_covers_field(size_t struct_size, size_t field_end)
+{
+    return struct_size >= field_end;
+}
+
+static bool mgd_cfg_has_version_list_block(const moq_msquic_managed_cfg_t *cfg)
+{
+    return mgd_cfg_covers_field(cfg->struct_size,
+                                MGD_CFG_FIELD_END(version_count));
+}
+
+static bool mgd_version_list_contains(const moq_version_t *versions,
+                                      size_t count, moq_version_t version)
+{
+    for (size_t i = 0; i < count; i++)
+        if (versions[i] == version)
+            return true;
+    return false;
+}
+
+static moq_result_t mgd_validate_version_list(
+    const moq_version_t *versions, size_t count)
+{
+    if (versions == NULL || count == 0 ||
+        count > MOQ_MSQUIC_MANAGED_MAX_VERSIONS)
+        return MOQ_ERR_INVAL;
+
+    for (size_t i = 0; i < count; i++) {
+        if (moq_alpn_for_version(versions[i]) == NULL)
+            return MOQ_ERR_UNSUPPORTED;
+        for (size_t j = 0; j < i; j++)
+            if (versions[i] == versions[j])
+                return MOQ_ERR_INVAL;
+    }
+    return MOQ_OK;
+}
+
+static moq_result_t mgd_store_alpns(moq_msquic_managed_t *m,
+                                    const moq_version_t *versions,
+                                    size_t count)
+{
+    if (count == 0 || count > MOQ_MSQUIC_MANAGED_MAX_VERSIONS)
+        return MOQ_ERR_INVAL;
+
+    m->version_count = count;
+    m->alpn_count = (uint32_t)count;
+    for (size_t i = 0; i < count; i++) {
+        const char *alpn = moq_alpn_for_version(versions[i]);
+
+        if (alpn == NULL)
+            return MOQ_ERR_UNSUPPORTED;
+        m->versions[i] = versions[i];
+        m->alpns[i].Length = (uint32_t)strlen(alpn);
+        m->alpns[i].Buffer = (uint8_t *)(uintptr_t)alpn;
+    }
+    return MOQ_OK;
+}
+
+static bool mgd_offered_version(const moq_msquic_managed_t *m,
+                                moq_version_t version)
+{
+    return mgd_version_list_contains(m->versions, m->version_count, version);
 }
 
 /* Bump facade activity for wait(). Takes m->mu briefly; callers hold at
@@ -361,6 +433,7 @@ static void mgd_hook(moq_msquic_conn_t *conn, void *user)
  * mutex; the caller sets mc->lane and appends under lane->mu before any
  * callback can fire (i.e. before ConnectionSetConfiguration / Start). */
 static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
+                                   moq_version_t negotiated_version,
                                    moq_msquic_managed_conn_t **out)
 {
     moq_msquic_managed_conn_t *mc =
@@ -370,11 +443,12 @@ static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
         return MOQ_ERR_NOMEM;
     memset(mc, 0, sizeof(*mc));
     mc->owner = m;
+    mc->negotiated_version = negotiated_version;
 
     moq_session_cfg_t scfg;
     moq_session_cfg_init_sized(&scfg, sizeof(scfg), &m->alloc,
                                m->cfg.perspective);
-    scfg.version = m->version; /* matches the one offered ALPN */
+    scfg.version = negotiated_version; /* matches the negotiated ALPN */
     if (m->cfg.send_request_capacity)
         scfg.send_request_capacity = 1;
     if (m->cfg.initial_request_capacity != 0)
@@ -478,6 +552,15 @@ static QUIC_STATUS QUIC_API mgd_listener_cb(HQUIC listener, void *ctx,
     if (ev->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION)
         return QUIC_STATUS_SUCCESS;
 
+    moq_version_t selected_version = 0;
+    const QUIC_NEW_CONNECTION_INFO *info = ev->NEW_CONNECTION.Info;
+    if (info == NULL || info->NegotiatedAlpn == NULL ||
+        !moq_alpn_to_version((const char *)info->NegotiatedAlpn,
+                             info->NegotiatedAlpnLength,
+                             &selected_version) ||
+        !mgd_offered_version(m, selected_version))
+        return QUIC_STATUS_CONNECTION_REFUSED;
+
     /* (b) reserve facade capacity under m->mu, then RELEASE it — so
      * choose_lane and the lane append never run under m->mu (which
      * would reverse the lane->mu -> m->mu order). The reserve
@@ -518,7 +601,7 @@ static QUIC_STATUS QUIC_API mgd_listener_cb(HQUIC listener, void *ctx,
 
     /* (a) create the child (no locks; not visible yet). */
     moq_msquic_managed_conn_t *mc = NULL;
-    if (mgd_make_child(m, &mc) != MOQ_OK) {
+    if (mgd_make_child(m, selected_version, &mc) != MOQ_OK) {
         mgd_release_reserve(m);
         return QUIC_STATUS_OUT_OF_MEMORY;
     }
@@ -674,7 +757,7 @@ bool moq_msq_test_lane_inject_terminal_child(moq_msquic_managed_lane_t *lane,
     m->conn_count++;
     pthread_mutex_unlock(&m->mu);
 
-    if (mgd_make_child(m, &mc) != MOQ_OK) {
+    if (mgd_make_child(m, m->version, &mc) != MOQ_OK) {
         mgd_release_reserve(m);
         return false;
     }
@@ -1341,6 +1424,12 @@ static void mgd_copy_cfg(moq_msquic_managed_t *m,
      * default unless the caller-sized prefix covers the whole field. */
     if (!MGD_CFG_HAS(cfg, max_open_subgroups))
         m->cfg.max_open_subgroups = 0;
+    /* The caller's version array is borrowed only through create(). Public
+     * multi-version construction repoints this pair at facade-owned storage
+     * after validating and copying it; test-only exact constructors retain no
+     * caller pointer. */
+    m->cfg.versions = NULL;
+    m->cfg.version_count = 0;
 }
 
 /*
@@ -1531,9 +1620,28 @@ moq_result_t moq_msquic_managed_create(
     mgd_derived_cfg_t derived;
 
     mgd_derive_cfg(cfg, is_client, &derived);
-    const char *alpn_str = moq_alpn_for_version(derived.version);
-    if (alpn_str == NULL)
+    moq_version_t exact_version = derived.version;
+    if (moq_alpn_for_version(exact_version) == NULL)
         return MOQ_ERR_UNSUPPORTED;
+
+    const moq_version_t *offered_versions = &exact_version;
+    size_t offered_count = 1;
+    bool multi_version_server = false;
+    if (mgd_cfg_has_version_list_block(cfg)) {
+        if ((cfg->versions == NULL) != (cfg->version_count == 0))
+            return MOQ_ERR_INVAL;
+        if (cfg->version_count != 0) {
+            if (is_client || cfg->version != 0)
+                return MOQ_ERR_INVAL;
+            moq_result_t vr =
+                mgd_validate_version_list(cfg->versions, cfg->version_count);
+            if (vr != MOQ_OK)
+                return vr;
+            offered_versions = cfg->versions;
+            offered_count = cfg->version_count;
+            multi_version_server = true;
+        }
+    }
 
     /* Reject an out-of-range subgroup pool HERE -- before any allocation or
      * transport setup -- so the caller sees the core's own MOQ_ERR_INVAL
@@ -1556,9 +1664,18 @@ moq_result_t moq_msquic_managed_create(
     /* The helper also applies the app-deadline whole-block ABI gate. */
     mgd_copy_cfg(m, cfg);
     mgd_apply_derived_cfg(m, &derived);
-    m->alpn = alpn_str;
+    m->version = multi_version_server ? (moq_version_t)0 : exact_version;
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
+    moq_result_t ar = mgd_store_alpns(m, offered_versions, offered_count);
+    if (ar != MOQ_OK) {
+        mgd_free(m);
+        return ar;
+    }
+    if (multi_version_server) {
+        m->cfg.versions = m->versions;
+        m->cfg.version_count = m->version_count;
+    }
     if (mgd_lanes_alloc(m) != MOQ_OK) {
         mgd_free(m);
         return MOQ_ERR_NOMEM;
@@ -1620,13 +1737,9 @@ moq_result_t moq_msquic_managed_create(
 
     QUIC_SETTINGS settings;
     mgd_build_settings(cfg, &settings);
-    QUIC_BUFFER alpn = {
-        (uint32_t)strlen(m->alpn),
-        (uint8_t *)(uintptr_t)m->alpn,
-    };
     if (QUIC_FAILED(m->api->ConfigurationOpen(
-            m->registration, &alpn, 1, &settings, sizeof(settings),
-            NULL, &m->configuration))) {
+            m->registration, m->alpns, m->alpn_count, &settings,
+            sizeof(settings), NULL, &m->configuration))) {
         mgd_close_transport(m);
         mgd_free(m);
         return MOQ_ERR_INTERNAL;
@@ -1658,7 +1771,7 @@ moq_result_t moq_msquic_managed_create(
     if (is_client) {
         moq_msquic_managed_conn_t *mc = NULL;
 
-        if (mgd_make_child(m, &mc) != MOQ_OK) {
+        if (mgd_make_child(m, m->version, &mc) != MOQ_OK) {
             mgd_close_transport(m);
             mgd_free(m);
             return MOQ_ERR_INTERNAL;
@@ -1707,8 +1820,8 @@ moq_result_t moq_msquic_managed_create(
         QuicAddrSetPort(&addr, cfg->port);
         if (QUIC_FAILED(m->api->ListenerOpen(
                 m->registration, mgd_listener_cb, m, &m->listener)) ||
-            QUIC_FAILED(m->api->ListenerStart(m->listener, &alpn, 1,
-                                              &addr))) {
+            QUIC_FAILED(m->api->ListenerStart(m->listener, m->alpns,
+                                              m->alpn_count, &addr))) {
             mgd_close_transport(m);
             mgd_free(m);
             return MOQ_ERR_INTERNAL;
@@ -1802,6 +1915,8 @@ static moq_result_t mgd_test_create_lanes_only(
     mgd_derived_cfg_t derived;
 
     mgd_derive_cfg(cfg, cfg->perspective == MOQ_PERSPECTIVE_CLIENT, &derived);
+    if (moq_alpn_for_version(derived.version) == NULL)
+        return MOQ_ERR_UNSUPPORTED;
 
     moq_msquic_managed_t *m = cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);
 
@@ -1811,9 +1926,13 @@ static moq_result_t mgd_test_create_lanes_only(
     m->alloc = *cfg->alloc;
     mgd_copy_cfg(m, cfg);
     mgd_apply_derived_cfg(m, &derived);
-    m->alpn = moq_alpn_for_version(m->version);
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
+    moq_result_t ar = mgd_store_alpns(m, &m->version, 1);
+    if (ar != MOQ_OK) {
+        mgd_free(m);
+        return ar;
+    }
     if (mgd_lanes_alloc(m) != MOQ_OK) {
         mgd_free(m);
         return MOQ_ERR_NOMEM;
@@ -1886,10 +2005,18 @@ QUIC_STATUS moq_msq_test_listener_accept(moq_msquic_managed_t *m,
                                          HQUIC connection)
 {
     QUIC_LISTENER_EVENT ev;
+    QUIC_NEW_CONNECTION_INFO info;
+
+    if (m == NULL || m->alpn_count == 0)
+        return QUIC_STATUS_CONNECTION_REFUSED;
 
     memset(&ev, 0, sizeof(ev));
+    memset(&info, 0, sizeof(info));
+    info.NegotiatedAlpn = m->alpns[0].Buffer;
+    info.NegotiatedAlpnLength = (uint16_t)m->alpns[0].Length;
     ev.Type = QUIC_LISTENER_EVENT_NEW_CONNECTION;
     ev.NEW_CONNECTION.Connection = connection;
+    ev.NEW_CONNECTION.Info = &info;
     return mgd_listener_cb(NULL, m, &ev);
 }
 
@@ -1917,7 +2044,7 @@ moq_result_t moq_msq_test_lane_inject_live_child(
     m->conn_count++;
     pthread_mutex_unlock(&m->mu);
 
-    moq_result_t rc = mgd_make_child(m, &mc);
+    moq_result_t rc = mgd_make_child(m, m->version, &mc);
     if (rc != MOQ_OK) {
         mgd_release_reserve(m);
         return rc;
@@ -2522,8 +2649,16 @@ uint64_t moq_msquic_managed_close_code(const moq_msquic_managed_t *cm)
 moq_version_t moq_msquic_managed_negotiated_version(
     const moq_msquic_managed_t *m)
 {
-    /* exact-version: m->version is fixed at create() from the single
-     * offered ALPN, so it IS the negotiated version. Immutable after
+    /* Exact endpoints fix m->version at create(); multi-version servers keep
+     * it at 0 because version is per accepted connection. Immutable after
      * create, so no lock is needed. */
     return m != NULL ? m->version : (moq_version_t)0;
+}
+
+moq_version_t moq_msquic_managed_conn_negotiated_version(
+    const moq_msquic_managed_conn_t *conn)
+{
+    if (conn == NULL || !mgd_in_lane_pump(conn->lane))
+        return (moq_version_t)0;
+    return conn->negotiated_version;
 }

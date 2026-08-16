@@ -86,13 +86,14 @@
  * moq_msquic_managed_session() is pump-scoped and simply reads NULL once
  * that connection is gone.
  *
- * Version: exact-version. The facade offers exactly one MoQ ALPN,
- * chosen by cfg.version (default draft-16 / "moqt-16"), and creates
- * the session at that version eagerly. A client/server version
- * mismatch therefore fails ALPN negotiation at the handshake: the
- * client observes a bounded fatal terminal with no MoQ setup, and the
- * server never accepts the connection. Deferred multi-version offers
- * (a real ALPN list) are a later addition.
+ * Version: clients are exact-version and offer exactly one MoQ ALPN,
+ * chosen by cfg.version (default draft-16 / "moqt-16"). Servers may
+ * either offer that same exact single ALPN, or append a version list in
+ * cfg.versions/cfg.version_count and accept several draft ALPNs on one
+ * listener. The server list is ordered by preference, most preferred first;
+ * the selected version is the first mutually supported entry in that server
+ * list. A multi-version server creates each child session at the version
+ * MsQuic reports for that accepted connection.
  *
  * Teardown: stop() refuses new accepts, shuts every live connection
  * down, waits for each transport to quiesce (all pending sends and
@@ -120,9 +121,12 @@ typedef struct moq_msquic_managed_lane moq_msquic_managed_lane_t;
 /* An accepted connection (server) or the single client connection. */
 typedef struct moq_msquic_managed_conn moq_msquic_managed_conn_t;
 
+#define MOQ_MSQUIC_MANAGED_MAX_VERSIONS 8u
+
 /* Information available at server accept, for lane placement. Sparse
- * for now (only struct_size); peer address / negotiated ALPN / version
- * land later behind struct_size without breaking choose_lane. */
+ * for now (only struct_size). The negotiated MoQ version is available
+ * later from moq_msquic_managed_conn_negotiated_version() once the
+ * accepted connection is visible in its lane pump. */
 typedef struct moq_msquic_accept_info {
     uint32_t struct_size;
 } moq_msquic_accept_info_t;
@@ -216,7 +220,7 @@ typedef struct moq_msquic_managed_cfg {
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
 
-    /* appended LAST (after the app_deadline block): outgoing subgroup pool per
+    /* appended: outgoing subgroup pool per
      * session, forwarded verbatim to moq_session_cfg_t.max_open_subgroups
      * (0 = session default -- and what prefix-sized callers get). A small value
      * makes the SESSION's write pool the sender-side blocker independent of any
@@ -229,6 +233,27 @@ typedef struct moq_msquic_managed_cfg {
      * transport setup -- the core's own limit, reported at the facade rather
      * than surfacing later as an internal or transport error. */
     uint32_t max_open_subgroups;
+    /* appended LAST: SERVER-only list of MoQ versions to offer as ALPNs on one
+     * listener, ordered by server preference (most preferred first). The
+     * selected version is the first mutually supported entry in this server
+     * list. The list is one ABI block: honored only when struct_size covers
+     * both pointer and count entirely; prefix/partial callers behave as absent.
+     *
+     * When version_count == 0, the exact-version cfg.version field above remains
+     * authoritative (0 = draft-16). When version_count > 0:
+     *   - perspective must be SERVER;
+     *   - cfg.version must be 0 (no exact-version/list conflict);
+     *   - versions must point at 1..MOQ_MSQUIC_MANAGED_MAX_VERSIONS entries;
+     *   - entries must be known MoQ versions and must not duplicate.
+     *
+     * create() deep-copies the list and ALPN buffer array before starting
+     * transport; the caller may free or mutate the source array after create().
+     * A multi-version SERVER returns 0 from the facade-level
+     * moq_msquic_managed_negotiated_version(); use
+     * moq_msquic_managed_conn_negotiated_version() inside the lane pump for an
+     * accepted connection's immutable selected draft. */
+    const moq_version_t *versions;
+    size_t version_count;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(
@@ -498,12 +523,18 @@ MOQ_API bool moq_msquic_managed_is_closed(const moq_msquic_managed_t *m);
 MOQ_API uint64_t moq_msquic_managed_close_code(
     const moq_msquic_managed_t *m);
 
-/* The MoQ version this facade speaks. Exact-version: the single offered
- * ALPN fixes it at create(), so this is the negotiated version from that
- * point (0 only for a NULL facade). Parity with the other managed
- * adapters' negotiated_version accessor. */
+/* The MoQ version this facade speaks. Exact-version endpoints know it at
+ * create(). A multi-version SERVER returns 0 here because version is
+ * per-accepted-connection; use the conn accessor from the lane pump. */
 MOQ_API moq_version_t moq_msquic_managed_negotiated_version(
     const moq_msquic_managed_t *m);
+
+/* The immutable MoQ version selected for an accepted server connection or the
+ * single client connection. Valid only for an application-owned connection
+ * pointer inside its owning on_lane_pump; returns 0 for NULL or outside that
+ * pump window. */
+MOQ_API moq_version_t moq_msquic_managed_conn_negotiated_version(
+    const moq_msquic_managed_conn_t *conn);
 
 #ifdef __cplusplus
 }
