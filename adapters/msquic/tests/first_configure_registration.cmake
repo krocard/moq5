@@ -1,0 +1,385 @@
+# Configure-order regression: one fresh configure must register every test.
+#
+# A guard that reads a find_program() result BEFORE the find_program() runs is
+# invisible to any build directory that has already been configured once: the
+# first pass silently drops the test, and the cache makes every later pass look
+# correct. So this fixture cannot inspect the build tree it is running in. It
+# configures a CHILD build in a directory it deletes first, and compares the
+# CTest name set after the child's FIRST configure against the set after an
+# immediate identical SECOND configure.
+#
+# Comparison is exact sorted-list equality. A sorted list preserves
+# MULTIPLICITY, so a duplicate registration that appears in one pass and not the
+# other is a difference; the mismatch diagnostic prints both full lists rather
+# than a set subtraction, because subtraction cannot express "the same name,
+# twice".
+#
+# DISCOVERY MODE IS READ FROM THE MODULE THAT RESOLVED IT, and the child's
+# resulting dependency IDENTITY is then validated from its own cache before any
+# CTest query. A mode inferred from a cache HINT is not proof: msquic_DIR can be
+# stale while package discovery is disabled and the checkout fallback is what
+# actually ran, and a child sent off with that stale hint silently resolves
+# whatever ambient package it can find -- passing while testing a different
+# dependency than its parent.
+#
+# DISCOVERY MODE IS AN EXPLICIT CONTRACT, not a guess. The project finds MsQuic
+# two documented ways (cmake/FindMsQuic.cmake): an installed msquic CONFIG
+# package, or a checkout root. The config path RETURNS before MOQ_MSQUIC_ROOT is
+# ever set, so a child told only "use this root" cannot reproduce a parent that
+# used the package. The parent therefore states which mode it used and the child
+# is pinned to exactly that one -- never left to discover whichever dependency
+# happens to win.
+#
+# The name set comes from CTest's STRUCTURED output (--show-only=json-v1),
+# parsed with string(JSON) -- both within the project's declared CMake 3.20
+# floor. CTest's human listing is documented as unstable, so it is not a
+# boundary worth hardening; a schema-checked document is.
+#
+# Every step is fail-closed. A failed configure, a failed CTest query, a
+# document that is not valid JSON, a missing or wrong-typed `tests` array, a
+# non-object entry, a missing/wrong-typed/empty `name`, or an empty set is a
+# FAILURE -- never an empty or partial set that happens to compare equal to
+# another.
+#
+# The child is configured with MOQ_MSQUIC_REGISTRATION_CHILD=ON so it does not
+# register this fixture again. The fixture asserts that suppression actually
+# took effect, so deleting or inverting it fails here rather than nesting.
+
+cmake_minimum_required(VERSION 3.20)
+
+foreach(_v SOURCE_DIR BUILD_DIR CMAKE_CMD CTEST_CMD MSQUIC_MODE
+           EXPECT_RECV_LOOPBACK SELF_TEST_NAME)
+    if(NOT DEFINED ${_v})
+        message(FATAL_ERROR "first_configure_registration: ${_v} not provided")
+    endif()
+endforeach()
+
+# -- pin the child to the parent's ACTUAL MsQuic discovery mode --------------
+if(MSQUIC_MODE STREQUAL "package")
+    if(NOT DEFINED MSQUIC_DIR OR MSQUIC_DIR STREQUAL "")
+        message(FATAL_ERROR
+            "first_configure_registration: MSQUIC_MODE=package but no "
+            "MSQUIC_DIR was forwarded")
+    endif()
+    # Pin the exact package directory; do NOT disable the package search, since
+    # the package IS the parent's dependency.
+    set(MSQUIC_ARGS "-Dmsquic_DIR=${MSQUIC_DIR}")
+elseif(MSQUIC_MODE STREQUAL "root")
+    if(NOT DEFINED MSQUIC_ROOT OR MSQUIC_ROOT STREQUAL "")
+        message(FATAL_ERROR
+            "first_configure_registration: MSQUIC_MODE=root but no "
+            "MSQUIC_ROOT was forwarded")
+    endif()
+    # Pin the exact checkout and refuse an ambient package, so the child cannot
+    # silently resolve a different dependency than the parent did.
+    set(MSQUIC_ARGS
+        "-DCMAKE_DISABLE_FIND_PACKAGE_msquic=TRUE"
+        "-DMOQ_MSQUIC_ROOT=${MSQUIC_ROOT}")
+else()
+    message(FATAL_ERROR
+        "first_configure_registration: MSQUIC_MODE is '${MSQUIC_MODE}', which "
+        "is not a branch this fixture can reproduce. It must be the value "
+        "FindMsQuic.cmake recorded for the branch that actually resolved "
+        "MsQuic ('package' or 'root').")
+endif()
+
+# -- openssl: give the child a search HINT, never the cached result ----------
+# The child must run its own first-pass find_program -- forwarding MOQ_OPENSSL
+# would pre-seed the very cache entry whose absence the defect hides in, and the
+# regression would pass vacuously. But a parent configured against a non-ambient
+# openssl must not produce a false failure on a host where that directory is not
+# on CTest's PATH, so its DIRECTORY is added to the child's program search path.
+if(DEFINED OPENSSL_HINT_DIR AND NOT OPENSSL_HINT_DIR STREQUAL "")
+    list(APPEND MSQUIC_ARGS "-DCMAKE_PROGRAM_PATH=${OPENSSL_HINT_DIR}")
+endif()
+
+# -- fresh child directory, proven fresh -------------------------------------
+# Reusing a preconfigured directory is exactly what hides the defect, so the
+# removal is verified rather than assumed.
+file(REMOVE_RECURSE "${BUILD_DIR}")
+if(EXISTS "${BUILD_DIR}")
+    message(FATAL_ERROR
+        "first_configure_registration: could not remove ${BUILD_DIR}; "
+        "refusing to run against a directory that may already be configured")
+endif()
+
+function(ar_configure_child pass_label)
+    execute_process(
+        COMMAND "${CMAKE_CMD}" -S "${SOURCE_DIR}" -B "${BUILD_DIR}"
+                -DMOQ_BUILD_ADAPTER_MSQUIC=ON
+                -DMOQ_BUILD_MSQUIC_MANAGED=ON
+                ${MSQUIC_ARGS}
+                -DMOQ_MSQUIC_REGISTRATION_CHILD=ON
+        RESULT_VARIABLE rc
+        OUTPUT_VARIABLE out
+        ERROR_VARIABLE err)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} configure failed "
+            "(rc=${rc})\n--- stdout ---\n${out}\n--- stderr ---\n${err}")
+    endif()
+endfunction()
+
+# Returns the sorted CTest name list, read from the structured listing. Every
+# element is schema-checked, so a document that is valid JSON but not the shape
+# we expect fails instead of yielding a short list that could compare equal to
+# another short list.
+function(ar_test_names pass_label out_var)
+    execute_process(
+        COMMAND "${CTEST_CMD}" --test-dir "${BUILD_DIR}" --show-only=json-v1
+        RESULT_VARIABLE rc
+        OUTPUT_VARIABLE out
+        ERROR_VARIABLE err)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} ctest "
+            "--show-only=json-v1 failed (rc=${rc})\n"
+            "--- stdout ---\n${out}\n--- stderr ---\n${err}")
+    endif()
+
+    # Top level must be a JSON object.
+    string(JSON doc_type ERROR_VARIABLE jerr TYPE "${out}")
+    if(jerr OR NOT doc_type STREQUAL "OBJECT")
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} listing is not a JSON "
+            "object (type='${doc_type}' error='${jerr}').\n"
+            "--- ctest output ---\n${out}")
+    endif()
+
+    # `tests` must be present and an array.
+    string(JSON tests_type ERROR_VARIABLE jerr TYPE "${out}" tests)
+    if(jerr OR NOT tests_type STREQUAL "ARRAY")
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} listing has no "
+            "`tests` ARRAY (type='${tests_type}' error='${jerr}').\n"
+            "--- ctest output ---\n${out}")
+    endif()
+
+    string(JSON n_tests ERROR_VARIABLE jerr LENGTH "${out}" tests)
+    if(jerr)
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} could not measure the "
+            "`tests` array: ${jerr}\n--- ctest output ---\n${out}")
+    endif()
+
+    set(names "")
+    if(n_tests GREATER 0)
+        math(EXPR last "${n_tests} - 1")
+        foreach(i RANGE ${last})
+            string(JSON item_type ERROR_VARIABLE jerr TYPE "${out}" tests ${i})
+            if(jerr OR NOT item_type STREQUAL "OBJECT")
+                message(FATAL_ERROR
+                    "first_configure_registration: ${pass_label} tests[${i}] is "
+                    "not an OBJECT (type='${item_type}' error='${jerr}').\n"
+                    "--- ctest output ---\n${out}")
+            endif()
+            string(JSON name_type ERROR_VARIABLE jerr TYPE "${out}"
+                   tests ${i} name)
+            if(jerr OR NOT name_type STREQUAL "STRING")
+                message(FATAL_ERROR
+                    "first_configure_registration: ${pass_label} tests[${i}] "
+                    "has no STRING `name` (type='${name_type}' "
+                    "error='${jerr}').\n--- ctest output ---\n${out}")
+            endif()
+            string(JSON nm ERROR_VARIABLE jerr GET "${out}" tests ${i} name)
+            if(jerr OR nm STREQUAL "")
+                message(FATAL_ERROR
+                    "first_configure_registration: ${pass_label} tests[${i}] "
+                    "has an empty name (error='${jerr}').\n"
+                    "--- ctest output ---\n${out}")
+            endif()
+            list(APPEND names "${nm}")
+        endforeach()
+    endif()
+
+    # Every array element yielded exactly one name.
+    list(LENGTH names parsed)
+    if(NOT parsed EQUAL n_tests)
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} read ${parsed} names "
+            "from a `tests` array of ${n_tests}.\n"
+            "--- ctest output ---\n${out}")
+    endif()
+
+    if(names STREQUAL "")
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} found NO tests. "
+            "An empty set must never compare equal.\n"
+            "--- ctest output ---\n${out}")
+    endif()
+
+    list(SORT names)
+    set(${out_var} "${names}" PARENT_SCOPE)
+endfunction()
+
+# Read one cache entry from the child. Fails closed: a missing entry, or the
+# same key appearing more than once, is an error rather than an empty string
+# that would silently compare equal to another empty string.
+function(ar_cache_get key out_var)
+    set(cache_file "${BUILD_DIR}/CMakeCache.txt")
+    if(NOT EXISTS "${cache_file}")
+        message(FATAL_ERROR
+            "first_configure_registration: no ${cache_file} to validate the "
+            "child's dependency identity against")
+    endif()
+    file(STRINGS "${cache_file}" hits REGEX "^${key}:[^=]*=")
+    list(LENGTH hits n)
+    if(n EQUAL 0)
+        file(READ "${cache_file}" cache_text)
+        message(FATAL_ERROR
+            "first_configure_registration: child cache has no '${key}'.\n"
+            "--- child CMakeCache.txt ---\n${cache_text}")
+    elseif(NOT n EQUAL 1)
+        message(FATAL_ERROR
+            "first_configure_registration: child cache has ${n} entries for "
+            "'${key}', which is contradictory: ${hits}")
+    endif()
+    list(GET hits 0 line)
+    string(REGEX REPLACE "^${key}:[^=]*=" "" val "${line}")
+    set(${out_var} "${val}" PARENT_SCOPE)
+endfunction()
+
+# Compare two paths as paths, not as strings: resolve both before comparing so a
+# symlinked or non-normalized spelling is not reported as a mismatch. An empty
+# expectation is refused rather than matching everything.
+function(ar_same_path label got want)
+    if(want STREQUAL "")
+        message(FATAL_ERROR
+            "first_configure_registration: ${label}: nothing to compare "
+            "against -- the parent forwarded an empty expected path")
+    endif()
+    get_filename_component(g "${got}" REALPATH)
+    get_filename_component(w "${want}" REALPATH)
+    if(NOT g STREQUAL w)
+        message(FATAL_ERROR
+            "first_configure_registration: ${label} identity mismatch.\n"
+            "  child resolved: ${got}\n"
+            "     (real path)  ${g}\n"
+            "  parent used:    ${want}\n"
+            "     (real path)  ${w}\n"
+            "The child must exercise the parent's dependency, not whichever "
+            "one its own search happens to find.")
+    endif()
+endfunction()
+
+# Is `path` inside `root`? Both are resolved first.
+function(ar_path_under label path root)
+    get_filename_component(p "${path}" REALPATH)
+    get_filename_component(r "${root}" REALPATH)
+    string(FIND "${p}" "${r}/" pos)
+    if(NOT pos EQUAL 0)
+        message(FATAL_ERROR
+            "first_configure_registration: ${label} does not belong to the "
+            "parent's MsQuic root.\n  resolved: ${p}\n  root:     ${r}")
+    endif()
+endfunction()
+
+# After a child configure, prove it resolved the SAME dependency the parent did.
+function(ar_check_identity pass_label)
+    if(MSQUIC_MODE STREQUAL "package")
+        ar_cache_get("msquic_DIR" child_pkg)
+        ar_same_path("${pass_label} msquic_DIR" "${child_pkg}" "${MSQUIC_DIR}")
+    else()
+        ar_cache_get("CMAKE_DISABLE_FIND_PACKAGE_msquic" child_disable)
+        if(NOT child_disable)
+            message(FATAL_ERROR
+                "first_configure_registration: ${pass_label} root mode but the "
+                "child left package discovery enabled "
+                "(CMAKE_DISABLE_FIND_PACKAGE_msquic='${child_disable}'), so it "
+                "may have resolved an ambient package instead of the root")
+        endif()
+        ar_cache_get("MOQ_MSQUIC_ROOT" child_root)
+        ar_same_path("${pass_label} MOQ_MSQUIC_ROOT" "${child_root}"
+                     "${MSQUIC_ROOT}")
+        # The root can be right while the resolved artifacts came from
+        # somewhere else, so both are checked against it.
+        ar_cache_get("MOQ_MSQUIC_INCLUDE_DIR" child_inc)
+        ar_cache_get("MOQ_MSQUIC_LIBRARY" child_lib)
+        ar_path_under("${pass_label} MOQ_MSQUIC_INCLUDE_DIR" "${child_inc}"
+                      "${MSQUIC_ROOT}")
+        ar_path_under("${pass_label} MOQ_MSQUIC_LIBRARY" "${child_lib}"
+                      "${MSQUIC_ROOT}")
+        if(DEFINED MSQUIC_INCLUDE_DIR AND NOT MSQUIC_INCLUDE_DIR STREQUAL "")
+            ar_same_path("${pass_label} include dir" "${child_inc}"
+                         "${MSQUIC_INCLUDE_DIR}")
+        endif()
+        if(DEFINED MSQUIC_LIBRARY AND NOT MSQUIC_LIBRARY STREQUAL "")
+            ar_same_path("${pass_label} library" "${child_lib}"
+                         "${MSQUIC_LIBRARY}")
+        endif()
+    endif()
+
+    # OpenSSL: the child ran its OWN find_program (the result was never
+    # forwarded), so this proves the hint steered that search onto the parent's
+    # executable rather than some other openssl on the host.
+    if(DEFINED EXPECT_OPENSSL AND NOT EXPECT_OPENSSL STREQUAL "")
+        ar_cache_get("MOQ_OPENSSL" child_ssl)
+        ar_same_path("${pass_label} MOQ_OPENSSL" "${child_ssl}"
+                     "${EXPECT_OPENSSL}")
+    endif()
+endfunction()
+
+ar_configure_child("first")
+ar_check_identity("first")
+ar_test_names("first" first_names)
+
+ar_configure_child("second")
+ar_check_identity("second")
+ar_test_names("second" second_names)
+
+# -- 1. the two passes must agree exactly, multiplicity included -------------
+if(NOT first_names STREQUAL second_names)
+    list(LENGTH first_names n_first)
+    list(LENGTH second_names n_second)
+    # A set subtraction names the usual case directly, but it reports NOTHING
+    # when the only difference is how many times a name appears. Both full
+    # sorted lists are therefore printed too, and they are authoritative.
+    set(second_only "${second_names}")
+    list(REMOVE_ITEM second_only ${first_names})
+    set(first_only "${first_names}")
+    list(REMOVE_ITEM first_only ${second_names})
+    message(FATAL_ERROR
+        "first_configure_registration: the first configure did not register "
+        "the same tests as an immediate second configure.\n"
+        "  registered only by the SECOND pass: ${second_only}\n"
+        "  registered only by the FIRST pass:  ${first_only}\n"
+        "  (a duplicate-only difference shows in neither line above; the full "
+        "sorted lists are authoritative)\n"
+        "  FIRST pass  (${n_first}): ${first_names}\n"
+        "  SECOND pass (${n_second}): ${second_names}\n"
+        "A guard that reads a cache entry its own find_program() has not yet "
+        "written produces exactly this.")
+endif()
+
+list(LENGTH first_names n_first)
+
+# -- 2. the OpenSSL-dependent test the defect dropped ------------------------
+if(EXPECT_RECV_LOOPBACK)
+    if(NOT "msquic_recv_loopback" IN_LIST first_names)
+        message(FATAL_ERROR
+            "first_configure_registration: openssl was discovered by the "
+            "parent, so a single fresh configure must already register "
+            "msquic_recv_loopback -- it is absent from the first pass.\n"
+            "  first-pass names: ${first_names}")
+    endif()
+else()
+    if("msquic_recv_loopback" IN_LIST first_names)
+        message(FATAL_ERROR
+            "first_configure_registration: openssl was NOT discovered, so no "
+            "certificate-dependent test may be registered, but "
+            "msquic_recv_loopback is present")
+    endif()
+endif()
+
+# -- 3. the recursion suppression really suppressed --------------------------
+if("${SELF_TEST_NAME}" IN_LIST first_names)
+    message(FATAL_ERROR
+        "first_configure_registration: the child registered this fixture "
+        "(${SELF_TEST_NAME}) despite MOQ_MSQUIC_REGISTRATION_CHILD=ON, so the "
+        "suppression is not load-bearing")
+endif()
+
+file(REMOVE_RECURSE "${BUILD_DIR}")
+message(STATUS
+    "first_configure_registration: ${n_first} tests (mode=${MSQUIC_MODE}), "
+    "identical across both configures")

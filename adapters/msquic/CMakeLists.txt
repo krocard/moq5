@@ -256,6 +256,12 @@ if(MOQ_BUILD_TESTS)
     # Managed loopback: real MsQuic on localhost, self-signed certs,
     # managed client + managed server, one MoQ pub/sub flow.
     if(MOQ_BUILD_MSQUIC_MANAGED)
+        # Discover openssl BEFORE the first registration guard that reads it.
+        # find_program caches, so a discovery placed after its first use makes
+        # the FIRST configure of a fresh build tree drop every test guarded
+        # above it, while every later configure of the same tree looks correct.
+        find_program(MOQ_OPENSSL openssl)
+
         # Inbound receive-backpressure recovery over real MsQuic loopback:
         # a stalled receiver backpressures the sender, and on release the
         # whole workload is delivered byte-exact and exactly once. Narrow
@@ -290,7 +296,6 @@ if(MOQ_BUILD_TESTS)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
 
-        find_program(MOQ_OPENSSL openssl)
         if(MOQ_OPENSSL)
             add_test(NAME msquic_gen_certs
                 COMMAND ${MOQ_OPENSSL} req -x509 -newkey rsa:2048
@@ -495,6 +500,121 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(msquic_stress PROPERTIES
                 FIXTURES_REQUIRED msquic_certs
                 LABELS "network;msquic"
+                TIMEOUT 600)
+        endif()
+
+        # A configure-order guard that reads a find_program() result before the
+        # find_program() runs is invisible from inside an already-configured
+        # build tree, so this regression configures a throwaway CHILD build in
+        # a directory it deletes first and compares its first- and
+        # second-configure CTest name sets.
+        #
+        # MOQ_MSQUIC_REGISTRATION_CHILD is internal and test-only: the child
+        # sets it so it does not register this fixture again. It defaults OFF,
+        # so an ordinary configure still registers the top-level test, and the
+        # fixture asserts the suppression actually took effect.
+        # Validate the recorded branch HERE, in configure scope -- before and
+        # independently of whether OpenSSL exists or this particular test is
+        # registered. Doing it only inside the script would be unreachable for
+        # an empty or unrecognized mode, because such a mode fails the
+        # registration conjunction below and the script never runs: the test
+        # would silently disappear instead of failing.
+        if(NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
+           AND NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"
+           AND NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "preexisting")
+            message(FATAL_ERROR
+                "MsQuic was found but FindMsQuic recorded discovery mode "
+                "'${MOQ_MSQUIC_DISCOVERY_MODE}', which is not one of "
+                "package/root/preexisting. Every branch that resolves MsQuic "
+                "must record which one it was, or the configure-order "
+                "regression silently stops being registered.")
+        endif()
+
+        # The recorded branch, surfaced so a nested control can observe it
+        # without it having to live in (and pollute) the cache.
+        message(STATUS
+            "MsQuic discovery mode: ${MOQ_MSQUIC_DISCOVERY_MODE}")
+
+        # Registered only where openssl was actually discovered: without it no
+        # test is guarded on it in either pass, so the two passes agree
+        # trivially and there is nothing for this fixture to protect. The child
+        # is deliberately NOT told the parent's MOQ_OPENSSL -- passing it would
+        # pre-seed the cache the child's own first configure must populate, and
+        # that is exactly the state the defect hides in.
+        #
+        # Only for the two discovery branches an independent child can
+        # reproduce. FindMsQuic also supports a caller-supplied
+        # msquic::msquic target ("preexisting"); that dependency exists only
+        # in the parent's own scope, so a nested configure cannot be given it
+        # -- and inventing a fake package/root identity for it would test a
+        # different dependency. In that mode this one test is omitted while
+        # the rest of the MsQuic suite registers normally. Any other value
+        # already failed the configure-scope check above -- it is not silently
+        # dropped here.
+        if(MOQ_OPENSSL AND NOT MOQ_MSQUIC_REGISTRATION_CHILD
+           AND (MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
+                OR MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"))
+            # Which of FindMsQuic's discovery branches ACTUALLY resolved
+            # MsQuic this configure. Read from the module's own record, not
+            # inferred from msquic_DIR: a nonempty msquic_DIR can be stale while
+            # package discovery is disabled and the checkout fallback is what
+            # really ran, and classifying that as package mode would send the
+            # child off to whatever ambient package it can find.
+            set(_reg_mode "${MOQ_MSQUIC_DISCOVERY_MODE}")
+            # A search HINT only -- never the cached MOQ_OPENSSL result, which
+            # would pre-seed the cache entry the child's own first pass must
+            # populate. This keeps a parent pointed at a non-ambient openssl
+            # from failing on a host where that directory is off CTest's PATH.
+            # The executable itself is forwarded SEPARATELY, as the identity the
+            # child's own discovery must land on.
+            set(_reg_ssl_hint "")
+            if(MOQ_OPENSSL)
+                get_filename_component(_reg_ssl_hint "${MOQ_OPENSSL}" DIRECTORY)
+            endif()
+            add_test(NAME msquic_first_configure_registration
+                COMMAND ${CMAKE_COMMAND}
+                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                    -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/first-configure-child
+                    -DCMAKE_CMD=${CMAKE_COMMAND}
+                    -DCTEST_CMD=${CMAKE_CTEST_COMMAND}
+                    -DMSQUIC_MODE=${_reg_mode}
+                    "-DMSQUIC_DIR=${msquic_DIR}"
+                    "-DMSQUIC_ROOT=${MOQ_MSQUIC_ROOT}"
+                    "-DOPENSSL_HINT_DIR=${_reg_ssl_hint}"
+                    "-DEXPECT_OPENSSL=${MOQ_OPENSSL}"
+                    "-DMSQUIC_INCLUDE_DIR=${MOQ_MSQUIC_INCLUDE_DIR}"
+                    "-DMSQUIC_LIBRARY=${MOQ_MSQUIC_LIBRARY}"
+                    -DEXPECT_RECV_LOOPBACK=$<BOOL:${MOQ_OPENSSL}>
+                    -DSELF_TEST_NAME=msquic_first_configure_registration
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/first_configure_registration.cmake)
+            set_tests_properties(msquic_first_configure_registration PROPERTIES
+                LABELS "msquic"
+                TIMEOUT 600)
+        endif()
+
+        # FindMsQuic's preexisting-target branch: prove a caller-supplied
+        # msquic::msquic configures cleanly, records that branch, OMITS the
+        # nested-configure regression above rather than registering it to fail,
+        # and keeps the rest of the MsQuic suite. Registered only from the root
+        # branch, which is where a concrete include dir and library to import
+        # are known; the child it configures is a plain project configure, so it
+        # needs no recursion guard of its own.
+        if(NOT MOQ_MSQUIC_REGISTRATION_CHILD
+           AND MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"
+           AND MOQ_MSQUIC_INCLUDE_DIR AND MOQ_MSQUIC_LIBRARY)
+            add_test(NAME msquic_preexisting_target
+                COMMAND ${CMAKE_COMMAND}
+                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                    -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/preexisting-child
+                    -DCMAKE_CMD=${CMAKE_COMMAND}
+                    -DCTEST_CMD=${CMAKE_CTEST_COMMAND}
+                    "-DMSQUIC_INCLUDE_DIR=${MOQ_MSQUIC_INCLUDE_DIR}"
+                    "-DMSQUIC_LIBRARY=${MOQ_MSQUIC_LIBRARY}"
+                    "-DPARENT_OPENSSL=${MOQ_OPENSSL}"
+                    -DSELF_TEST_NAME=msquic_first_configure_registration
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/preexisting_msquic_target.cmake)
+            set_tests_properties(msquic_preexisting_target PROPERTIES
+                LABELS "msquic"
                 TIMEOUT 600)
         endif()
     endif()

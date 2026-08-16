@@ -9,9 +9,19 @@
 #      this checkout: header at src/inc/msquic.h, library under
 #      build/bin/.
 #
-# Result variables: MsQuic_FOUND
+# Result variables: MsQuic_FOUND, and MOQ_MSQUIC_DISCOVERY_MODE recording
+# WHICH branch actually resolved MsQuic ("package", "root", or "preexisting").
+# The mode is a fact about this configure, not a hint: a nonempty msquic_DIR
+# cache entry can be stale while package discovery is disabled and the checkout
+# fallback is what really ran, so nothing may infer the mode from that hint.
+# It is a NORMAL result variable, like MsQuic_FOUND: a fact about the current
+# configure, scoped to the caller and inherited by subdirectories added after
+# this call. It is deliberately not cached -- a consuming project's cache should
+# not carry it, and a normal variable also shadows any stale user-supplied cache
+# entry of the same name.
 
 if(TARGET msquic::msquic)
+    set(MOQ_MSQUIC_DISCOVERY_MODE "preexisting")
     set(MsQuic_FOUND TRUE)
     return()
 endif()
@@ -21,6 +31,7 @@ if(msquic_FOUND)
     if(TARGET msquic AND NOT TARGET msquic::msquic)
         add_library(msquic::msquic ALIAS msquic)
     endif()
+    set(MOQ_MSQUIC_DISCOVERY_MODE "package")
     set(MsQuic_FOUND TRUE)
     return()
 endif()
@@ -45,6 +56,12 @@ include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(MsQuic
     REQUIRED_VARS MOQ_MSQUIC_INCLUDE_DIR MOQ_MSQUIC_LIBRARY
 )
+
+# Recorded only once the fallback has actually RESOLVED MsQuic. The contract is
+# "which branch resolved it", so a failed root lookup must not claim `root`.
+if(MsQuic_FOUND)
+    set(MOQ_MSQUIC_DISCOVERY_MODE "root")
+endif()
 
 if(MsQuic_FOUND AND NOT TARGET msquic::msquic)
     add_library(msquic::msquic UNKNOWN IMPORTED)
