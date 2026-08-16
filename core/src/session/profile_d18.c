@@ -2941,6 +2941,7 @@ static const moq_profile_ops_t d18_ops = {
     .destroy                 = d18_destroy,
     .start                   = d18_start,
     .process_control_data    = d18_process_control_data,
+    .min_track_namespace_fields = 0,
     .uses_request_streams    = true,
     .location_varint_max     = MOQ_VI64_MAX,
     .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */

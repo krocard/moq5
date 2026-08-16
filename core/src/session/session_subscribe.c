@@ -2823,8 +2823,9 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     if (s->goaway_received) return MOQ_ERR_GOAWAY;
 
     /* Validate cfg BEFORE credit checks / REQUESTS_BLOCKED side effects. */
-    if (moq_validate_full_track_name(&cfg->track_namespace,
-                                      cfg->track_name) < 0)
+    if (moq_validate_full_track_name_min_fields(
+            &cfg->track_namespace, cfg->track_name,
+            s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
     if (cfg->group_order != MOQ_GROUP_ORDER_DEFAULT &&
         cfg->group_order != MOQ_GROUP_ORDER_ASCENDING &&

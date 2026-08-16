@@ -312,6 +312,11 @@ typedef struct moq_profile_ops {
 
     /* -- Request-stream correlation capability + hooks ---------------- */
 
+    /* Track Namespace cardinality for full-name request APIs. Draft-16
+     * requires 1..32 fields; draft-18 permits the root namespace (0 fields).
+     * Present fields are non-empty in both profiles. */
+    size_t min_track_namespace_fields;
+
     /*
      * Capability: when true, this profile correlates requests by the identity
      * of a dedicated bidirectional stream opened per request (the request

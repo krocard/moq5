@@ -938,8 +938,9 @@ moq_result_t moq_session_publish(moq_session_t *s,
     if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
     if (s->goaway_received) return MOQ_ERR_GOAWAY;
 
-    if (moq_validate_full_track_name(&cfg->track_namespace,
-                                      cfg->track_name) < 0)
+    if (moq_validate_full_track_name_min_fields(
+            &cfg->track_namespace, cfg->track_name,
+            s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
         return MOQ_ERR_INVAL;

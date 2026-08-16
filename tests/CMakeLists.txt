@@ -190,6 +190,10 @@ add_executable(test_d18_subscribe_response unit/test_d18_subscribe_response.c)
 target_link_libraries(test_d18_subscribe_response PRIVATE moq-core-test-internals)
 add_test(NAME d18_subscribe_response COMMAND test_d18_subscribe_response)
 
+add_executable(test_namespace_cardinality unit/test_namespace_cardinality.c)
+target_link_libraries(test_namespace_cardinality PRIVATE moq-core-test-internals)
+add_test(NAME namespace_cardinality COMMAND test_namespace_cardinality)
+
 add_executable(test_d18_fetch unit/test_d18_fetch.c)
 target_link_libraries(test_d18_fetch PRIVATE moq-core-test-internals)
 add_test(NAME d18_fetch COMMAND test_d18_fetch)

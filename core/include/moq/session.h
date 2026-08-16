@@ -295,9 +295,10 @@ MOQ_API moq_perspective_t moq_session_perspective(const moq_session_t *s);
  *
  * Returns:
  *   MOQ_OK              merged, or no-op (already <= current largest)
- *   MOQ_ERR_INVAL       NULL args, a malformed full track name (empty/NULL
- *                       namespace, a component or name with nonzero length
- *                       but NULL data, or an over-long full name), or a
+ *   MOQ_ERR_INVAL       NULL args, a malformed full track name (namespace
+ *                       cardinality invalid for the selected profile, a
+ *                       component or name with nonzero length but NULL data,
+ *                       or an over-long full name), or a
  *                       location component above the session's profile limit
  *   MOQ_ERR_NOMEM       a new record is required but the registry is full
  *                       (max_track_history_records reached) or allocation
@@ -1644,7 +1645,8 @@ MOQ_API uint64_t moq_session_peer_auth_token_cache_size(const moq_session_t *s);
 /*
  * Subscribe configuration.
  *
- * Required: track_namespace (1..32 non-empty parts), track_name,
+ * Required: track_namespace (draft-16: 1..32 non-empty parts; draft-18:
+ *   0..32 non-empty parts), track_name,
  *   filter (must not be NONE).
  * Filter-dependent: start_group/start_object (ABSOLUTE_START,
  *   ABSOLUTE_RANGE), end_group (ABSOLUTE_RANGE only).

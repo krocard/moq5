@@ -4813,6 +4813,7 @@ static const moq_profile_ops_t d16_ops = {
      * stream-correlation hooks stay NULL (the core then treats every peer
      * unidirectional stream as data and never invokes the request-stream
      * validator). */
+    .min_track_namespace_fields      = 1,
     .uses_request_streams            = false,
     .location_varint_max             = MOQ_QUIC_VARINT_MAX,
     .fetch_datagram_supported = false,   /* no datagram bit in the fetch header */

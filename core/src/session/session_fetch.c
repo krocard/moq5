@@ -1247,8 +1247,9 @@ moq_result_t moq_session_fetch(moq_session_t *s,
             }
         }
     } else {
-        if (moq_validate_full_track_name(&cfg->track_namespace,
-                                          cfg->track_name) < 0)
+        if (moq_validate_full_track_name_min_fields(
+                &cfg->track_namespace, cfg->track_name,
+                s->profile->min_track_namespace_fields) < 0)
             return MOQ_ERR_INVAL;
         if (cfg->end_group < cfg->start_group)
             return MOQ_ERR_INVAL;

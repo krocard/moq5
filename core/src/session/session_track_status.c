@@ -492,6 +492,10 @@ moq_result_t moq_session_track_status(moq_session_t *s,
     }
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
         return MOQ_ERR_INVAL;
+    if (moq_validate_full_track_name_min_fields(
+            &cfg->track_namespace, cfg->track_name,
+            s->profile->min_track_namespace_fields) < 0)
+        return MOQ_ERR_INVAL;
 #undef TS_CFG_HAS
 #undef TS_CFG_MIN
 

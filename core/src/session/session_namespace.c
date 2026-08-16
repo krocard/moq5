@@ -692,7 +692,9 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
         return MOQ_ERR_INVAL;
 
     /* Validate namespace. */
-    if (moq_validate_namespace(&cfg->track_namespace) < 0)
+    if (moq_validate_namespace_min_fields(
+            &cfg->track_namespace,
+            s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
 
     /* Check request ID credit via profile. */
