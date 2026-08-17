@@ -311,6 +311,13 @@ typedef struct moq_msquic_lane_stats {
                                     * staging attempts and synchronous
                                     * send failures are never counted)   */
     uint64_t flush_bytes;          /* bytes in those accepted batches    */
+#ifdef MOQ_MSQUIC_TESTING
+    /* Test-only future-field discriminator. It makes sizeof(current) larger
+     * than the frozen v0 floor in white-box builds, so a regression that
+     * validates against sizeof(current) is observable before a real public
+     * field is appended. Never part of the production ABI. */
+    uint64_t test_appended;
+#endif
 } moq_msquic_lane_stats_t;
 
 /* Frozen v0 layout floor: the smallest out_size moq_msquic_lane_get_stats

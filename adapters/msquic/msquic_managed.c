@@ -190,7 +190,10 @@ struct moq_msquic_managed {
     char *cert_path;
     char *key_path;
 
-    const QUIC_API_TABLE *api; /* owned (MsQuicOpen2) */
+    const QUIC_API_TABLE *api; /* owned via MsQuicOpen2 unless test-borrowed */
+#ifdef MOQ_MSQUIC_TESTING
+    bool api_borrowed; /* lanes-only fake table; never passed to MsQuicClose */
+#endif
     HQUIC registration;
     HQUIC configuration;
     HQUIC listener;
@@ -226,6 +229,10 @@ struct moq_msquic_managed {
 
 static uint64_t mgd_now_us(void)
 {
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_now_us != NULL)
+        return moq_msq_test_now_us();
+#endif
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -913,6 +920,17 @@ static void mgd_bell_ring(moq_msquic_managed_lane_t *lane)
     pthread_mutex_unlock(&lane->bell_mu);
 }
 
+#ifdef MOQ_MSQUIC_TESTING
+/* Test-only: deliver a bell generation without arming any explicit wake
+ * cause. This drives the real wait/classification boundary while keeping
+ * wake accounting at zero. */
+void moq_msq_test_bell_ring_raw(moq_msquic_managed_lane_t *lane)
+{
+    if (lane != NULL)
+        mgd_bell_ring(lane);
+}
+#endif
+
 static uint64_t mgd_bell_snapshot(moq_msquic_managed_lane_t *lane)
 {
     pthread_mutex_lock(&lane->bell_mu);
@@ -1210,7 +1228,12 @@ static void mgd_close_transport(moq_msquic_managed_t *m)
         m->registration = NULL;
     }
     if (m->api != NULL) {
+#ifdef MOQ_MSQUIC_TESTING
+        if (!m->api_borrowed)
+            MsQuicClose(m->api);
+#else
         MsQuicClose(m->api);
+#endif
         m->api = NULL;
     }
 }
@@ -1230,6 +1253,23 @@ void moq_msquic_managed_cfg_init_sized(moq_msquic_managed_cfg_t *cfg,
         size = sizeof(*cfg);
     memset(cfg, 0, size);
     cfg->struct_size = (uint32_t)size;
+}
+
+/* Copy the caller-sized configuration and enforce every multi-field ABI
+ * block in one place. Test-only constructors use this helper too, so their
+ * prefix tests exercise the production gate rather than a copied model. */
+static void mgd_copy_cfg(moq_msquic_managed_t *m,
+                         const moq_msquic_managed_cfg_t *cfg)
+{
+    memcpy(&m->cfg, cfg,
+           cfg->struct_size < sizeof(m->cfg) ? cfg->struct_size
+                                             : sizeof(m->cfg));
+    if (cfg->struct_size <
+        offsetof(moq_msquic_managed_cfg_t, app_deadline_ctx) +
+            sizeof(cfg->app_deadline_ctx)) {
+        m->cfg.app_deadline_us = NULL;
+        m->cfg.app_deadline_ctx = NULL;
+    }
 }
 
 /*
@@ -1349,20 +1389,8 @@ moq_result_t moq_msquic_managed_create(
         return MOQ_ERR_NOMEM;
     memset(m, 0, sizeof(*m));
     m->alloc = *cfg->alloc;
-    memcpy(&m->cfg, cfg,
-           cfg->struct_size < sizeof(m->cfg) ? cfg->struct_size
-                                             : sizeof(m->cfg));
-    /* app_deadline_us + app_deadline_ctx are ONE ABI block: the truncated
-     * memcpy above may have copied the callback alone (struct_size landing
-     * between the two). Enforce the whole-block gate — drop the pair unless
-     * struct_size covers THROUGH app_deadline_ctx — so the fold never sees a
-     * callback with a zeroed context. */
-    if (cfg->struct_size <
-        offsetof(moq_msquic_managed_cfg_t, app_deadline_ctx) +
-            sizeof(cfg->app_deadline_ctx)) {
-        m->cfg.app_deadline_us = NULL;
-        m->cfg.app_deadline_ctx = NULL;
-    }
+    /* The helper also applies the app-deadline whole-block ABI gate. */
+    mgd_copy_cfg(m, cfg);
     m->version = version;
     m->alpn = alpn_str;
     m->max_connections = 1;
@@ -1570,18 +1598,20 @@ moq_result_t moq_msquic_managed_create(
  * doorbell_main -> doorbell_pump_sweep -> doorbell_reap transition on a host
  * where no UDP bind is possible.
  *
- * The MsQuic API table IS opened, because moq_msquic_conn_create refuses a
- * NULL api and every child needs one; MsQuicOpen2 loads the library and opens
- * no socket.
+ * The default helper opens the MsQuic API table because every child needs one;
+ * the borrowed-table variant instead uses a caller-owned fake. Neither path
+ * opens a registration, configuration, listener, or socket.
  *
  * What this facade CANNOT do, by construction: accept, connect, or carry a
- * single byte. Children come from moq_msq_test_lane_inject_terminal_child.
+ * single byte. Tests may inject a terminal-only child or bind a live child to
+ * a fake connection handle through the test-only helpers below.
  * Teardown is the ordinary public stop()/destroy() path — mgd_close_transport
  * skips the handles that were never opened.
  *
  * Never compiled into production libraries. */
-moq_result_t moq_msq_test_managed_create_lanes_only(
-    const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out)
+static moq_result_t mgd_test_create_lanes_only(
+    const moq_msquic_managed_cfg_t *cfg, const QUIC_API_TABLE *borrowed_api,
+    moq_msquic_managed_t **out)
 {
     if (out == NULL)
         return MOQ_ERR_INVAL;
@@ -1595,9 +1625,7 @@ moq_result_t moq_msq_test_managed_create_lanes_only(
         return MOQ_ERR_NOMEM;
     memset(m, 0, sizeof(*m));
     m->alloc = *cfg->alloc;
-    memcpy(&m->cfg, cfg,
-           cfg->struct_size < sizeof(m->cfg) ? cfg->struct_size
-                                             : sizeof(m->cfg));
+    mgd_copy_cfg(m, cfg);
     m->version = cfg->version != 0 ? cfg->version : MOQ_VERSION_DRAFT_16;
     m->alpn = moq_alpn_for_version(m->version);
     m->max_connections = cfg->max_connections != 0 ? cfg->max_connections : 1;
@@ -1610,7 +1638,10 @@ moq_result_t moq_msq_test_managed_create_lanes_only(
         mgd_free(m);
         return MOQ_ERR_NOMEM;
     }
-    if (QUIC_FAILED(MsQuicOpen2(&m->api))) {
+    if (borrowed_api != NULL) {
+        m->api = borrowed_api;
+        m->api_borrowed = true;
+    } else if (QUIC_FAILED(MsQuicOpen2(&m->api))) {
         mgd_free(m);
         return MOQ_ERR_INTERNAL;
     }
@@ -1643,6 +1674,92 @@ moq_result_t moq_msq_test_managed_create_lanes_only(
     }
     *out = m;
     return MOQ_OK;
+}
+
+moq_result_t moq_msq_test_managed_create_lanes_only(
+    const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out)
+{
+    return mgd_test_create_lanes_only(cfg, NULL, out);
+}
+
+/* Test-only borrowed-table variant. The fake table remains owned by the test;
+ * the facade uses it for real adapter downcalls but never closes it. */
+moq_result_t moq_msq_test_managed_create_lanes_only_api(
+    const moq_msquic_managed_cfg_t *cfg, const QUIC_API_TABLE *api,
+    moq_msquic_managed_t **out)
+{
+    if (api == NULL) {
+        if (out != NULL)
+            *out = NULL;
+        return MOQ_ERR_INVAL;
+    }
+    return mgd_test_create_lanes_only(cfg, api, out);
+}
+
+/* Test-only live child: reserve and construct through the production child
+ * path, bind it to a supplied fake connection handle, publish it to the lane,
+ * and arm the same initial pump a real accept does. No callback handler is
+ * registered here because the fake test drives the production connection
+ * callback explicitly. */
+moq_result_t moq_msq_test_lane_inject_live_child(
+    moq_msquic_managed_lane_t *lane, HQUIC connection,
+    moq_msquic_managed_conn_t **out)
+{
+    if (lane == NULL || connection == NULL || out == NULL)
+        return MOQ_ERR_INVAL;
+    *out = NULL;
+    moq_msquic_managed_t *m = lane->owner;
+    moq_msquic_managed_conn_t *mc = NULL;
+
+    pthread_mutex_lock(&m->mu);
+    if (m->conn_count >= m->max_connections || m->draining ||
+        atomic_load_explicit(&m->stop_requested, memory_order_acquire)) {
+        pthread_mutex_unlock(&m->mu);
+        return MOQ_ERR_WRONG_STATE;
+    }
+    m->conn_count++;
+    pthread_mutex_unlock(&m->mu);
+
+    moq_result_t rc = mgd_make_child(m, &mc);
+    if (rc != MOQ_OK) {
+        mgd_release_reserve(m);
+        return rc;
+    }
+
+    pthread_mutex_lock(&lane->mu);
+    if (lane->stop_requested) {
+        pthread_mutex_unlock(&lane->mu);
+        moq_msquic_conn_destroy(mc->conn);
+        moq_session_destroy(mc->session);
+        m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
+        mgd_release_reserve(m);
+        return MOQ_ERR_WRONG_STATE;
+    }
+    mgd_lane_append(lane, mc);
+    rc = moq_msquic_conn_bind(mc->conn, connection);
+    if (rc != MOQ_OK) {
+        mgd_lane_remove(lane, mc);
+        pthread_mutex_unlock(&lane->mu);
+        moq_msquic_conn_destroy(mc->conn);
+        moq_session_destroy(mc->session);
+        m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
+        mgd_release_reserve(m);
+        return rc;
+    }
+    mc->connection = connection;
+    lane->wake_pending = true;
+    pthread_cond_broadcast(&lane->cv);
+    mgd_bell_ring(lane);
+    pthread_mutex_unlock(&lane->mu);
+    mgd_bump_activity(m);
+    *out = mc;
+    return MOQ_OK;
+}
+
+moq_msquic_conn_t *moq_msq_test_managed_conn_adapter(
+    moq_msquic_managed_conn_t *conn)
+{
+    return conn != NULL ? conn->conn : NULL;
 }
 #endif
 

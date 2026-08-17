@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include <msquic.h>
@@ -109,8 +110,11 @@ struct fake_msq {
     int recv_set_enabled_fails;/* make the next N StreamReceiveSetEnabled
                                   calls fail (exercises the resume-fatal
                                   path) */
-    int conn_shutdowns;
+    _Atomic int conn_shutdowns;
+    _Atomic int conn_closes;
     uint64_t last_conn_shutdown_code;
+    void (*on_conn_shutdown)(fake_msq_t *f, void *ctx);
+    void *on_conn_shutdown_ctx;
 };
 
 void fake_msq_init(fake_msq_t *f, bool is_client);

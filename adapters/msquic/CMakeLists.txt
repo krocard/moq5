@@ -365,29 +365,34 @@ if(MOQ_BUILD_TESTS)
                 TIMEOUT 120)
         endif()
 
-        # Lane doorbell statistics: wake-arm classification, the
-        # pending-cycle sample rule, idle-cap vs explicit causes, the
-        # caller-context rule, struct_size prefix discipline, and a
-        # real-transport flush observation under concurrent polling.
+        # Deterministic lane statistics: exact wake/deadline/idle cause
+        # accounting, ABI-prefix discipline, callback confinement, and
+        # accepted-send lifetime totals across ordinary reap and stop. The
+        # facade borrows the fake API table and opens no listener, socket,
+        # credential, or certificate. Compiles the production adapter and
+        # managed sources directly so every private seam stays test-only.
         add_executable(test_msquic_lane_stats
-            tests/test_msquic_lane_stats.c)
+            tests/test_msquic_lane_stats.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_lane_stats PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_lane_stats PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_msquic_lane_stats PRIVATE
-            moq::adapter-msquic-managed Threads::Threads)
+            moq::core msquic::msquic Threads::Threads)
         if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
             target_compile_options(test_msquic_lane_stats PRIVATE
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_lane_stats
-                COMMAND test_msquic_lane_stats
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_lane_stats PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 120)
-        endif()
+        add_test(NAME msquic_lane_stats COMMAND test_msquic_lane_stats)
+        set_tests_properties(msquic_lane_stats PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
 
         # Managed settings policy: the listener's pinned path MTU. Compiles
         # the adapter + managed sources directly (test seams on) so it asserts

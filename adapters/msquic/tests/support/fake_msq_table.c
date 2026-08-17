@@ -175,8 +175,17 @@ static void QUIC_API f_conn_shutdown(HQUIC conn,
     fake_msq_t *f = (fake_msq_t *)conn;
 
     (void)flags;
-    f->conn_shutdowns++;
+    atomic_fetch_add(&f->conn_shutdowns, 1);
     f->last_conn_shutdown_code = code;
+    if (f->on_conn_shutdown != NULL)
+        f->on_conn_shutdown(f, f->on_conn_shutdown_ctx);
+}
+
+static void QUIC_API f_conn_close(HQUIC conn)
+{
+    fake_msq_t *f = (fake_msq_t *)conn;
+
+    atomic_fetch_add(&f->conn_closes, 1);
 }
 
 /* Mirror of the adapter's laundering: SetCallbackHandler carries the handler
@@ -209,6 +218,8 @@ static QUIC_STATUS QUIC_API f_get_param(HQUIC h, uint32_t param,
 void fake_msq_init(fake_msq_t *f, bool is_client)
 {
     memset(f, 0, sizeof(*f));
+    atomic_init(&f->conn_shutdowns, 0);
+    atomic_init(&f->conn_closes, 0);
     f->is_client = is_client;
     f->force_next_id = UINT64_MAX;
     f->api.StreamOpen = f_stream_open;
@@ -218,6 +229,7 @@ void fake_msq_init(fake_msq_t *f, bool is_client)
     f->api.StreamClose = f_stream_close;
     f->api.StreamReceiveSetEnabled = f_stream_receive_set_enabled;
     f->api.ConnectionShutdown = f_conn_shutdown;
+    f->api.ConnectionClose = f_conn_close;
     f->api.DatagramSend = f_datagram_send;
     f->api.SetCallbackHandler = f_set_callback_handler;
     f->api.GetParam = f_get_param;

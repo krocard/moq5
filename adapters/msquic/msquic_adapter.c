@@ -54,8 +54,16 @@
 
 #include "msquic_internal.h"
 
+#ifdef MOQ_MSQUIC_TESTING
+uint64_t (*moq_msq_test_now_us)(void);
+#endif
+
 static uint64_t now_us(void)
 {
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_now_us != NULL)
+        return moq_msq_test_now_us();
+#endif
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
