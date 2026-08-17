@@ -414,12 +414,12 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_settings PROPERTIES
             LABELS "msquic" TIMEOUT 30)
 
-        # Cross-lane doorbell wake delivery: the check->wait race, prompt
-        # sub-idle-cap consumption, bidirectional wakes, coalescing, cause
-        # classification, and wake-vs-stop. Needs the doorbell
-        # pre-wait test hook, so it compiles the adapter + managed sources
-        # directly with the testing seams on (test_msquic_unit-style) and
-        # links no production adapter library.
+        # Network-free cross-lane doorbell proof: check->wait handoff,
+        # bidirectional wakes, coalescing, cause classification, callback
+        # confinement, and wake-vs-stop. Uses only the lanes-only facade and
+        # explicit test rendezvous; no listener, certificate, socket, sleep,
+        # retry, or elapsed-time verdict. Compiles the adapter + managed
+        # sources directly with testing seams and links no production adapter.
         add_executable(test_msquic_wake
             tests/test_msquic_wake.c
             msquic_adapter.c
@@ -436,16 +436,10 @@ if(MOQ_BUILD_TESTS)
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_wake
-                COMMAND test_msquic_wake
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_wake PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 120)
-        endif()
+        add_test(NAME msquic_wake COMMAND test_msquic_wake)
+        set_tests_properties(msquic_wake PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
 
         # Reaper scheduling pin: a child is not reclaimed while a pump is owed
         # (a pump OPPORTUNITY precedes further batch reclamation — not proof the

@@ -938,6 +938,15 @@ static bool mgd_bell_wait(moq_msquic_managed_lane_t *lane, uint64_t seen,
 }
 
 #ifdef MOQ_MSQUIC_TESTING
+/* Test-only: observe the bell generation through the SAME leaf-mutex snapshot
+ * path the doorbell uses. A held pre-wait test can therefore prove a ring was
+ * delivered before releasing the waiter, without advancing through the idle
+ * cap. Never compiled into production libraries. */
+uint64_t moq_msq_test_bell_generation(moq_msquic_managed_lane_t *lane)
+{
+    return lane != NULL ? mgd_bell_snapshot(lane) : 0;
+}
+
 /* Test-only: runs in the doorbell's check->wait race window — after the
  * loop-top predicate observed no work, with lane->mu released, immediately
  * before the bell wait. Lets a test pin the doorbell in exactly the window
