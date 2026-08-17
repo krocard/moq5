@@ -32,15 +32,21 @@
  * reapability rule — which is why the transport half is read back through an
  * independent seam rather than assumed.
  *
- * Alongside the fairness case, two controls pin its boundaries. A lane whose
- * callback returns nonzero proves the callback suppressor is load-bearing and
- * that an unacknowledged child survives to forced teardown. A stopped lane is
+ * Alongside the fairness case, stop and pump-exit controls pin its boundaries.
+ * A lane whose callback returns nonzero proves the callback suppressor is
+ * load-bearing and that an unacknowledged child survives to forced teardown.
+ * A stopped lane is
  * ordered, not timed: the callback is PARKED inside its pump still owning
  * lane->mu, stop runs on a helper thread, and a seam publishes the instant
  * stop's facade flag is latched — before stop reaches for any lane lock — so
  * the callback is released only once that fact holds. The doorbell then leaves
  * that pump with stop already visible, which is exactly what the new reap site
  * must decline: the child is reclaimed by stop's own forced cleanup, once.
+ * A separate continuously-rearmed stop control pins the older loop-top
+ * contract: stop publishes the facade-wide atomic before taking lane->mu, so
+ * the doorbell must leave immediately after the callback returns even though
+ * that callback armed another pass. This protects stop without requiring a
+ * scheduling-dependent mutex yield between ordinary pump passes.
  *
  * Compiled with MOQ_MSQUIC_TESTING (seams never ship).
  *
@@ -77,7 +83,7 @@ static int failures;
  * idle cannot reclaim within it. Sized far beyond the single pump a fair
  * scheduler needs, and cheap — each pass sweeps one connection. */
 enum { GATE_PUMPS = 20000, POST_REAP_MIN = 64, POST_EXIT_SWEEPS = 8,
-       SPIN_MAX = 40000, WAIT_US = 2 * 1000 };
+       STOP_REARM_PUMPS = 32, SPIN_MAX = 40000, WAIT_US = 2 * 1000 };
 
 /* Fail-closed bound on the ordered stop control's two rendezvous. Expiry is a
  * failure, never a result. */
@@ -317,6 +323,38 @@ static int stop_pump(moq_msquic_managed_t *m, moq_msquic_managed_lane_t *lane,
          * still-running callback through the public surface: on a SERVER
          * facade that has not pump-exited, CLOSED can only be the facade stop.
          * Its early return makes this a pure read — it arms nothing. */
+        atomic_store(&f->wake_in_hold, moq_msquic_managed_wake(m));
+    }
+    return 0;
+}
+
+/* Rearm on every delivered pass through a declared boundary, then park while
+ * still owning lane->mu. The stop hook publishes the facade atomic before its
+ * caller attempts that mutex. Once the callback observes the publication and
+ * returns, the loop-top predicate must suppress the already-armed next pass.
+ * A callback beyond the boundary returns nonzero so a broken predicate fails
+ * deterministically without leaving the test runner hung. */
+static int stop_rearm_pump(moq_msquic_managed_t *m,
+                           moq_msquic_managed_lane_t *lane, uint64_t now,
+                           void *user)
+{
+    struct fx *f = user;
+    int idx = atomic_fetch_add(&f->pumps, 1) + 1;
+
+    (void)now;
+    if (idx > STOP_REARM_PUMPS) {
+        atomic_fetch_add(&f->nonzero_returns, 1);
+        return 1;
+    }
+
+    if (moq_msquic_lane_wake(lane) == MOQ_OK)
+        atomic_fetch_add(&f->churn_wakes, 1);
+
+    if (idx == STOP_REARM_PUMPS) {
+        atomic_store(&f->held_at_pump, idx);
+        bar_set(&g_bar.held);
+        if (!bar_wait(&g_bar.stop_latched, HOLD_GUARD_US))
+            atomic_store(&f->hold_expired, 1);
         atomic_store(&f->wake_in_hold, moq_msquic_managed_wake(m));
     }
     return 0;
@@ -754,6 +792,140 @@ static void t_stop_skips_the_fairness_reap(void)
         printf("PASS: stop_skips_the_fairness_reap\n");
 }
 
+/* --- 4. controls: facade stop versus continuously armed work -------------- */
+
+static void t_stop_before_pump_entry(void)
+{
+    int before = failures;
+    struct fx f;
+    struct rig r;
+
+    fx_init(&f);
+    atomic_store(&f.phase, PH_RUN);
+    if (!rig_up(&r, &f, 1, stop_rearm_pump)) {
+        CHECK(0 && "lanes-only facade");
+        rig_down(&r);
+        atomic_store(&g_fx, NULL);
+        return;
+    }
+
+    moq_result_t stop_rc = moq_msquic_managed_stop(r.m);
+    moq_result_t wake_rc = moq_msquic_managed_wake(r.m);
+    moq_result_t wait_rc = moq_msquic_managed_wait(r.m, 0);
+    moq_msquic_lane_stats_t st;
+    bool stats_ok =
+        moq_msquic_lane_get_stats(r.lane, &st, sizeof(st)) == MOQ_OK;
+    bool fatal = moq_msquic_managed_is_fatal(r.m);
+
+    rig_down(&r);
+    atomic_store(&g_fx, NULL);
+
+    printf("STOP-BEFORE-PUMP: stop=%d wake=%d wait=%d pumps=%d "
+           "stats=%d sweeps=%llu fatal=%d\n",
+           stop_rc, wake_rc, wait_rc, atomic_load(&f.pumps), (int)stats_ok,
+           stats_ok ? (unsigned long long)st.pump_sweeps : 0, (int)fatal);
+
+    CHECK(stop_rc == MOQ_OK);
+    CHECK(wake_rc == MOQ_ERR_CLOSED);
+    CHECK(wait_rc == MOQ_ERR_CLOSED);
+    CHECK(atomic_load(&f.pumps) == 0);
+    CHECK(stats_ok);
+    if (stats_ok)
+        CHECK(st.pump_sweeps == 0);
+    CHECK(!fatal);
+
+    if (failures == before)
+        printf("PASS: stop_before_pump_entry\n");
+}
+
+static void t_stop_during_continuous_rearm(void)
+{
+    int before = failures;
+    struct fx f;
+    struct rig r;
+    struct stop_arg sa;
+    pthread_t th;
+
+    fx_init(&f);
+    atomic_store(&f.phase, PH_RUN);
+    atomic_store(&f.wake_in_hold, RC_UNSET);
+    if (!rig_up(&r, &f, 1, stop_rearm_pump)) {
+        CHECK(0 && "lanes-only facade");
+        rig_down(&r);
+        atomic_store(&g_fx, NULL);
+        return;
+    }
+
+    (void)moq_msquic_managed_wake(r.m);
+    bool held = bar_wait(&g_bar.held, HOLD_GUARD_US);
+    int pumps_at_hold = atomic_load(&f.pumps);
+    int rearms_at_hold = atomic_load(&f.churn_wakes);
+
+    sa.m = r.m;
+    sa.rc = RC_UNSET;
+    atomic_store(&g_stop_m, r.m);
+    moq_msq_test_stop_latched = stop_latched_hook;
+    bool spawned = held && pthread_create(&th, NULL, stop_thread, &sa) == 0;
+    bool latched = spawned && bar_wait(&g_bar.stop_latched, HOLD_GUARD_US);
+    if (spawned)
+        pthread_join(th, NULL);
+    moq_msq_test_stop_latched = NULL;
+    atomic_store(&g_stop_m, NULL);
+
+    int pumps_after = atomic_load(&f.pumps);
+    int rearms_after = atomic_load(&f.churn_wakes);
+    moq_msquic_lane_stats_t st;
+    bool stats_ok =
+        moq_msquic_lane_get_stats(r.lane, &st, sizeof(st)) == MOQ_OK;
+    moq_result_t wake_rc = moq_msquic_managed_wake(r.m);
+    moq_result_t wait_rc = MOQ_OK;
+    int wait_spins = 0;
+
+    /* The completed pump may leave a coalesced activity latch. Drain that
+     * public notification before asking for the facade's terminal result. */
+    for (; wait_spins < SPIN_MAX && wait_rc == MOQ_OK; wait_spins++)
+        wait_rc = moq_msquic_managed_wait(r.m, 0);
+    bool fatal = moq_msquic_managed_is_fatal(r.m);
+
+    rig_down(&r);
+    atomic_store(&g_fx, NULL);
+
+    printf("STOP-REARM: held=%d pumps_at=%d rearmed_at=%d spawned=%d "
+           "latched=%d hold_expired=%d wake_in_hold=%d stop=%d pumps=%d "
+           "rearmed=%d nonzero=%d stats=%d sweeps=%llu wake=%d wait=%d/%d "
+           "fatal=%d\n",
+           (int)held, pumps_at_hold, rearms_at_hold, (int)spawned,
+           (int)latched, atomic_load(&f.hold_expired),
+           atomic_load(&f.wake_in_hold), sa.rc, pumps_after, rearms_after,
+           atomic_load(&f.nonzero_returns), (int)stats_ok,
+           stats_ok ? (unsigned long long)st.pump_sweeps : 0, wake_rc,
+           wait_rc, wait_spins, (int)fatal);
+
+    CHECK(held);
+    CHECK(pumps_at_hold == STOP_REARM_PUMPS);
+    CHECK(rearms_at_hold == STOP_REARM_PUMPS);
+    CHECK(spawned);
+    CHECK(latched);
+    CHECK(atomic_load(&f.hold_expired) == 0);
+    CHECK(atomic_load(&f.wake_in_hold) == MOQ_ERR_CLOSED);
+    CHECK(sa.rc == MOQ_OK);
+    /* The already-armed pass is suppressed by the facade stop observed at the
+     * loop top. No scheduler timing or mutex-acquisition race is the oracle. */
+    CHECK(pumps_after == STOP_REARM_PUMPS);
+    CHECK(rearms_after == STOP_REARM_PUMPS);
+    CHECK(atomic_load(&f.nonzero_returns) == 0);
+    CHECK(stats_ok);
+    if (stats_ok)
+        CHECK(st.pump_sweeps == STOP_REARM_PUMPS);
+    CHECK(wake_rc == MOQ_ERR_CLOSED);
+    CHECK(wait_spins < SPIN_MAX);
+    CHECK(wait_rc == MOQ_ERR_CLOSED);
+    CHECK(!fatal);
+
+    if (failures == before)
+        printf("PASS: stop_during_continuous_rearm\n");
+}
+
 int main(void)
 {
     static const QUIC_API_TABLE *lib_pin;
@@ -767,6 +939,8 @@ int main(void)
     t_pump_exit_retains_child(false);
     t_pump_exit_retains_child(true);
     t_stop_skips_the_fairness_reap();
+    t_stop_before_pump_entry();
+    t_stop_during_continuous_rearm();
 
     if (failures == 0)
         printf("PASS: msquic_reap_fairness\n");
