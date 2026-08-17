@@ -520,18 +520,23 @@ if(MOQ_BUILD_TESTS)
 
         # Terminal-child lifetime pin: a bounded application pump that leaves
         # SESSION_CLOSED unconsumed must still be given its child, its session
-        # and its own per-connection state on a later pump. Kept out of
-        # test_msquic_reap so that binary's narrower scope — a pump OPPORTUNITY
-        # precedes further batch reclamation — stays separately reportable.
-        # Uses the reap-gap and prewait seams to observe the doorbell's own
-        # decision points, so it compiles the adapter + managed sources with the
-        # testing seams on and links no production adapter library.
+        # and its own per-connection state on a later pump; an unacknowledged
+        # child holds its admission reserve; and ack_terminal classifies every
+        # guard exactly. Kept out of test_msquic_reap so that binary's narrower
+        # scope — a pump OPPORTUNITY precedes further batch reclamation — stays
+        # separately reportable. The facade borrows the fake API table and opens
+        # no listener, socket, credential or certificate; the reap-gap and
+        # prewait seams observe the doorbell's own decision points, so it
+        # compiles the adapter + managed sources with the testing seams on and
+        # links no production adapter library.
         add_executable(test_msquic_terminal_ack
             tests/test_msquic_terminal_ack.c
+            tests/support/fake_msq_table.c
             msquic_adapter.c
             msquic_managed.c)
         target_include_directories(test_msquic_terminal_ack PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
             ${CMAKE_CURRENT_SOURCE_DIR}/include)
         target_compile_definitions(test_msquic_terminal_ack PRIVATE
             MOQ_MSQUIC_TESTING MOQ_BUILDING)
@@ -542,16 +547,10 @@ if(MOQ_BUILD_TESTS)
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_terminal_ack
-                COMMAND test_msquic_terminal_ack
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_terminal_ack PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 120)
-        endif()
+        add_test(NAME msquic_terminal_ack COMMAND test_msquic_terminal_ack)
+        set_tests_properties(msquic_terminal_ack PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
 
         # Production-contract conformance over real MsQuic loopback:
         # every MoQ session call runs inside the managed on_lane_pump,
