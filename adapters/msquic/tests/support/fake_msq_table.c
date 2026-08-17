@@ -48,6 +48,10 @@ static QUIC_STATUS QUIC_API f_stream_start(HQUIC h,
     fake_msq_stream_t *st = stream_of(h);
     fake_msq_t *f = st->owner;
 
+    if (f->stream_start_fails > 0) {
+        f->stream_start_fails--;
+        return QUIC_STATUS_ABORTED; /* refused before any state moves */
+    }
     st->started = true;
     st->start_flags = flags;
     /* real QUIC numbering from the fake's own counters, matching what

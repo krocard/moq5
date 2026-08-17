@@ -267,6 +267,9 @@ static void conn_feed_close(moq_msquic_conn_t *c)
 {
     if (!c->close_pending || c->close_fed)
         return;
+#ifdef MOQ_MSQUIC_TESTING
+    c->test_close_feed_commits++;
+#endif
     c->close_fed = true;
     if (c->close_clean)
         (void)moq_transport_bridge_on_transport_close(

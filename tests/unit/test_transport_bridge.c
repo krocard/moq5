@@ -3203,6 +3203,78 @@ static int test_terminal_facts_not_set_by_other_events(void)
     return failures;
 }
 
+/* A bridge-local endpoint failure can latch fatal before the physical
+ * transport reports its terminal. The bridge latch clears transport state but
+ * does not itself close the session, so either transport-terminal flavor must
+ * still deliver exactly one SESSION_CLOSED while preserving the first cause. */
+static int run_already_fatal_transport_terminal(bool clean)
+{
+    int failures = 0;
+    test_pair_t tp;
+    if (test_pair_init(&tp) < 0) { failures++; return failures; }
+
+    const uint64_t first_code = 0x51;
+    const uint64_t later_code = 0x62;
+    bridge_set_fatal(tp.client_bridge, first_code);
+
+    bool observed = true;
+    MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(tp.client_bridge));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(tp.client_bridge) ==
+                   first_code);
+    MOQ_TEST_CHECK(moq_session_state(tp.client) != MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK(!moq_transport_bridge_terminal_facts(tp.client_bridge,
+                                                        &observed));
+    MOQ_TEST_CHECK(!observed);
+
+    moq_result_t rc = clean
+        ? moq_transport_bridge_on_transport_close(tp.client_bridge, later_code,
+                                                  1000)
+        : moq_transport_bridge_on_transport_error(tp.client_bridge, later_code,
+                                                  1000);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(tp.client_bridge));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
+    MOQ_TEST_CHECK(moq_transport_bridge_fatal_code(tp.client_bridge) ==
+                   first_code);
+    MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_CLOSED);
+
+    moq_event_t ev;
+    size_t n = 0;
+    memset(&ev, 0, sizeof(ev));
+    MOQ_TEST_CHECK(moq_session_poll_events_ex(tp.client, &ev, 1, sizeof(ev),
+                                              &n) == MOQ_OK);
+    MOQ_TEST_CHECK(n == 1);
+    if (n == 1) {
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SESSION_CLOSED);
+        MOQ_TEST_CHECK(ev.u.closed.code == first_code);
+        moq_event_cleanup(&ev);
+    }
+
+    /* The alternate flavor and repeated original flavor are idempotent. */
+    (void)moq_transport_bridge_on_transport_error(tp.client_bridge, 0x73,
+                                                  1001);
+    (void)moq_transport_bridge_on_transport_close(tp.client_bridge, 0x84,
+                                                  1002);
+    n = 0;
+    MOQ_TEST_CHECK(moq_session_poll_events_ex(tp.client, &ev, 1, sizeof(ev),
+                                              &n) == MOQ_OK);
+    MOQ_TEST_CHECK(n == 0);
+    observed = false;
+    MOQ_TEST_CHECK(moq_transport_bridge_terminal_facts(tp.client_bridge,
+                                                       &observed));
+    MOQ_TEST_CHECK(observed);
+
+    test_pair_destroy(&tp);
+    return failures;
+}
+
+static int test_already_fatal_transport_terminal(void)
+{
+    return run_already_fatal_transport_terminal(false) +
+           run_already_fatal_transport_terminal(true);
+}
+
 /* A SETUP whose completion-event tokens can never fit the arena must reach the
  * normal close path so the bridge dispatches CLOSE_SESSION: a buffer error here
  * would instead be escalated to a connection fatal, losing close semantics. */
@@ -11033,6 +11105,7 @@ int main(void)
     /* terminal facts */
     failures += test_terminal_facts_enqueued_then_observed();
     failures += test_terminal_facts_not_set_by_other_events();
+    failures += test_already_fatal_transport_terminal();
     failures += test_setup_scratch_shortfall_closes_not_fatal();
 
     if (failures == 0)

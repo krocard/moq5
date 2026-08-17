@@ -2987,7 +2987,15 @@ moq_result_t moq_transport_bridge_on_transport_close(
     moq_transport_bridge_t *b, uint64_t code, uint64_t now_us)
 {
     if (!b) return MOQ_ERR_INVAL;
-    if (b->fatal || b->closed) return MOQ_OK;
+    /* A bridge-local failure can become fatal before the transport reports
+     * its terminal. The fatal latch tears down bridge state, but it does not
+     * close the session; preserve that first cause and still deliver the
+     * session terminal when the transport catches up. */
+    if (b->fatal) {
+        moq_session_on_transport_close(b->session, b->fatal_code, now_us);
+        return MOQ_OK;
+    }
+    if (b->closed) return MOQ_OK;
     b->closed = true;
     b->close_code = code;
     bridge_clear_all_state(b);
@@ -2999,7 +3007,11 @@ moq_result_t moq_transport_bridge_on_transport_error(
     moq_transport_bridge_t *b, uint64_t code, uint64_t now_us)
 {
     if (!b) return MOQ_ERR_INVAL;
-    if (b->fatal || b->closed) return MOQ_OK;
+    if (b->fatal) {
+        moq_session_on_transport_close(b->session, b->fatal_code, now_us);
+        return MOQ_OK;
+    }
+    if (b->closed) return MOQ_OK;
     bridge_set_fatal(b, code);
     moq_session_on_transport_close(b->session, code, now_us);
     return MOQ_OK;

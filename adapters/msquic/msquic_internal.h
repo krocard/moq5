@@ -162,6 +162,12 @@ struct moq_msquic_conn {
     bool close_clean;
     uint64_t close_code;
     bool shutdown_complete;        /* conn SHUTDOWN_COMPLETE observed */
+#ifdef MOQ_MSQUIC_TESTING
+    /* Number of close feeds that crossed conn_feed_close's pending/fed guard.
+     * Tests use this to distinguish one committed bridge call from a boolean
+     * that merely says at least one feed was attempted. */
+    uint32_t test_close_feed_commits;
+#endif
 
     moq_transport_endpoint_ops_t ops;
 };

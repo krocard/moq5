@@ -204,6 +204,33 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME msquic_unit COMMAND test_msquic_unit)
 
+    # The transport terminal always reaches the session, exactly once --
+    # including when the bridge already latched a terminal of its own, whose
+    # latch tells the session nothing. Same white-box rig as the units: the
+    # production connection callback and service entries over the fake API
+    # table, one thread, no socket and no timing.
+    add_executable(test_msquic_close_feed
+        tests/test_msquic_close_feed.c
+        tests/support/fake_msq_table.c
+        msquic_adapter.c)
+    target_include_directories(test_msquic_close_feed PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(test_msquic_close_feed PRIVATE
+        MOQ_MSQUIC_TESTING MOQ_BUILDING)
+    target_link_libraries(test_msquic_close_feed PRIVATE
+        moq::core msquic::msquic)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_msquic_close_feed PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msquic_close_feed COMMAND test_msquic_close_feed)
+    set_tests_properties(msquic_close_feed PROPERTIES
+        LABELS "msquic"
+        TIMEOUT 60)
+
     # Consumers: the same standalone project resolved against the
     # build tree (no install) and against a scratch install prefix.
     # Both request the managed component, which pulls the attach

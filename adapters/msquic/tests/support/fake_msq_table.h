@@ -101,6 +101,9 @@ struct fake_msq {
     fake_msq_dgram_t dgrams[FAKE_MSQ_MAX_DGRAMS];
     int dgram_count;
 
+    int stream_start_fails;    /* make the next N StreamStart calls fail
+                                  synchronously, as MsQuic does when the
+                                  connection is already winding down */
     int stream_send_fails;     /* make the next N StreamSend calls fail */
     int dgram_send_fails;      /* make the next N DatagramSend calls fail */
     int recv_set_enabled_fails;/* make the next N StreamReceiveSetEnabled
