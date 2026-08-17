@@ -273,10 +273,26 @@ static void mgd_bump_activity(moq_msquic_managed_t *m)
  * Per-connection lock domain: a worker takes the connection's LANE
  * mutex, so distinct lanes' callbacks run concurrently. */
 
+#ifdef MOQ_MSQUIC_TESTING
+/* Test-only: the transport guard is about to take this lane's mutex. Runs on
+ * the transport worker with no lane mutex held, so a test can rendezvous at
+ * the exact lock boundary the guard serializes on, instead of at the caller's
+ * intent to reach it. Never compiled into production libraries. */
+void (*moq_msq_test_guard_pre_lock)(moq_msquic_managed_lane_t *lane);
+
+/* Test-only: an external stats reader is about to take this lane's mutex.
+ * Same purpose, for the application-thread arm of the snapshot. */
+void (*moq_msq_test_stats_pre_lock)(moq_msquic_managed_lane_t *lane);
+#endif
+
 static void mgd_guard_enter(void *user)
 {
     moq_msquic_managed_conn_t *mc = user;
 
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_guard_pre_lock != NULL)
+        moq_msq_test_guard_pre_lock(mc->lane);
+#endif
     pthread_mutex_lock(&mc->lane->mu);
     mgd_tls_cb = mc->owner;
     /* mark this lane held for the whole batch, so lane_wake() (which the
@@ -1602,9 +1618,10 @@ moq_result_t moq_msquic_managed_create(
  * the borrowed-table variant instead uses a caller-owned fake. Neither path
  * opens a registration, configuration, listener, or socket.
  *
- * What this facade CANNOT do, by construction: accept, connect, or carry a
- * single byte. Tests may inject a terminal-only child or bind a live child to
- * a fake connection handle through the test-only helpers below.
+ * What this facade CANNOT do, by construction: listen, connect, or carry a
+ * single byte over a real transport. Tests may drive the production listener
+ * callback over a synthesized identity, inject a terminal-only child, or bind
+ * a live child to a fake connection handle through the helpers below.
  * Teardown is the ordinary public stop()/destroy() path — mgd_close_transport
  * skips the handles that were never opened.
  *
@@ -1694,6 +1711,23 @@ moq_result_t moq_msq_test_managed_create_lanes_only_api(
         return MOQ_ERR_INVAL;
     }
     return mgd_test_create_lanes_only(cfg, api, out);
+}
+
+/* Test-only synthesized accept: hand the EXACT production listener callback a
+ * NEW_CONNECTION event for a supplied connection handle and return its real
+ * status. Reserve, choose_lane, the range check, the stop/drain re-check, the
+ * child construction, the lane append, the handler registration, the bind and
+ * the wake all run unchanged — nothing about the selection path is reproduced
+ * here. */
+QUIC_STATUS moq_msq_test_listener_accept(moq_msquic_managed_t *m,
+                                         HQUIC connection)
+{
+    QUIC_LISTENER_EVENT ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_LISTENER_EVENT_NEW_CONNECTION;
+    ev.NEW_CONNECTION.Connection = connection;
+    return mgd_listener_cb(NULL, m, &ev);
 }
 
 /* Test-only live child: reserve and construct through the production child
@@ -2021,6 +2055,10 @@ moq_result_t moq_msquic_lane_get_stats(moq_msquic_managed_lane_t *lane,
     } else if (mgd_tls_cb == lane->owner) {
         return MOQ_ERR_WRONG_STATE;
     } else {
+#ifdef MOQ_MSQUIC_TESTING
+        if (moq_msq_test_stats_pre_lock != NULL)
+            moq_msq_test_stats_pre_lock(lane);
+#endif
         pthread_mutex_lock(&lane->mu);
         mgd_lane_stats_fill(lane, &full);
         pthread_mutex_unlock(&lane->mu);

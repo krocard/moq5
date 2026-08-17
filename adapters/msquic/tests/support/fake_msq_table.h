@@ -11,9 +11,13 @@
  * callback handlers, deterministically and with no real transport.
  *
  * One fake_msq_t models one endpoint's transport. Stream handles are
- * pointers to fake_msq_stream_t. The test delivers connection events
- * by invoking moq_msquic_conn_callback() directly and stream events
- * via the helpers below.
+ * pointers to fake_msq_stream_t, connection handles are the fake itself,
+ * and each carries a tag so SetCallbackHandler can tell them apart. A test
+ * delivers connection events either by invoking moq_msquic_conn_callback()
+ * directly with its own context, or -- when the handler was registered on
+ * the connection handle by the code under test -- through
+ * fake_msq_deliver_conn_event(), which uses exactly that handler and
+ * context. Stream events go through the helpers below.
  */
 
 #include <stdbool.h>
@@ -30,7 +34,15 @@
 
 typedef struct fake_msq fake_msq_t;
 
+/* Handle discriminator. MsQuic's SetCallbackHandler takes one opaque HQUIC
+ * for both connections and streams, so the fake tags every object it hands
+ * out and reads the tag back to route the registration. Both tagged structs
+ * begin with this field. */
+#define FAKE_MSQ_KIND_CONN   0x66616b63u /* 'fakc' */
+#define FAKE_MSQ_KIND_STREAM 0x66616b73u /* 'faks' */
+
 typedef struct fake_msq_stream {
+    uint32_t kind;             /* FAKE_MSQ_KIND_STREAM */
     fake_msq_t *owner;
     QUIC_STREAM_CALLBACK_HANDLER cb;
     void *ctx;
@@ -85,6 +97,7 @@ typedef struct fake_msq_send {
 } fake_msq_send_t;
 
 struct fake_msq {
+    uint32_t kind;             /* FAKE_MSQ_KIND_CONN */
     QUIC_API_TABLE api;
     bool is_client;            /* drives fake stream-id numbering */
     /* forced id override for the next StreamStart (UINT64_MAX = off):
@@ -112,9 +125,15 @@ struct fake_msq {
                                   path) */
     _Atomic int conn_shutdowns;
     _Atomic int conn_closes;
+    _Atomic int conn_set_configs; /* ConnectionSetConfiguration calls */
     uint64_t last_conn_shutdown_code;
     void (*on_conn_shutdown)(fake_msq_t *f, void *ctx);
     void *on_conn_shutdown_ctx;
+
+    /* Connection handler registered through SetCallbackHandler on this
+     * connection handle, with the context registered beside it. */
+    QUIC_CONNECTION_CALLBACK_HANDLER conn_cb;
+    void *conn_ctx;
 };
 
 void fake_msq_init(fake_msq_t *f, bool is_client);
@@ -122,6 +141,15 @@ const QUIC_API_TABLE *fake_msq_table(fake_msq_t *f);
 
 /* The connection handle to bind (identifies the fake). */
 HQUIC fake_msq_conn_handle(fake_msq_t *f);
+
+/* True once SetCallbackHandler registered a connection handler on this
+ * connection handle. */
+bool fake_msq_conn_cb_installed(const fake_msq_t *f);
+
+/* Deliver a connection event through the handler and context registered on
+ * this connection handle, as MsQuic would. Aborts when none is registered. */
+QUIC_STATUS fake_msq_deliver_conn_event(fake_msq_t *f,
+                                        QUIC_CONNECTION_EVENT *ev);
 
 /* Local streams in creation order (NULL past the end). */
 fake_msq_stream_t *fake_msq_stream_at(fake_msq_t *f, int index);

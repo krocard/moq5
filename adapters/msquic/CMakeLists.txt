@@ -343,27 +343,35 @@ if(MOQ_BUILD_TESTS)
                 TIMEOUT 120)
         endif()
 
-        # Decisive lane-partition pin: server with two lanes, one lane
-        # owning two connections; proves lane-scoped iteration, no
-        # concurrent lane reentry, and terminal-before-reap visibility.
-        add_executable(test_msquic_lanes tests/test_msquic_lanes.c)
+        # Decisive lane-partition pin: accepts synthesized through the exact
+        # production listener callback over a borrowed fake API table, so
+        # placement, lane-scoped iteration, wake selectivity, deadline cause
+        # separation and callback confinement are proven with no listener,
+        # socket, credential or certificate. Compiles the production adapter
+        # and managed sources directly so every private seam stays test-only.
+        add_executable(test_msquic_lanes
+            tests/test_msquic_lanes.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_lanes PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
+        target_compile_definitions(test_msquic_lanes PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
         target_link_libraries(test_msquic_lanes PRIVATE
-            moq::adapter-msquic-managed Threads::Threads)
+            moq::core msquic::msquic Threads::Threads)
         if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
             target_compile_options(test_msquic_lanes PRIVATE
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_lanes
-                COMMAND test_msquic_lanes
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_lanes PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 120)
-        endif()
+        add_test(NAME msquic_lanes COMMAND test_msquic_lanes)
+        set_tests_properties(msquic_lanes PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
 
         # Deterministic lane statistics: exact wake/deadline/idle cause
         # accounting, ABI-prefix discipline, callback confinement, and
