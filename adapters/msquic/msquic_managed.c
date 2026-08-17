@@ -578,6 +578,14 @@ static bool mgd_lane_work_pending(const moq_msquic_managed_lane_t *lane)
  * libraries. */
 void (*moq_msq_test_reap_gap)(moq_msquic_managed_lane_t *lane);
 
+/* Test-only: fires inside moq_msquic_managed_stop() the moment the FACADE stop
+ * flag is published, and before stop takes any lane lock — the one window in
+ * which stop is visible while a lane pump can still be running with lane->mu
+ * held. Lets a test order "stop is latched" against a callback it is holding,
+ * with no timing involved. Called with no facade or lane lock held. Never
+ * compiled into production libraries. */
+void (*moq_msq_test_stop_latched)(moq_msquic_managed_t *m);
+
 /* Test-only: arm this lane's coalesced pump exactly as a worker batch's
  * guard_leave would. Callable ONLY from the reap-gap hook above, which runs with
  * lane->mu held (so this is a plain flag store, not a wake path). */
@@ -606,6 +614,56 @@ size_t moq_msq_test_lane_reapable(moq_msquic_managed_lane_t *lane)
             n++;
     pthread_mutex_unlock(&lane->mu);
     return n;
+}
+
+/* Test-only: SYNTHESIZE the ownership and terminal facts a scheduling test
+ * needs from a terminal child — the facade reserve, a real session, lane
+ * linkage, a closed bridge, and the reapability latch — using the production
+ * functions where they apply.
+ *
+ * It is NOT a live accept and does not claim to be one. There is no lane
+ * choice, no transport handle, no configuration, no callback, and no real
+ * SHUTDOWN_COMPLETE: `shutdown_complete` is written directly because no
+ * transport is present to set it. What IS production here is the reserve
+ * accounting, mgd_make_child, mgd_lane_append, the bridge's own
+ * on_transport_close (so the session really closes and really queues
+ * SESSION_CLOSED), mgd_hook's reapability rule, and the pump arm a worker
+ * batch's guard_leave would leave behind.
+ *
+ * Returns false if the facade reserve is exhausted or the child cannot be
+ * built. Call with NO lane or facade lock held. */
+bool moq_msq_test_lane_inject_terminal_child(moq_msquic_managed_lane_t *lane,
+                                             uint64_t close_code)
+{
+    moq_msquic_managed_t *m = lane->owner;
+    moq_msquic_managed_conn_t *mc = NULL;
+
+    pthread_mutex_lock(&m->mu);
+    if (m->conn_count >= m->max_connections) {
+        pthread_mutex_unlock(&m->mu);
+        return false;
+    }
+    m->conn_count++;
+    pthread_mutex_unlock(&m->mu);
+
+    if (mgd_make_child(m, &mc) != MOQ_OK) {
+        mgd_release_reserve(m);
+        return false;
+    }
+
+    pthread_mutex_lock(&lane->mu);
+    mgd_lane_append(lane, mc);
+    /* the terminal itself, through the entry the attach adapter uses */
+    (void)moq_transport_bridge_on_transport_close(mc->conn->bridge, close_code,
+                                                  mgd_now_us());
+    mc->conn->shutdown_complete = true;
+    mgd_hook(mc->conn, mc); /* the real reapability latch */
+    /* arm one coalesced pump, exactly as a worker batch's guard_leave would */
+    lane->pump_pending = true;
+    pthread_cond_broadcast(&lane->cv);
+    mgd_bell_ring(lane);
+    pthread_mutex_unlock(&lane->mu);
+    return true;
 }
 #endif
 
@@ -941,6 +999,35 @@ static void *doorbell_main(void *arg)
                     lane->st_wake_to_pump_max_us = delay;
             }
             doorbell_pump_sweep(lane);
+            /* Reap opportunity between pump passes. Without it the only reap
+             * site is the no-work iteration below, so a lane whose callback
+             * arms work on every pass — a same-lane lane_wake(), or event
+             * progress rearming the coalesced pump — never reaches it, and an
+             * eligible child keeps its admission reserve for as long as the
+             * lane stays busy.
+             *
+             * Placed after the sweep has RETURNED: the app callback is over
+             * and no handle it was shown is in use. How much it reclaims is
+             * doorbell_reap's own rule, not a bound this site adds — with work
+             * armed (the case this exists for) it yields after its first
+             * victim, so the next pump still runs first; with the lane quiet
+             * after the pump it drains every eligible child, exactly as the
+             * no-work site does.
+             *
+             * Skipped once the FACADE stop is latched. That flag is published
+             * before stop takes any lane lock, so it can become visible while
+             * the pump that just returned was still running; from there on
+             * reclamation belongs to stop's own cleanup, which runs after it
+             * has joined this thread. The lane flag needs no test of its own:
+             * stop sets it under lane->mu, which this thread holds unbroken
+             * from the callback to here, and the loop-top predicate consumes
+             * it. Pump exit needs none either — it changes which site reclaims
+             * an eligible child, never whether, because a suppressed callback
+             * can no longer rearm the lane and the no-work site below is
+             * reached on the next pass. */
+            if (!atomic_load_explicit(&m->stop_requested,
+                                      memory_order_acquire))
+                doorbell_reap(lane);
             continue;
         }
         doorbell_reap(lane);
@@ -1467,6 +1554,89 @@ moq_result_t moq_msquic_managed_create(
     return MOQ_OK;
 }
 
+#ifdef MOQ_MSQUIC_TESTING
+/* Test-only: build the facade's LANE AND DOORBELL state and nothing else — no
+ * registration, no configuration, no credential, no listener, no socket, no
+ * certificate file. A scheduling test can then drive the real
+ * doorbell_main -> doorbell_pump_sweep -> doorbell_reap transition on a host
+ * where no UDP bind is possible.
+ *
+ * The MsQuic API table IS opened, because moq_msquic_conn_create refuses a
+ * NULL api and every child needs one; MsQuicOpen2 loads the library and opens
+ * no socket.
+ *
+ * What this facade CANNOT do, by construction: accept, connect, or carry a
+ * single byte. Children come from moq_msq_test_lane_inject_terminal_child.
+ * Teardown is the ordinary public stop()/destroy() path — mgd_close_transport
+ * skips the handles that were never opened.
+ *
+ * Never compiled into production libraries. */
+moq_result_t moq_msq_test_managed_create_lanes_only(
+    const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out)
+{
+    if (out == NULL)
+        return MOQ_ERR_INVAL;
+    *out = NULL;
+    if (cfg == NULL || cfg->alloc == NULL || cfg->on_lane_pump == NULL)
+        return MOQ_ERR_INVAL;
+
+    moq_msquic_managed_t *m = cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);
+
+    if (m == NULL)
+        return MOQ_ERR_NOMEM;
+    memset(m, 0, sizeof(*m));
+    m->alloc = *cfg->alloc;
+    memcpy(&m->cfg, cfg,
+           cfg->struct_size < sizeof(m->cfg) ? cfg->struct_size
+                                             : sizeof(m->cfg));
+    m->version = cfg->version != 0 ? cfg->version : MOQ_VERSION_DRAFT_16;
+    m->alpn = moq_alpn_for_version(m->version);
+    m->max_connections = cfg->max_connections != 0 ? cfg->max_connections : 1;
+    m->lane_count = cfg->lane_count != 0 ? cfg->lane_count : 1;
+    if ((size_t)m->lane_count > m->max_connections)
+        m->lane_count = (uint32_t)m->max_connections;
+    pthread_mutex_init(&m->mu, NULL);
+    pthread_cond_init(&m->cv, NULL);
+    if (mgd_lanes_alloc(m) != MOQ_OK) {
+        mgd_free(m);
+        return MOQ_ERR_NOMEM;
+    }
+    if (QUIC_FAILED(MsQuicOpen2(&m->api))) {
+        mgd_free(m);
+        return MOQ_ERR_INTERNAL;
+    }
+
+    bool spawn_ok = true;
+
+    for (uint32_t i = 0; i < m->lane_count && spawn_ok; i++) {
+        if (pthread_create(&m->lanes[i].doorbell, NULL, doorbell_main,
+                           &m->lanes[i]) == 0)
+            m->lanes[i].doorbell_running = true;
+        else
+            spawn_ok = false;
+    }
+    if (!spawn_ok) {
+        atomic_store_explicit(&m->stop_requested, true, memory_order_release);
+        for (uint32_t i = 0; i < m->lane_count; i++) {
+            pthread_mutex_lock(&m->lanes[i].mu);
+            m->lanes[i].stop_requested = true;
+            pthread_cond_broadcast(&m->lanes[i].cv);
+            mgd_bell_ring(&m->lanes[i]);
+            pthread_mutex_unlock(&m->lanes[i].mu);
+            if (m->lanes[i].doorbell_running) {
+                pthread_join(m->lanes[i].doorbell, NULL);
+                m->lanes[i].doorbell_running = false;
+            }
+        }
+        mgd_close_transport(m);
+        mgd_free(m);
+        return MOQ_ERR_INTERNAL;
+    }
+    *out = m;
+    return MOQ_OK;
+}
+#endif
+
 /* --- stop / destroy --------------------------------------------------------- */
 
 moq_result_t moq_msquic_managed_stop(moq_msquic_managed_t *m)
@@ -1487,6 +1657,10 @@ moq_result_t moq_msquic_managed_stop(moq_msquic_managed_t *m)
     atomic_store_explicit(&m->stop_requested, true, memory_order_release);
     m->draining = true;
     pthread_mutex_unlock(&m->mu);
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_stop_latched != NULL)
+        moq_msq_test_stop_latched(m); /* latched, and no lane lock taken yet */
+#endif
 
     /* signal every lane's doorbell: each shuts its own connections down
      * and waits (under its own lane->mu) for their SHUTDOWN_COMPLETE,

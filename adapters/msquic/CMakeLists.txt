@@ -453,6 +453,37 @@ if(MOQ_BUILD_TESTS)
                 TIMEOUT 120)
         endif()
 
+        # Reap FAIRNESS pin, plus the pump-exit and stop controls for the new
+        # reap site: an acknowledged, transport-reapable child must be
+        # reclaimed while its lane still has work owed on every pass, not only
+        # once the lane falls idle. NETWORK-FREE — the facade comes from a
+        # testing constructor that opens no listener, socket or credential, so
+        # this needs no cert fixture and carries no network label. Compiles the
+        # adapter + managed sources with the testing seams on and links no
+        # production adapter library.
+        add_executable(test_msquic_reap_fairness
+            tests/test_msquic_reap_fairness.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_reap_fairness PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_reap_fairness PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_reap_fairness PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_reap_fairness PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        # No cert fixture and no network: the facade this test builds opens no
+        # listener, so it is registered unconditionally.
+        add_test(NAME msquic_reap_fairness COMMAND test_msquic_reap_fairness)
+        set_tests_properties(msquic_reap_fairness PROPERTIES
+            LABELS "msquic"
+            TIMEOUT 120)
+
         # Terminal-child lifetime pin: a bounded application pump that leaves
         # SESSION_CLOSED unconsumed must still be given its child, its session
         # and its own per-connection state on a later pump. Kept out of
