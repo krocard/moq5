@@ -64,6 +64,15 @@ target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
 
+# Fake-endpoint fidelity: every recorded-operation capacity loss and every
+# byte-bearing truncation is observable and sticky, so a fixture cannot
+# assert an exact operation set or exact bytes on evidence that was dropped.
+add_executable(test_fake_endpoint_fidelity unit/test_fake_endpoint_fidelity.c)
+target_link_libraries(test_fake_endpoint_fidelity PRIVATE moq-core-test-internals)
+target_include_directories(test_fake_endpoint_fidelity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME fake_endpoint_fidelity COMMAND test_fake_endpoint_fidelity)
+
 add_executable(test_bridge_conformance
     unit/test_bridge_conformance.c
     support/bridge_conformance_pair.c

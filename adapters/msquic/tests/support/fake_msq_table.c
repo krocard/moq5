@@ -127,6 +127,15 @@ static QUIC_STATUS QUIC_API f_stream_shutdown(
     st->shutdown_calls++;
     st->last_shutdown_flags = flags;
     st->last_shutdown_code = code;
+    /* record in order; announce the first call that no longer fits rather
+     * than overwriting an earlier entry */
+    if (st->shutdown_log_len < FAKE_MSQ_SHUTDOWN_LOG) {
+        st->shutdown_flags_log[st->shutdown_log_len] = (uint32_t)flags;
+        st->shutdown_codes_log[st->shutdown_log_len] = code;
+        st->shutdown_log_len++;
+    } else {
+        st->shutdown_log_overflow = true;
+    }
     return QUIC_STATUS_SUCCESS;
 }
 

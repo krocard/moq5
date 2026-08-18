@@ -32,6 +32,17 @@
 #define FAKE_MSQ_MAX_DGRAMS 128
 #define FAKE_MSQ_HELD_MAX 8192
 
+/*
+ * Ordered StreamShutdown history per stream. A stream can legitimately be
+ * shut down more than once -- an abort in each direction, then a graceful
+ * close -- and only the ORDER and the distinct (flags, code) pairs
+ * distinguish those teardown shapes from one another. The log is bounded, so
+ * the first call it cannot record sets shutdown_log_overflow: the loss is
+ * announced rather than papered over by an overwrite, and the total count and
+ * the latest observation stay correct either way.
+ */
+#define FAKE_MSQ_SHUTDOWN_LOG 8
+
 typedef struct fake_msq fake_msq_t;
 
 /* Handle discriminator. MsQuic's SetCallbackHandler takes one opaque HQUIC
@@ -52,9 +63,14 @@ typedef struct fake_msq_stream {
     bool started;
     QUIC_STREAM_START_FLAGS start_flags;
     bool closed;               /* StreamClose seen */
-    int shutdown_calls;        /* StreamShutdown count */
+    int shutdown_calls;        /* StreamShutdown count (never clamped) */
     QUIC_STREAM_SHUTDOWN_FLAGS last_shutdown_flags;
     uint64_t last_shutdown_code;
+    /* the first FAKE_MSQ_SHUTDOWN_LOG shutdowns, in order */
+    uint32_t shutdown_flags_log[FAKE_MSQ_SHUTDOWN_LOG];
+    uint64_t shutdown_codes_log[FAKE_MSQ_SHUTDOWN_LOG];
+    int shutdown_log_len;
+    bool shutdown_log_overflow; /* a shutdown could not be recorded */
     int receive_set_enabled;   /* +1 per TRUE, -1 per FALSE */
     bool receive_enabled;      /* last StreamReceiveSetEnabled value */
 

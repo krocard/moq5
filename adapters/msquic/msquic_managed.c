@@ -46,6 +46,10 @@
 
 #include "../common/moq_alpn.h"
 
+#ifdef MOQ_MSQUIC_TESTING
+#include "tests/support/msq_test_seams.h"
+#endif
+
 /* Which facade's callback context this thread is currently inside (the
  * one of this facade's lane mutexes is held whenever this matches). Set
  * for the whole transport batch (guard) and around doorbell service
@@ -196,7 +200,11 @@ struct moq_msquic_managed {
 
     const QUIC_API_TABLE *api; /* owned via MsQuicOpen2 unless test-borrowed */
 #ifdef MOQ_MSQUIC_TESTING
-    bool api_borrowed; /* lanes-only fake table; never passed to MsQuicClose */
+    bool api_borrowed; /* caller-owned table; never passed to MsQuicClose */
+    /* The no-doorbell decision, FROZEN once per facade at create. Read
+     * per lane it could produce a half-threaded facade if the control
+     * changed mid-creation, so the loop consults this, never the global. */
+    bool doorbell_suppressed;
 #endif
     HQUIC registration;
     HQUIC configuration;
@@ -355,6 +363,12 @@ void (*moq_msq_test_guard_pre_lock)(moq_msquic_managed_lane_t *lane);
 /* Test-only: an external stats reader is about to take this lane's mutex.
  * Same purpose, for the application-thread arm of the snapshot. */
 void (*moq_msq_test_stats_pre_lock)(moq_msquic_managed_lane_t *lane);
+
+/* Test-only: an external snapshot is about to take this lane's mutex. Same
+ * purpose again, for the seam's own reader -- a test can rendezvous exactly
+ * at the lock boundary the snapshot serializes on, rather than at its intent
+ * to reach it. Never compiled into production libraries. */
+void (*moq_msq_test_snapshot_pre_lock)(moq_msquic_managed_lane_t *lane);
 #endif
 
 static void mgd_guard_enter(void *user)
@@ -1075,6 +1089,19 @@ uint64_t moq_msq_test_bell_generation(moq_msquic_managed_lane_t *lane)
  * the bell protocol must cover. Never compiled into production libraries. */
 void (*moq_msq_test_prewait)(moq_msquic_managed_lane_t *lane);
 
+/* Test-only: an API table the facade BORROWS instead of calling MsQuicOpen2.
+ * Read once, at create; the table stays the caller's and is never passed to
+ * MsQuicClose. Lets a test stand the whole facade on a fake table with no
+ * MsQuic library, socket or credential. Never compiled into production
+ * libraries. */
+const QUIC_API_TABLE *moq_msq_test_api_override;
+
+/* Test-only: suppress doorbell thread creation, so every iteration is driven
+ * explicitly through moq_msq_test_lane_step instead. Read once, at create;
+ * teardown stays valid with no thread, because every join site is already
+ * guarded on doorbell_running. Never compiled into production libraries. */
+bool moq_msq_test_no_doorbell;
+
 /* Test-only: count of idle waits this lane returned from because the bell
  * generation advanced (a ring delivered the wake), not because the deadline
  * expired. A prompt delivery increments it; a wake left to the idle cap does
@@ -1090,128 +1117,168 @@ uint64_t moq_msq_test_bell_wakes(moq_msquic_managed_lane_t *lane)
  * explicit wakes no longer depend on it. */
 #define MGD_IDLE_WAIT_US 200000u
 
+/* One doorbell iteration's decision, taken with lane->mu held.
+ *
+ * This is the whole per-iteration policy: consume a wake or worker batch and
+ * pump, reap, honor a due deadline, or report that the lane is idle. The
+ * thread's only remaining job is to wait, so nothing here is a model of the
+ * decision -- doorbell_main and the deterministic test driver run the very
+ * same function, and any transition one performs the other performs too.
+ *
+ * On MGD_STEP_IDLE it reports the instant to wait until and whether that
+ * instant is the idle cap rather than a session deadline, which is what the
+ * caller needs to classify the wake it eventually gets. */
+typedef enum {
+    MGD_STEP_PUMPED = 0,
+    MGD_STEP_TICKED = 1,
+    MGD_STEP_STOP = 2,
+    MGD_STEP_IDLE = 3,
+} mgd_step_kind_t;
+
+static mgd_step_kind_t mgd_doorbell_step(moq_msquic_managed_lane_t *lane,
+                                         uint64_t *until_us, bool *at_cap)
+{
+    moq_msquic_managed_t *m = lane->owner;
+
+    if (lane->stop_requested ||
+        atomic_load_explicit(&m->stop_requested, memory_order_acquire))
+        return MGD_STEP_STOP;
+
+    if (mgd_lane_work_pending(lane)) {
+        /* a wake or worker-armed batch: ONE coalesced pump over the
+         * whole lane. Run it BEFORE reaping so terminal children
+         * stay visible to the pump that polls their final
+         * SESSION_CLOSED event. ext_wake is the lock-free cross-lane
+         * wake; consuming it here (after a pump, or after the bounded
+         * idle wait) is what makes that wake guaranteed. */
+        lane->wake_pending = false;
+        lane->pump_pending = false;
+        atomic_store_explicit(&lane->ext_wake, false,
+                              memory_order_release);
+        /* Close the explicit pending-wake cycle (if one is open —
+         * pump_pending alone is a worker batch, not an explicit wake)
+         * and record EXACTLY ONE latency sample for it. */
+        uint64_t stamp =
+            atomic_exchange(&lane->st_wake_stamp_us, (uint64_t)0);
+        if (stamp != 0) {
+            uint64_t nowd = mgd_now_us();
+            uint64_t delay = nowd > stamp ? nowd - stamp : 0;
+            lane->st_wake_to_pump_samples++;
+            lane->st_wake_to_pump_total_us += delay;
+            if (delay > lane->st_wake_to_pump_max_us)
+                lane->st_wake_to_pump_max_us = delay;
+        }
+        doorbell_pump_sweep(lane);
+        /* Reap opportunity between pump passes. Without it the only reap
+         * site is the no-work iteration below, so a lane whose callback
+         * arms work on every pass — a same-lane lane_wake(), or event
+         * progress rearming the coalesced pump — never reaches it, and an
+         * eligible child keeps its admission reserve for as long as the
+         * lane stays busy.
+         *
+         * Placed after the sweep has RETURNED: the app callback is over
+         * and no handle it was shown is in use. How much it reclaims is
+         * doorbell_reap's own rule, not a bound this site adds — with work
+         * armed (the case this exists for) it yields after its first
+         * victim, so the next pump still runs first; with the lane quiet
+         * after the pump it drains every eligible child, exactly as the
+         * no-work site does.
+         *
+         * Skipped once the FACADE stop is latched. That flag is published
+         * before stop takes any lane lock, so it can become visible while
+         * the pump that just returned was still running; from there on
+         * reclamation belongs to stop's own cleanup, which runs after it
+         * has joined this thread. The lane flag needs no test of its own:
+         * stop sets it under lane->mu, which this thread holds unbroken
+         * from the callback to here, and the loop-top predicate consumes
+         * it. Pump exit needs none either — it changes which site reclaims
+         * an eligible child, never whether, because a suppressed callback
+         * can no longer rearm the lane and the no-work site below is
+         * reached on the next pass. */
+        if (!atomic_load_explicit(&m->stop_requested,
+                                  memory_order_acquire))
+            doorbell_reap(lane);
+        return MGD_STEP_PUMPED;
+    }
+    doorbell_reap(lane);
+    if (lane->stop_requested ||
+        atomic_load_explicit(&m->stop_requested, memory_order_acquire))
+        return MGD_STEP_STOP;
+
+    uint64_t deadline = UINT64_MAX;
+    for (moq_msquic_managed_conn_t *mc = lane->conns; mc != NULL;
+         mc = mc->next) {
+        uint64_t dl = moq_session_next_deadline_us(mc->session);
+
+        if (dl < deadline)
+            deadline = dl;
+    }
+    /* Fold the application service deadline (e.g. media_sender's periodic
+     * catalog refresh) so a purely time-based deadline wakes this lane
+     * with no transport event. Pure cached read; the loop already broke
+     * above on stop, and lane->mu -> ep->mu here matches the pump's order.
+     * Recomputed every iteration, so there is no stale arm to guard. */
+    if (m->cfg.app_deadline_us != NULL) {
+        uint64_t ad = m->cfg.app_deadline_us(m->cfg.app_deadline_ctx);
+        if (ad < deadline)
+            deadline = ad;
+    }
+    uint64_t now = mgd_now_us();
+
+    /* a due session deadline: tick every session, then pump. Reaching
+     * this branch means NO explicit wake was pending (the predicate
+     * above wins), so counting the cause here cannot double-count. */
+    if (deadline != UINT64_MAX && deadline <= now) {
+        lane->st_deadline_sweeps++;
+        doorbell_service_all(lane);
+        doorbell_pump_sweep(lane);
+        return MGD_STEP_TICKED;
+    }
+
+    /* Idle: report when to wake and whether that instant is the cap rather
+     * than a session deadline, so the caller can classify what wakes it. */
+    uint64_t cap = now + MGD_IDLE_WAIT_US;
+    uint64_t until = (deadline != UINT64_MAX && deadline < cap) ? deadline
+                                                                : cap;
+
+    *until_us = until;
+    *at_cap = (until == cap);
+    return MGD_STEP_IDLE;
+}
+
 static void *doorbell_main(void *arg)
 {
     moq_msquic_managed_lane_t *lane = arg;
-    moq_msquic_managed_t *m = lane->owner;
 
     pthread_mutex_lock(&lane->mu);
-    while (!lane->stop_requested &&
-           !atomic_load_explicit(&m->stop_requested, memory_order_acquire)) {
-        /* Snapshot the bell BEFORE the work predicate: any ring that
-         * lands after this line — including one racing the check->wait
-         * window below — moves the generation and turns this iteration's
-         * bell wait into an immediate return. (bell_mu is a leaf; taking
-         * it briefly under lane->mu is the one sanctioned nesting.) */
+    for (;;) {
+        /* Snapshot the bell BEFORE the decision: any ring that lands after
+         * this line -- including one racing the check->wait window below --
+         * moves the generation and turns this iteration's bell wait into an
+         * immediate return. (bell_mu is a leaf; taking it briefly under
+         * lane->mu is the one sanctioned nesting.) */
         uint64_t bell_seen = mgd_bell_snapshot(lane);
+        uint64_t until = 0;
+        bool at_cap = false;
+        mgd_step_kind_t kind = mgd_doorbell_step(lane, &until, &at_cap);
 
-        if (mgd_lane_work_pending(lane)) {
-            /* a wake or worker-armed batch: ONE coalesced pump over the
-             * whole lane. Run it BEFORE reaping so terminal children
-             * stay visible to the pump that polls their final
-             * SESSION_CLOSED event. ext_wake is the lock-free cross-lane
-             * wake; consuming it here (after a pump, or after the bounded
-             * idle wait) is what makes that wake guaranteed. */
-            lane->wake_pending = false;
-            lane->pump_pending = false;
-            atomic_store_explicit(&lane->ext_wake, false,
-                                  memory_order_release);
-            /* Close the explicit pending-wake cycle (if one is open —
-             * pump_pending alone is a worker batch, not an explicit wake)
-             * and record EXACTLY ONE latency sample for it. */
-            uint64_t stamp =
-                atomic_exchange(&lane->st_wake_stamp_us, (uint64_t)0);
-            if (stamp != 0) {
-                uint64_t nowd = mgd_now_us();
-                uint64_t delay = nowd > stamp ? nowd - stamp : 0;
-                lane->st_wake_to_pump_samples++;
-                lane->st_wake_to_pump_total_us += delay;
-                if (delay > lane->st_wake_to_pump_max_us)
-                    lane->st_wake_to_pump_max_us = delay;
-            }
-            doorbell_pump_sweep(lane);
-            /* Reap opportunity between pump passes. Without it the only reap
-             * site is the no-work iteration below, so a lane whose callback
-             * arms work on every pass — a same-lane lane_wake(), or event
-             * progress rearming the coalesced pump — never reaches it, and an
-             * eligible child keeps its admission reserve for as long as the
-             * lane stays busy.
-             *
-             * Placed after the sweep has RETURNED: the app callback is over
-             * and no handle it was shown is in use. How much it reclaims is
-             * doorbell_reap's own rule, not a bound this site adds — with work
-             * armed (the case this exists for) it yields after its first
-             * victim, so the next pump still runs first; with the lane quiet
-             * after the pump it drains every eligible child, exactly as the
-             * no-work site does.
-             *
-             * Skipped once the FACADE stop is latched. That flag is published
-             * before stop takes any lane lock, so it can become visible while
-             * the pump that just returned was still running; from there on
-             * reclamation belongs to stop's own cleanup, which runs after it
-             * has joined this thread. The lane flag needs no test of its own:
-             * stop sets it under lane->mu, which this thread holds unbroken
-             * from the callback to here, and the loop-top predicate consumes
-             * it. Pump exit needs none either — it changes which site reclaims
-             * an eligible child, never whether, because a suppressed callback
-             * can no longer rearm the lane and the no-work site below is
-             * reached on the next pass. */
-            if (!atomic_load_explicit(&m->stop_requested,
-                                      memory_order_acquire))
-                doorbell_reap(lane);
-            continue;
-        }
-        doorbell_reap(lane);
-        if (lane->stop_requested ||
-            atomic_load_explicit(&m->stop_requested, memory_order_acquire))
+        if (kind == MGD_STEP_STOP)
             break;
-
-        uint64_t deadline = UINT64_MAX;
-        for (moq_msquic_managed_conn_t *mc = lane->conns; mc != NULL;
-             mc = mc->next) {
-            uint64_t dl = moq_session_next_deadline_us(mc->session);
-
-            if (dl < deadline)
-                deadline = dl;
-        }
-        /* Fold the application service deadline (e.g. media_sender's periodic
-         * catalog refresh) so a purely time-based deadline wakes this lane
-         * with no transport event. Pure cached read; the loop already broke
-         * above on stop, and lane->mu -> ep->mu here matches the pump's order.
-         * Recomputed every iteration, so there is no stale arm to guard. */
-        if (m->cfg.app_deadline_us != NULL) {
-            uint64_t ad = m->cfg.app_deadline_us(m->cfg.app_deadline_ctx);
-            if (ad < deadline)
-                deadline = ad;
-        }
-        uint64_t now = mgd_now_us();
-
-        /* a due session deadline: tick every session, then pump. Reaching
-         * this branch means NO explicit wake was pending (the predicate
-         * above wins), so counting the cause here cannot double-count. */
-        if (deadline != UINT64_MAX && deadline <= now) {
-            lane->st_deadline_sweeps++;
-            doorbell_service_all(lane);
-            doorbell_pump_sweep(lane);
+        if (kind != MGD_STEP_IDLE)
             continue;
-        }
 
         /* Wait on the BELL for a wake or the next deadline, but never
          * longer than the idle cap. Every wake source rings the bell, and
-         * the generation snapshot taken at the loop top (before the work
-         * predicate) makes a ring in the check->wait window return
-         * immediately — explicit wakes no longer depend on the cap; it
-         * remains as a robustness backstop and bounds the deadline scan
-         * cadence. lane->mu is released across the sleep (the doorbell
-         * never holds it while blocked on the bell, and never holds
-         * bell_mu while reacquiring it). On return we simply loop: the
-         * top predicate consumes wake/pump/ext_wake, and a now-due
-         * deadline is handled above. */
-        uint64_t cap = now + MGD_IDLE_WAIT_US;
-        uint64_t until = (deadline != UINT64_MAX && deadline < cap)
-                             ? deadline
-                             : cap;
-        uint64_t delay = until - now;
+         * the generation snapshot taken above (before the decision) makes a
+         * ring in the check->wait window return immediately -- explicit
+         * wakes no longer depend on the cap; it remains as a robustness
+         * backstop and bounds the deadline scan cadence. lane->mu is
+         * released across the sleep (the doorbell never holds it while
+         * blocked on the bell, and never holds bell_mu while reacquiring
+         * it). On return we simply loop: the next decision consumes
+         * wake/pump/ext_wake, and a now-due deadline is handled there. */
+        uint64_t now = mgd_now_us();
+        uint64_t delay = until > now ? until - now : 0;
         struct timespec abs;
 
         clock_gettime(CLOCK_REALTIME, &abs);
@@ -1232,13 +1299,13 @@ static void *doorbell_main(void *arg)
 #endif
         pthread_mutex_lock(&lane->mu);
         /* An idle-cap expiry with no work: the wait ran to the CAP (not a
-         * due deadline, which the loop-top branch counts) and no explicit
-         * wake / worker batch arrived. Classified here, at the decision
-         * point, so an explicit wake consumed above is never also counted
-         * as an idle wake. */
+         * due deadline, which the decision counts) and no explicit wake /
+         * worker batch arrived. Classified here, at the decision point, so
+         * an explicit wake consumed above is never also counted as an idle
+         * wake. */
         if (!lane->wake_pending && !lane->pump_pending &&
             !atomic_load_explicit(&lane->ext_wake, memory_order_acquire) &&
-            until == cap && mgd_now_us() >= cap) {
+            at_cap && mgd_now_us() >= until) {
             lane->st_idle_cap_wakes++;
         }
     }
@@ -1247,6 +1314,57 @@ static void *doorbell_main(void *arg)
     doorbell_quiesce(lane);
     pthread_mutex_unlock(&lane->mu);
     return NULL;
+}
+
+/* Install the MsQuic API table: borrow a caller-supplied one, or open our
+ * own. Read ONCE here, at create. A borrowed table remains the caller's
+ * property, which is what api_borrowed records for mgd_close_transport. */
+static moq_result_t mgd_open_api(moq_msquic_managed_t *m,
+                                 const QUIC_API_TABLE *borrowed)
+{
+#ifdef MOQ_MSQUIC_TESTING
+    if (borrowed == NULL)
+        borrowed = moq_msq_test_api_override;
+#endif
+    if (borrowed != NULL) {
+        m->api = borrowed;
+#ifdef MOQ_MSQUIC_TESTING
+        m->api_borrowed = true;
+#endif
+        return MOQ_OK;
+    }
+    if (QUIC_FAILED(MsQuicOpen2(&m->api)))
+        return MOQ_ERR_INTERNAL;
+    return MOQ_OK;
+}
+
+/* Freeze this facade's doorbell decision. Taken ONCE, at create, before any
+ * lane is spawned, so every lane of one facade agrees. */
+static void mgd_freeze_doorbell_decision(moq_msquic_managed_t *m)
+{
+#ifdef MOQ_MSQUIC_TESTING
+    m->doorbell_suppressed = moq_msq_test_no_doorbell;
+#else
+    (void)m;
+#endif
+}
+
+/* Spawn one lane's doorbell thread, recording that it is running. A facade
+ * whose frozen decision suppressed the worker is simply a lane with no
+ * thread, which every join site already handles. */
+static bool mgd_spawn_doorbell(moq_msquic_managed_t *m,
+                               moq_msquic_managed_lane_t *lane)
+{
+#ifdef MOQ_MSQUIC_TESTING
+    if (m->doorbell_suppressed)
+        return true;
+#else
+    (void)m;
+#endif
+    if (pthread_create(&lane->doorbell, NULL, doorbell_main, lane) != 0)
+        return false;
+    lane->doorbell_running = true;
+    return true;
 }
 
 /* --- create ---------------------------------------------------------------- */
@@ -1690,9 +1808,11 @@ moq_result_t moq_msquic_managed_create(
         return MOQ_ERR_NOMEM;
     }
 
-    if (QUIC_FAILED(MsQuicOpen2(&m->api))) {
+    moq_result_t apirc = mgd_open_api(m, NULL);
+
+    if (apirc != MOQ_OK) {
         mgd_free(m);
-        return MOQ_ERR_INTERNAL;
+        return apirc;
     }
     /* A managed SERVER lowers the PROCESS-GLOBAL minimum MTU floor to 1280 here,
      * after MsQuicOpen2 and before RegistrationOpen, so the pre-configuration
@@ -1836,13 +1956,9 @@ moq_result_t moq_msquic_managed_create(
 
     /* spawn one doorbell per lane */
     bool spawn_ok = true;
-    for (uint32_t i = 0; i < m->lane_count && spawn_ok; i++) {
-        if (pthread_create(&m->lanes[i].doorbell, NULL, doorbell_main,
-                           &m->lanes[i]) == 0)
-            m->lanes[i].doorbell_running = true;
-        else
-            spawn_ok = false;
-    }
+    mgd_freeze_doorbell_decision(m);
+    for (uint32_t i = 0; i < m->lane_count && spawn_ok; i++)
+        spawn_ok = mgd_spawn_doorbell(m, &m->lanes[i]);
     if (!spawn_ok) {
         /* undo: transport is live. Signal stop so any spawned doorbell
          * quiesces + exits, join them, close the listener, then shut +
@@ -1937,23 +2053,18 @@ static moq_result_t mgd_test_create_lanes_only(
         mgd_free(m);
         return MOQ_ERR_NOMEM;
     }
-    if (borrowed_api != NULL) {
-        m->api = borrowed_api;
-        m->api_borrowed = true;
-    } else if (QUIC_FAILED(MsQuicOpen2(&m->api))) {
+    moq_result_t apirc = mgd_open_api(m, borrowed_api);
+
+    if (apirc != MOQ_OK) {
         mgd_free(m);
-        return MOQ_ERR_INTERNAL;
+        return apirc;
     }
 
     bool spawn_ok = true;
 
-    for (uint32_t i = 0; i < m->lane_count && spawn_ok; i++) {
-        if (pthread_create(&m->lanes[i].doorbell, NULL, doorbell_main,
-                           &m->lanes[i]) == 0)
-            m->lanes[i].doorbell_running = true;
-        else
-            spawn_ok = false;
-    }
+    mgd_freeze_doorbell_decision(m);
+    for (uint32_t i = 0; i < m->lane_count && spawn_ok; i++)
+        spawn_ok = mgd_spawn_doorbell(m, &m->lanes[i]);
     if (!spawn_ok) {
         atomic_store_explicit(&m->stop_requested, true, memory_order_release);
         for (uint32_t i = 0; i < m->lane_count; i++) {
@@ -1993,6 +2104,108 @@ moq_result_t moq_msq_test_managed_create_lanes_only_api(
         return MOQ_ERR_INVAL;
     }
     return mgd_test_create_lanes_only(cfg, api, out);
+}
+
+/* Run exactly one production doorbell iteration on the calling thread. This
+ * is the SAME mgd_doorbell_step the doorbell thread executes -- the only
+ * thing the thread adds is the wait -- so a single-threaded test drives real
+ * transitions rather than a model of them. */
+moq_msq_test_step_t moq_msq_test_lane_step(moq_msquic_managed_lane_t *lane)
+{
+    uint64_t until = 0;
+    bool at_cap = false;
+    mgd_step_kind_t kind;
+
+    if (lane == NULL)
+        return MOQ_MSQ_TEST_STEP_IDLE;
+    pthread_mutex_lock(&lane->mu);
+    kind = mgd_doorbell_step(lane, &until, &at_cap);
+    pthread_mutex_unlock(&lane->mu);
+    /* Mapped explicitly, never cast: the seam is a source contract of its own
+     * and must not silently inherit an internal enum's ordinal order. */
+    switch (kind) {
+    case MGD_STEP_PUMPED:
+        return MOQ_MSQ_TEST_STEP_PUMPED;
+    case MGD_STEP_TICKED:
+        return MOQ_MSQ_TEST_STEP_TICKED;
+    case MGD_STEP_STOP:
+        return MOQ_MSQ_TEST_STEP_STOP;
+    case MGD_STEP_IDLE:
+        break;
+    }
+    return MOQ_MSQ_TEST_STEP_IDLE;
+}
+
+/* Observation only, under the lane lock: every field below is read, none is
+ * written, and terminal state comes from the bridge's own facts rather than
+ * from any acknowledging call. Returns the number of children actually
+ * linked, which may exceed `cap` -- a caller seeing that must treat the
+ * picture as incomplete rather than read a silently truncated set. */
+size_t moq_msq_test_lane_snapshot(moq_msquic_managed_lane_t *lane,
+                                  moq_msq_test_lane_row_t *lane_row,
+                                  moq_msq_test_child_row_t *rows, size_t cap)
+{
+    size_t linked = 0;
+
+    if (lane == NULL)
+        return 0;
+    if (moq_msq_test_snapshot_pre_lock != NULL)
+        moq_msq_test_snapshot_pre_lock(lane);
+    pthread_mutex_lock(&lane->mu);
+    if (lane_row != NULL) {
+        moq_msquic_managed_t *m = lane->owner;
+
+        memset(lane_row, 0, sizeof(*lane_row));
+        lane_row->doorbell_running = lane->doorbell_running;
+        lane_row->wake_pending = lane->wake_pending;
+        lane_row->pump_pending = lane->pump_pending;
+        lane_row->ext_wake =
+            atomic_load_explicit(&lane->ext_wake, memory_order_acquire);
+        lane_row->pump_exit = lane->pump_exit;
+        lane_row->lane_stop = lane->stop_requested;
+        lane_row->facade_stop =
+            m != NULL && atomic_load_explicit(&m->stop_requested,
+                                              memory_order_acquire);
+        lane_row->in_sweep = lane->in_sweep;
+        lane_row->in_lane_pump = lane->in_lane_pump;
+        lane_row->bell_gen = mgd_bell_snapshot(lane);
+        lane_row->conn_count = lane->conn_count;
+        lane_row->pump_sweeps = lane->st_pump_sweeps;
+        lane_row->service_passes = lane->st_service_passes;
+        lane_row->deadline_sweeps = lane->st_deadline_sweeps;
+        lane_row->idle_cap_wakes = lane->st_idle_cap_wakes;
+    }
+    for (moq_msquic_managed_conn_t *mc = lane->conns; mc != NULL;
+         mc = mc->next) {
+        if (rows != NULL && linked < cap) {
+            moq_msq_test_child_row_t *r = &rows[linked];
+            bool observed = false;
+
+            memset(r, 0, sizeof(*r));
+            r->id = mc;
+            r->user = mc->user;
+            r->reapable = mc->reapable;
+            r->app_terminal_acked = mc->app_terminal_acked;
+            if (mc->conn != NULL) {
+                r->shutdown_complete = mc->conn->shutdown_complete;
+                r->has_events = moq_msq_conn_has_events(mc->conn);
+                r->close_feed_commits = mc->conn->test_close_feed_commits;
+                if (mc->conn->bridge != NULL) {
+                    r->terminal_enqueued =
+                        moq_transport_bridge_terminal_facts(mc->conn->bridge,
+                                                            &observed);
+                    r->terminal_observed = observed;
+                    r->bridge_fatal =
+                        moq_transport_bridge_is_fatal(mc->conn->bridge);
+                    r->bridge_fatal_code =
+                        moq_transport_bridge_fatal_code(mc->conn->bridge);
+                }
+            }
+        }
+        linked++;
+    }
+    pthread_mutex_unlock(&lane->mu);
+    return linked;
 }
 
 /* Test-only synthesized accept: hand the EXACT production listener callback a

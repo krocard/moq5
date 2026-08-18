@@ -416,6 +416,60 @@ if(MOQ_BUILD_TESTS)
             LABELS "msquic;sansio"
             TIMEOUT 30)
 
+        # Managed-lane seams: the API table is borrowed rather than opened,
+        # no doorbell thread is created, one production doorbell decision is
+        # driven explicitly on the caller's thread, and the lane snapshot
+        # observes without mutating and fails closed past its row capacity.
+        # Compiles the production sources directly so every seam stays
+        # test-only.
+        add_executable(test_msq_seams
+            tests/test_msq_seams.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msq_seams PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/tests)
+        target_compile_definitions(test_msq_seams PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msq_seams PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msq_seams PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msq_seams COMMAND test_msq_seams)
+        set_tests_properties(msq_seams PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
+        # Fake-MsQuic shutdown history: repeated stream shutdowns keep their
+        # order and their distinct (flags, code) pairs, and the first call
+        # that cannot be recorded makes the loss observable.
+        add_executable(test_fake_msq_history
+            tests/test_fake_msq_history.c
+            tests/support/fake_msq_table.c)
+        target_include_directories(test_fake_msq_history PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_fake_msq_history PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_fake_msq_history PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_fake_msq_history PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME fake_msq_history COMMAND test_fake_msq_history)
+        set_tests_properties(fake_msq_history PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
         # Size-qualified config-prefix derivation on the production path:
         # a prefix-sized cfg defaults every appended field, a cfg sized
         # through max_connections honors that field while still defaulting
