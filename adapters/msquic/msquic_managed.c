@@ -1274,6 +1274,52 @@ void moq_msquic_managed_cfg_init_sized(moq_msquic_managed_cfg_t *cfg,
 /* Copy the caller-sized configuration and enforce every multi-field ABI
  * block in one place. Test-only constructors use this helper too, so their
  * prefix tests exercise the production gate rather than a copied model. */
+/* True when the caller's struct_size covers all of `field`. Every appended
+ * field is read through this, so a prefix-sized caller reads the documented
+ * default instead of whatever its stack held past the frozen prefix. */
+#define MGD_CFG_HAS(cfg, field)                                              \
+    ((cfg)->struct_size >=                                                   \
+     offsetof(moq_msquic_managed_cfg_t, field) + sizeof((cfg)->field))
+
+/* The size-qualified reading of the appended config block. One derivation,
+ * consumed by both the public constructor and the lanes-only test
+ * constructor, so a test facade can never adopt a value the public path
+ * would ignore. */
+typedef struct mgd_derived_cfg {
+    moq_version_t version;
+    size_t max_connections;
+    uint32_t lane_count;
+} mgd_derived_cfg_t;
+
+static void mgd_derive_cfg(const moq_msquic_managed_cfg_t *cfg,
+                           bool is_client, mgd_derived_cfg_t *out)
+{
+    out->version = MOQ_VERSION_DRAFT_16;
+    if (MGD_CFG_HAS(cfg, version) && cfg->version != 0)
+        out->version = cfg->version;
+
+    out->max_connections = 1;
+    if (MGD_CFG_HAS(cfg, max_connections) && cfg->max_connections != 0)
+        out->max_connections = cfg->max_connections;
+
+    /* lane count: clients always use exactly one lane; servers take
+     * cfg.lane_count (0 -> 1). Cap lanes at the connection cap — more
+     * lanes than connections buys nothing. */
+    out->lane_count = 1;
+    if (!is_client && MGD_CFG_HAS(cfg, lane_count) && cfg->lane_count > 1)
+        out->lane_count = cfg->lane_count;
+    if ((size_t)out->lane_count > out->max_connections)
+        out->lane_count = (uint32_t)out->max_connections;
+}
+
+static void mgd_apply_derived_cfg(moq_msquic_managed_t *m,
+                                  const mgd_derived_cfg_t *derived)
+{
+    m->version = derived->version;
+    m->max_connections = derived->max_connections;
+    m->lane_count = derived->lane_count;
+}
+
 static void mgd_copy_cfg(moq_msquic_managed_t *m,
                          const moq_msquic_managed_cfg_t *cfg)
 {
@@ -1389,13 +1435,10 @@ moq_result_t moq_msquic_managed_create(
         (cfg->cert_path == NULL || cfg->key_path == NULL))
         return MOQ_ERR_INVAL;
 
-    moq_version_t version = MOQ_VERSION_DRAFT_16;
-    if (cfg->struct_size >=
-            offsetof(moq_msquic_managed_cfg_t, version) +
-                sizeof(cfg->version) &&
-        cfg->version != 0)
-        version = cfg->version;
-    const char *alpn_str = moq_alpn_for_version(version);
+    mgd_derived_cfg_t derived;
+
+    mgd_derive_cfg(cfg, is_client, &derived);
+    const char *alpn_str = moq_alpn_for_version(derived.version);
     if (alpn_str == NULL)
         return MOQ_ERR_UNSUPPORTED;
 
@@ -1407,26 +1450,8 @@ moq_result_t moq_msquic_managed_create(
     m->alloc = *cfg->alloc;
     /* The helper also applies the app-deadline whole-block ABI gate. */
     mgd_copy_cfg(m, cfg);
-    m->version = version;
+    mgd_apply_derived_cfg(m, &derived);
     m->alpn = alpn_str;
-    m->max_connections = 1;
-    if (cfg->struct_size >=
-            offsetof(moq_msquic_managed_cfg_t, max_connections) +
-                sizeof(cfg->max_connections) &&
-        cfg->max_connections != 0)
-        m->max_connections = cfg->max_connections;
-    /* lane count: clients always use exactly one lane; servers take
-     * cfg.lane_count (0 -> 1). Cap lanes at the connection cap — more
-     * lanes than connections buys nothing. */
-    m->lane_count = 1;
-    if (!is_client &&
-        cfg->struct_size >=
-            offsetof(moq_msquic_managed_cfg_t, lane_count) +
-                sizeof(cfg->lane_count) &&
-        cfg->lane_count > 1)
-        m->lane_count = cfg->lane_count;
-    if ((size_t)m->lane_count > m->max_connections)
-        m->lane_count = (uint32_t)m->max_connections;
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
     if (mgd_lanes_alloc(m) != MOQ_OK) {
@@ -1633,8 +1658,15 @@ static moq_result_t mgd_test_create_lanes_only(
     if (out == NULL)
         return MOQ_ERR_INVAL;
     *out = NULL;
-    if (cfg == NULL || cfg->alloc == NULL || cfg->on_lane_pump == NULL)
+    if (cfg == NULL || cfg->alloc == NULL || cfg->on_lane_pump == NULL ||
+        cfg->struct_size < offsetof(moq_msquic_managed_cfg_t, version))
         return MOQ_ERR_INVAL;
+
+    /* Same size-qualified derivation the public constructor uses, so a
+     * prefix-sized cfg defaults identically on both paths. */
+    mgd_derived_cfg_t derived;
+
+    mgd_derive_cfg(cfg, cfg->perspective == MOQ_PERSPECTIVE_CLIENT, &derived);
 
     moq_msquic_managed_t *m = cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);
 
@@ -1643,12 +1675,8 @@ static moq_result_t mgd_test_create_lanes_only(
     memset(m, 0, sizeof(*m));
     m->alloc = *cfg->alloc;
     mgd_copy_cfg(m, cfg);
-    m->version = cfg->version != 0 ? cfg->version : MOQ_VERSION_DRAFT_16;
+    mgd_apply_derived_cfg(m, &derived);
     m->alpn = moq_alpn_for_version(m->version);
-    m->max_connections = cfg->max_connections != 0 ? cfg->max_connections : 1;
-    m->lane_count = cfg->lane_count != 0 ? cfg->lane_count : 1;
-    if ((size_t)m->lane_count > m->max_connections)
-        m->lane_count = (uint32_t)m->max_connections;
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
     if (mgd_lanes_alloc(m) != MOQ_OK) {

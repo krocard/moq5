@@ -48,7 +48,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 foreach(_v SOURCE_DIR BUILD_DIR CMAKE_CMD CTEST_CMD MSQUIC_MODE
-           EXPECT_RECV_LOOPBACK SELF_TEST_NAME)
+           EXPECT_RECEIVE_REGISTRATIONS SELF_TEST_NAME)
     if(NOT DEFINED ${_v})
         message(FATAL_ERROR "first_configure_registration: ${_v} not provided")
     endif()
@@ -83,15 +83,6 @@ else()
         "MsQuic ('package' or 'root').")
 endif()
 
-# -- openssl: give the child a search HINT, never the cached result ----------
-# The child must run its own first-pass find_program -- forwarding MOQ_OPENSSL
-# would pre-seed the very cache entry whose absence the defect hides in, and the
-# regression would pass vacuously. But a parent configured against a non-ambient
-# openssl must not produce a false failure on a host where that directory is not
-# on CTest's PATH, so its DIRECTORY is added to the child's program search path.
-if(DEFINED OPENSSL_HINT_DIR AND NOT OPENSSL_HINT_DIR STREQUAL "")
-    list(APPEND MSQUIC_ARGS "-DCMAKE_PROGRAM_PATH=${OPENSSL_HINT_DIR}")
-endif()
 
 # -- fresh child directory, proven fresh -------------------------------------
 # Reusing a preconfigured directory is exactly what hides the defect, so the
@@ -309,14 +300,6 @@ function(ar_check_identity pass_label)
         endif()
     endif()
 
-    # OpenSSL: the child ran its OWN find_program (the result was never
-    # forwarded), so this proves the hint steered that search onto the parent's
-    # executable rather than some other openssl on the host.
-    if(DEFINED EXPECT_OPENSSL AND NOT EXPECT_OPENSSL STREQUAL "")
-        ar_cache_get("MOQ_OPENSSL" child_ssl)
-        ar_same_path("${pass_label} MOQ_OPENSSL" "${child_ssl}"
-                     "${EXPECT_OPENSSL}")
-    endif()
 endfunction()
 
 ar_configure_child("first")
@@ -353,22 +336,20 @@ endif()
 
 list(LENGTH first_names n_first)
 
-# -- 2. the OpenSSL-dependent test the defect dropped ------------------------
-if(EXPECT_RECV_LOOPBACK)
-    if(NOT "msquic_recv_loopback" IN_LIST first_names)
-        message(FATAL_ERROR
-            "first_configure_registration: openssl was discovered by the "
-            "parent, so a single fresh configure must already register "
-            "msquic_recv_loopback -- it is absent from the first pass.\n"
-            "  first-pass names: ${first_names}")
-    endif()
-else()
-    if("msquic_recv_loopback" IN_LIST first_names)
-        message(FATAL_ERROR
-            "first_configure_registration: openssl was NOT discovered, so no "
-            "certificate-dependent test may be registered, but "
-            "msquic_recv_loopback is present")
-    endif()
+# -- 2. the certificate-consuming registrations, present from pass one -------
+# The loopback identity is COMMITTED, so nothing about these registrations is
+# conditional on a tool being discovered: a single fresh configure must
+# already carry both receive cells. A guard that read a cache entry its own
+# discovery had not yet written is exactly what drops one of them here.
+if(EXPECT_RECEIVE_REGISTRATIONS)
+    foreach(_want msquic_recv_loopback msquic_over_window_credit)
+        if(NOT "${_want}" IN_LIST first_names)
+            message(FATAL_ERROR
+                "first_configure_registration: a single fresh configure must "
+                "already register ${_want}, but it is absent from the first "
+                "pass.\n  first-pass names: ${first_names}")
+        endif()
+    endforeach()
 endif()
 
 # -- 3. the recursion suppression really suppressed --------------------------

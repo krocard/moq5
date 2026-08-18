@@ -121,20 +121,84 @@ server); server code reaches its sessions through lane iteration.
 
 ## Tests
 
+### Which command to run
+
+A CTest label is inclusive metadata — it selects, it never excludes — so
+the fast gate has to say what it is leaving out:
+
 ```sh
-ctest --test-dir build-msquic -R '^msquic_'
+# fast correctness gate (this is the one that needs the exclusions)
+ctest --test-dir <tree> -R '^msquic_' -LE 'qualification|soak' \
+      --output-on-failure
+
+# the qualification lane, required but run on its own
+ctest --test-dir <tree> -L qualification --output-on-failure
+
+# the soak lane
+ctest --test-dir <tree> -L soak --output-on-failure
 ```
 
-`msquic_unit` drives the adapter white-box over a fake QUIC_API_TABLE
-(stream-id computation, send budget, rcbuf ownership, credit gating —
-no real transport); `msquic_loopback` runs the managed client + server
-over real MsQuic on localhost (self-signed certs generated into the
-build dir), including an object above the 64 KiB send-budget floor and
-a clean close; `msquic_public_compile` / `_cxx` pin the standalone
-headers; `msquic_adapter_consumer` / `msquic_install_consumer` build
-the `find_package(libmoq COMPONENTS adapter-msquic-managed)` consumer
-against the build tree and a scratch install prefix;
-`msquic_managed_shared_link` configures a fresh `BUILD_SHARED_LIBS=ON`
-tree and builds + runs the managed component through the shared base
-dylib (a static build cannot catch the cross-dylib link). The localhost
-tests are labelled `network`.
+`-LE` takes a regex, so the two exclusions are alternated in one quoted
+argument; quote it, or the shell will treat `|` as a pipe.
+
+Plain `ctest` and `ctest -L msquic` deliberately run **everything** —
+adding a `qualification` or `soak` label to a test does not remove it from
+either. Anything that defines a fast gate must therefore spell the
+exclusions out; nothing else makes the distinction real.
+
+### What runs where
+
+Most of the managed facade is proven **deterministically**, over a fake
+`QUIC_API_TABLE` with no listener, socket, credential or certificate
+(labelled `msquic;sansio`, and each well under a second):
+
+- `msquic_unit` — the adapter white-box: stream-id computation, send
+  budget, rcbuf ownership, credit gating, receive arrest/hold/resume, and
+  capacity invariance across receive-queue ceilings;
+- `msquic_cfg_prefix` — the size-qualified config-prefix derivation at
+  three `struct_size` boundaries;
+- `msquic_facade_control` — drain, stop idempotence, the facade pending
+  aggregates as a true cross-lane sum, and `wait()` reporting `MOQ_DONE`
+  rather than a terminal on a live server;
+- `msquic_confinement` — the CLIENT-only session accessor's pump window,
+  and `stop()` refused from inside a managed callback;
+- `msquic_no_spin` — one wake owes exactly one pump generation, counted
+  rather than timed;
+- `msquic_child_forwarding` — `cfg.streaming_objects` reaching the child
+  session through the production child path;
+- `msquic_lanes`, `msquic_lane_stats`, `msquic_close_feed`,
+  `msquic_terminal_ack`, `msquic_reap_fairness`, `msquic_wake`,
+  `msquic_settings` — lane placement, statistics, close feeding, terminal
+  acknowledgement and reap fairness.
+
+The `network`-labelled tests are the residue that needs a real transport,
+and they share one committed test-only loopback identity (see
+`tests/README_test_certs.md` — there is no certificate-generation fixture):
+
+- `msquic_conformance` — the production contract over real MsQuic:
+  setup, subscribe/object, reset, datagrams, send pressure, and the
+  clean/fatal version outcomes;
+- `msquic_recv_loopback` — application-event hold/release: a receiver that
+  stops polling object events survives the transfer without loss or a
+  fatal, delivers nothing to its application while held, keeps pumping on
+  real transport activity with no application wake, and on release takes
+  the whole workload byte-exact, in order and exactly once. It claims no
+  sender backpressure and no adapter arrest;
+- `msquic_loopback` — streaming-object rendering in both dispositions, a
+  real second client refused at the admission cap, and a connect that can
+  never complete;
+- `msquic_reap` — the reap/pump ordering pin;
+- `msquic_over_window_credit` — **qualification**: 48 MiB across one
+  subgroup, crossing the 16 MiB stream and 32 MiB connection receive
+  windows, which is the one fact no fake rail can reproduce. It is *not*
+  a pause/resume proof and does not own queue-capacity policy;
+- `msquic_stress` — **soak**: repeated full-lifecycle churn, excluded from
+  the fast gate and run through `ctest -L soak`.
+
+`msquic_public_compile` / `_cxx` pin the standalone headers;
+`msquic_adapter_consumer` / `msquic_install_consumer` build the
+`find_package(libmoq COMPONENTS adapter-msquic-managed)` consumer against
+the build tree and a scratch install prefix; `msquic_managed_shared_link`
+configures a fresh `BUILD_SHARED_LIBS=ON` tree and builds + runs the
+managed component through the shared base dylib (a static build cannot
+catch the cross-dylib link).

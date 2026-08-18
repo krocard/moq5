@@ -283,17 +283,27 @@ if(MOQ_BUILD_TESTS)
     # Managed loopback: real MsQuic on localhost, self-signed certs,
     # managed client + managed server, one MoQ pub/sub flow.
     if(MOQ_BUILD_MSQUIC_MANAGED)
-        # Discover openssl BEFORE the first registration guard that reads it.
-        # find_program caches, so a discovery placed after its first use makes
-        # the FIRST configure of a fresh build tree drop every test guarded
-        # above it, while every later configure of the same tree looks correct.
-        find_program(MOQ_OPENSSL openssl)
+        # A COMMITTED, test-only loopback identity: a fixed self-signed
+        # certificate and key that live in the source tree and are passed to
+        # each consumer directly. Generating a fresh identity per run through
+        # an ambient `openssl` added no security coverage, made every
+        # loopback test depend on a tool being on PATH at configure time, and
+        # made registration itself conditional on that discovery. Provenance
+        # is carried by the filenames, tests/README_test_certs.md and the
+        # certificate's own subject -- never by prose inside the PEM.
+        set(MOQ_MSQUIC_TEST_CERT
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_only_loopback_cert.pem)
+        set(MOQ_MSQUIC_TEST_KEY
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_only_loopback_key.pem)
 
-        # Inbound receive-backpressure recovery over real MsQuic loopback:
-        # a stalled receiver backpressures the sender, and on release the
-        # whole workload is delivered byte-exact and exactly once. Narrow
-        # claims (see the test header); the exact arrest mechanics are in
-        # the unit rail.
+        # Application-event hold/release over real MsQuic loopback: a
+        # receiver that stops polling object events neither breaks the
+        # connection nor loses data, receives nothing while held, and on
+        # release takes the whole workload byte-exact, in order and exactly
+        # once. It claims no sender backpressure and no adapter arrest --
+        # the arrest/hold/resume mechanics are owned deterministically by
+        # the unit rail, and receive-credit renewal by the over-window
+        # qualification cell.
         add_executable(test_msquic_recv_loopback
             tests/test_msquic_recv_loopback.c)
         target_link_libraries(test_msquic_recv_loopback PRIVATE
@@ -303,16 +313,26 @@ if(MOQ_BUILD_TESTS)
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_recv_loopback
-                COMMAND test_msquic_recv_loopback
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_recv_loopback PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 180)
-        endif()
+        # Two cells, two lanes, one binary: a CTest label applies to the
+        # registered command, not to a C function, so each registration
+        # names the case it wants through the selector. `stall` is the
+        # application-event hold/release cell; `over_window` is
+        # qualification -- it proves real QUIC receive-credit renewal past
+        # the 16/32 MiB windows, which no sans-I/O rail can reproduce, but
+        # it is not a pause/resume proof and does not own queue-capacity
+        # policy either.
+        add_test(NAME msquic_recv_loopback
+            COMMAND test_msquic_recv_loopback
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY} stall)
+        set_tests_properties(msquic_recv_loopback PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 120)
+        add_test(NAME msquic_over_window_credit
+            COMMAND test_msquic_recv_loopback
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY} over_window)
+        set_tests_properties(msquic_over_window_credit PROPERTIES
+            LABELS "network;msquic;qualification"
+            TIMEOUT 120)
 
         add_executable(test_msquic_loopback tests/test_msquic_loopback.c)
         target_link_libraries(test_msquic_loopback PRIVATE
@@ -323,25 +343,12 @@ if(MOQ_BUILD_TESTS)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
 
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_gen_certs
-                COMMAND ${MOQ_OPENSSL} req -x509 -newkey rsa:2048
-                    -sha256 -days 30 -nodes
-                    -keyout ${CMAKE_CURRENT_BINARY_DIR}/key.pem
-                    -out ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    -subj /CN=localhost)
-            set_tests_properties(msquic_gen_certs PROPERTIES
-                FIXTURES_SETUP msquic_certs
-                LABELS "network;msquic")
-            add_test(NAME msquic_loopback
-                COMMAND test_msquic_loopback
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_loopback PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 120)
-        endif()
+        add_test(NAME msquic_loopback
+            COMMAND test_msquic_loopback
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_loopback PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 120)
 
         # Decisive lane-partition pin: accepts synthesized through the exact
         # production listener callback over a borrowed fake API table, so
@@ -370,6 +377,156 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME msquic_lanes COMMAND test_msquic_lanes)
         set_tests_properties(msquic_lanes PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
+        # Size-qualified config-prefix derivation on the production path:
+        # a prefix-sized cfg defaults every appended field, a cfg sized
+        # through max_connections honors that field while still defaulting
+        # lane_count, and a full cfg honors all of them. Admission runs
+        # through the exact production listener callback over a borrowed
+        # fake API table, so this needs no listener, socket, credential or
+        # certificate. Compiles the production adapter and managed sources
+        # directly so every private seam stays test-only.
+        add_executable(test_msquic_cfg_prefix
+            tests/test_msquic_cfg_prefix.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_cfg_prefix PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_cfg_prefix PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_cfg_prefix PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_cfg_prefix PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_cfg_prefix COMMAND test_msquic_cfg_prefix)
+        set_tests_properties(msquic_cfg_prefix PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
+        # Facade control surface: drain refuses while releasing the reserve,
+        # stop is idempotent, the facade pending aggregates are the sum across
+        # lanes (children on distinct lanes over distinct fake connections),
+        # and a live SERVER facade reports a bounded wait as MOQ_DONE rather
+        # than claiming it is terminal. Lanes-only facade: no listener,
+        # socket, credential or certificate. Compiles the production adapter
+        # and managed sources directly so every private seam stays test-only.
+        add_executable(test_msquic_facade_control
+            tests/test_msquic_facade_control.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_facade_control PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_facade_control PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_facade_control PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_facade_control PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_facade_control COMMAND test_msquic_facade_control)
+        set_tests_properties(msquic_facade_control PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
+        # Callback confinement: the CLIENT-only session accessor is valid
+        # ONLY inside lane 0's on_lane_pump (NULL from an app thread, from
+        # on_activity, and always on a SERVER), and stop() from inside any
+        # managed callback is refused rather than deadlocked. Lanes-only
+        # facade with an injected child: no listener, socket, credential or
+        # certificate.
+        add_executable(test_msquic_confinement
+            tests/test_msquic_confinement.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_confinement PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_confinement PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_confinement PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_confinement PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_confinement COMMAND test_msquic_confinement)
+        set_tests_properties(msquic_confinement PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
+        # No-spin scheduling, counted rather than timed: one wake owes
+        # exactly one pump generation and the lane then parks at its
+        # pre-wait barrier; a raw bell generation arms no work and buys no
+        # pump at all. A build that re-armed without end is stopped INSIDE
+        # the callback by the documented nonzero pump-exit return, so it is
+        # observed rather than hung.
+        add_executable(test_msquic_no_spin
+            tests/test_msquic_no_spin.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_no_spin PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
+        target_compile_definitions(test_msquic_no_spin PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_no_spin PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_no_spin PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_no_spin COMMAND test_msquic_no_spin)
+        set_tests_properties(msquic_no_spin PROPERTIES
+            LABELS "msquic;sansio"
+            TIMEOUT 30)
+
+        # cfg.streaming_objects must reach the CHILD SESSION through the
+        # production child path (mgd_make_child). A rig that builds its own
+        # subscriber session cannot pin that, so the child here is created
+        # by the facade and driven through a full MoQ flow against a raw
+        # peer over the fake table. Both arms run on independent facades.
+        add_executable(test_msquic_child_forwarding
+            tests/test_msquic_child_forwarding.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c
+            msquic_managed.c)
+        target_include_directories(test_msquic_child_forwarding PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/tests) # shared fake_endpoint for the peer
+        target_compile_definitions(test_msquic_child_forwarding PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_child_forwarding PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_child_forwarding PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_child_forwarding
+            COMMAND test_msquic_child_forwarding)
+        set_tests_properties(msquic_child_forwarding PROPERTIES
             LABELS "msquic;sansio"
             TIMEOUT 30)
 
@@ -476,16 +633,12 @@ if(MOQ_BUILD_TESTS)
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_reap
-                COMMAND test_msquic_reap
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_reap PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 120)
-        endif()
+        add_test(NAME msquic_reap
+            COMMAND test_msquic_reap
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_reap PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 120)
 
         # Reap FAIRNESS pin, plus the pump-exit and stop controls for the new
         # reap site: an acknowledged, transport-reapable child must be
@@ -567,16 +720,12 @@ if(MOQ_BUILD_TESTS)
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_conformance
-                COMMAND test_msquic_conformance
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_conformance PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 180)
-        endif()
+        add_test(NAME msquic_conformance
+            COMMAND test_msquic_conformance
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        set_tests_properties(msquic_conformance PROPERTIES
+            LABELS "network;msquic"
+            TIMEOUT 180)
 
         # Stress/soak: repeated full-lifecycle churn over the same
         # script harness (no thresholds; MOQ_MSQUIC_STRESS_LOOPS
@@ -591,22 +740,26 @@ if(MOQ_BUILD_TESTS)
                 -Wall -Wextra -Wpedantic
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        if(MOQ_OPENSSL)
-            add_test(NAME msquic_stress
-                COMMAND test_msquic_stress
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(msquic_stress PROPERTIES
-                FIXTURES_REQUIRED msquic_certs
-                LABELS "network;msquic"
-                TIMEOUT 600)
-        endif()
+        add_test(NAME msquic_stress
+            COMMAND test_msquic_stress
+                ${MOQ_MSQUIC_TEST_CERT} ${MOQ_MSQUIC_TEST_KEY})
+        # Soak, not correctness: repeated full-lifecycle churn with no
+        # threshold of its own. It stays in the msquic and network label
+        # sets, so a plain full run and `ctest -L msquic` still include it;
+        # only the fast gate excludes it, and does so explicitly.
+        set_tests_properties(msquic_stress PROPERTIES
+            LABELS "network;msquic;soak"
+            TIMEOUT 600)
 
-        # A configure-order guard that reads a find_program() result before the
-        # find_program() runs is invisible from inside an already-configured
-        # build tree, so this regression configures a throwaway CHILD build in
-        # a directory it deletes first and compares its first- and
-        # second-configure CTest name sets.
+        # A registration set that differs between the FIRST configure of a
+        # fresh tree and an immediate second one is invisible from inside an
+        # already-configured build tree: by the time anyone looks, the cache
+        # is populated and both passes agree. So this regression configures a
+        # throwaway CHILD build in a directory it deletes first, and compares
+        # its first- and second-configure CTest name sets. Any guard that
+        # consults state its own configure has not yet written -- a cache
+        # entry, a discovered path, a recorded branch -- drops a test from the
+        # first pass only, which is exactly what the comparison catches.
         #
         # MOQ_MSQUIC_REGISTRATION_CHILD is internal and test-only: the child
         # sets it so it does not register this fixture again. It defaults OFF,
@@ -634,12 +787,13 @@ if(MOQ_BUILD_TESTS)
         message(STATUS
             "MsQuic discovery mode: ${MOQ_MSQUIC_DISCOVERY_MODE}")
 
-        # Registered only where openssl was actually discovered: without it no
-        # test is guarded on it in either pass, so the two passes agree
-        # trivially and there is nothing for this fixture to protect. The child
-        # is deliberately NOT told the parent's MOQ_OPENSSL -- passing it would
-        # pre-seed the cache the child's own first configure must populate, and
-        # that is exactly the state the defect hides in.
+        # The registration set is no longer gated on an ambient tool: the
+        # loopback identity is committed, so the certificate-consuming tests
+        # register on the first configure of a fresh tree unconditionally.
+        # That is exactly what the child now proves -- the two passes must
+        # agree, AND both receive registrations must already be present in
+        # the first one, so a guard that read a cache entry before its own
+        # discovery wrote it still fails here.
         #
         # Only for the two discovery branches an independent child can
         # reproduce. FindMsQuic also supports a caller-supplied
@@ -650,7 +804,7 @@ if(MOQ_BUILD_TESTS)
         # the rest of the MsQuic suite registers normally. Any other value
         # already failed the configure-scope check above -- it is not silently
         # dropped here.
-        if(MOQ_OPENSSL AND NOT MOQ_MSQUIC_REGISTRATION_CHILD
+        if(NOT MOQ_MSQUIC_REGISTRATION_CHILD
            AND (MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
                 OR MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"))
             # Which of FindMsQuic's discovery branches ACTUALLY resolved
@@ -660,16 +814,6 @@ if(MOQ_BUILD_TESTS)
             # really ran, and classifying that as package mode would send the
             # child off to whatever ambient package it can find.
             set(_reg_mode "${MOQ_MSQUIC_DISCOVERY_MODE}")
-            # A search HINT only -- never the cached MOQ_OPENSSL result, which
-            # would pre-seed the cache entry the child's own first pass must
-            # populate. This keeps a parent pointed at a non-ambient openssl
-            # from failing on a host where that directory is off CTest's PATH.
-            # The executable itself is forwarded SEPARATELY, as the identity the
-            # child's own discovery must land on.
-            set(_reg_ssl_hint "")
-            if(MOQ_OPENSSL)
-                get_filename_component(_reg_ssl_hint "${MOQ_OPENSSL}" DIRECTORY)
-            endif()
             add_test(NAME msquic_first_configure_registration
                 COMMAND ${CMAKE_COMMAND}
                     -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
@@ -679,11 +823,9 @@ if(MOQ_BUILD_TESTS)
                     -DMSQUIC_MODE=${_reg_mode}
                     "-DMSQUIC_DIR=${msquic_DIR}"
                     "-DMSQUIC_ROOT=${MOQ_MSQUIC_ROOT}"
-                    "-DOPENSSL_HINT_DIR=${_reg_ssl_hint}"
-                    "-DEXPECT_OPENSSL=${MOQ_OPENSSL}"
                     "-DMSQUIC_INCLUDE_DIR=${MOQ_MSQUIC_INCLUDE_DIR}"
                     "-DMSQUIC_LIBRARY=${MOQ_MSQUIC_LIBRARY}"
-                    -DEXPECT_RECV_LOOPBACK=$<BOOL:${MOQ_OPENSSL}>
+                    -DEXPECT_RECEIVE_REGISTRATIONS=ON
                     -DSELF_TEST_NAME=msquic_first_configure_registration
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/first_configure_registration.cmake)
             set_tests_properties(msquic_first_configure_registration PROPERTIES
@@ -709,7 +851,6 @@ if(MOQ_BUILD_TESTS)
                     -DCTEST_CMD=${CMAKE_CTEST_COMMAND}
                     "-DMSQUIC_INCLUDE_DIR=${MOQ_MSQUIC_INCLUDE_DIR}"
                     "-DMSQUIC_LIBRARY=${MOQ_MSQUIC_LIBRARY}"
-                    "-DPARENT_OPENSSL=${MOQ_OPENSSL}"
                     -DSELF_TEST_NAME=msquic_first_configure_registration
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/preexisting_msquic_target.cmake)
             set_tests_properties(msquic_preexisting_target PROPERTIES

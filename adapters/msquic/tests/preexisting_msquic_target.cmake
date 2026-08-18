@@ -11,12 +11,6 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-# PARENT_OPENSSL may legitimately be empty (no openssl on this host), so it is
-# checked for definedness only, separately from the must-be-nonempty inputs.
-if(NOT DEFINED PARENT_OPENSSL)
-    message(FATAL_ERROR "preexisting_msquic_target: PARENT_OPENSSL not provided")
-endif()
-
 foreach(_v SOURCE_DIR BUILD_DIR CMAKE_CMD CTEST_CMD MSQUIC_INCLUDE_DIR
            MSQUIC_LIBRARY SELF_TEST_NAME)
     if(NOT DEFINED ${_v} OR "${${_v}}" STREQUAL "")
@@ -45,12 +39,6 @@ execute_process(
             -DMOQ_BUILD_ADAPTER_MSQUIC=ON
             -DMOQ_BUILD_MSQUIC_MANAGED=ON
             "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${inject}"
-            # Unlike the configure-ORDER regression, this fixture is testing
-            # the preexisting-target branch, not first-pass find_program()
-            # ordering -- so pinning the child's openssl disposition to the
-            # parent's is correct here, and is what makes the expectations
-            # below deterministic in both capability states.
-            "-DMOQ_OPENSSL=${PARENT_OPENSSL}"
     RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR
@@ -68,34 +56,14 @@ if(NOT out MATCHES "MsQuic discovery mode: preexisting")
         "preexisting discovery branch.\n--- stdout ---\n${out}")
 endif()
 
-# The openssl pin must have actually taken, or the expectations below are
-# checking the wrong capability state. A pre-seeded cache entry suppresses
-# find_program's search, but that is a property of the CMake in use rather
-# than something this fixture controls, so it is verified instead of assumed.
+# The child must have left a cache behind: without one the configure did not
+# really run, and every expectation below would be read from a listing that
+# means nothing.
 if(NOT EXISTS "${BUILD_DIR}/CMakeCache.txt")
     message(FATAL_ERROR
         "preexisting_msquic_target: the child configure left no cache at "
         "${BUILD_DIR}/CMakeCache.txt")
 endif()
-file(STRINGS "${BUILD_DIR}/CMakeCache.txt" ssl_lines
-     REGEX "^MOQ_OPENSSL:[^=]*=")
-# Emptiness is tested by LENGTH, not by if(<var>): the matched line ends in
-# the NOTFOUND sentinel whenever openssl is absent, which if() reads as false
-# and would report a present entry as missing.
-list(LENGTH ssl_lines ssl_count)
-if(ssl_count EQUAL 0)
-    message(FATAL_ERROR
-        "preexisting_msquic_target: the child cache has no MOQ_OPENSSL entry")
-endif()
-list(GET ssl_lines 0 ssl_line)
-string(REGEX REPLACE "^MOQ_OPENSSL:[^=]*=" "" child_openssl "${ssl_line}")
-if(NOT child_openssl STREQUAL PARENT_OPENSSL)
-    message(FATAL_ERROR
-        "preexisting_msquic_target: the child's openssl was NOT pinned to the "
-        "parent's -- child='${child_openssl}' parent='${PARENT_OPENSSL}'. The "
-        "certificate expectations below assume the two agree.")
-endif()
-
 execute_process(
     COMMAND "${CTEST_CMD}" --test-dir "${BUILD_DIR}" --show-only=json-v1
     RESULT_VARIABLE rc OUTPUT_VARIABLE listing ERROR_VARIABLE err)
@@ -148,30 +116,17 @@ foreach(want msquic_public_compile msquic_unit msquic_settings)
     endif()
 endforeach()
 
-# 3. the certificate-dependent tests follow the parent's openssl disposition,
-#    which the child was pinned to: all present when openssl exists, all absent
-#    when it does not. Requiring them unconditionally would make this control
-#    fail on an openssl-less host for a reason that has nothing to do with the
-#    preexisting-target branch.
-set(cert_tests msquic_gen_certs msquic_recv_loopback msquic_loopback)
-if(PARENT_OPENSSL)
-    foreach(want IN LISTS cert_tests)
-        if(NOT "${want}" IN_LIST names)
-            message(FATAL_ERROR
-                "preexisting_msquic_target: openssl is available "
-                "('${PARENT_OPENSSL}') so ${want} must be registered.\n"
-                "  registered: ${names}")
-        endif()
-    endforeach()
-else()
-    foreach(unwanted IN LISTS cert_tests)
-        if("${unwanted}" IN_LIST names)
-            message(FATAL_ERROR
-                "preexisting_msquic_target: openssl is unavailable, so "
-                "${unwanted} must NOT be registered.\n  registered: ${names}")
-        endif()
-    endforeach()
-endif()
+# 3. the certificate-consuming tests are unconditional: the loopback identity
+#    is committed to the source tree, so this branch must register them like
+#    any other. There is no capability state to follow any more.
+set(cert_tests msquic_recv_loopback msquic_over_window_credit msquic_loopback)
+foreach(want IN LISTS cert_tests)
+    if(NOT "${want}" IN_LIST names)
+        message(FATAL_ERROR
+            "preexisting_msquic_target: ${want} must be registered.\n"
+            "  registered: ${names}")
+    endif()
+endforeach()
 
 file(REMOVE_RECURSE "${BUILD_DIR}")
 message(STATUS
