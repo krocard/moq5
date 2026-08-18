@@ -360,7 +360,8 @@ moq_result_t session_core_on_subscribe_tracks_error(moq_session_t *s, int slot,
     ev.detail_size = (uint32_t)sizeof(moq_subscribe_tracks_error_event_t);
     ev.borrow_epoch = s->borrow_epoch;
     ev.u.subscribe_tracks_error.handle = e->handle;
-    ev.u.subscribe_tracks_error.error_code = (moq_request_error_t)error_code;
+    ev.u.subscribe_tracks_error.error_code =
+        s->profile->semantic_request_error(error_code);
     ev.u.subscribe_tracks_error.can_retry = can_retry;
     ev.u.subscribe_tracks_error.retry_after_ms = retry_after_ms;
     ev.u.subscribe_tracks_error.reason = ev_reason;
@@ -683,6 +684,11 @@ moq_result_t moq_session_reject_subscribe_tracks(moq_session_t *s,
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     /* SUBSCRIBE_TRACKS is not REDIRECT-eligible (§10.6); refuse a REDIRECT code. */
     if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 

@@ -442,7 +442,8 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
         ev.detail_size = (uint32_t)sizeof(moq_track_status_error_event_t);
         ev.borrow_epoch = s->borrow_epoch;
         ev.u.track_status_error.handle = e->handle;
-        ev.u.track_status_error.error_code = (moq_request_error_t)error_code;
+        ev.u.track_status_error.error_code =
+            s->profile->semantic_request_error(error_code);
         ev.u.track_status_error.can_retry = can_retry;
         ev.u.track_status_error.retry_after_ms = retry_after_ms;
         ev.u.track_status_error.reason = ev_reason;
@@ -713,6 +714,11 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
     if (!s || !cfg) return MOQ_ERR_INVAL;
     /* Pre-redirect minimum: the original cfg was {struct_size, error_code}. */
     if (cfg->struct_size < offsetof(moq_reject_track_status_cfg_t, reason))
+        return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
         return MOQ_ERR_INVAL;
 #define TS_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_track_status_cfg_t, f) + sizeof(cfg->f))

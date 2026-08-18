@@ -2479,7 +2479,10 @@ moq_result_t session_core_emit_request_redirect(
     e.borrow_epoch = s->borrow_epoch;
     e.u.request_redirect.family = family;
     e.u.request_redirect.handle.raw = handle_opaque;
-    e.u.request_redirect.error_code = (moq_request_error_t)error_code;
+    /* REDIRECT recognition already happened against the FULL raw value; only
+     * the semantic code is normalized here. */
+    e.u.request_redirect.error_code =
+        s->profile->semantic_request_error(error_code);
     e.u.request_redirect.can_retry = can_retry;
     e.u.request_redirect.retry_after_ms = retry_after_ms;
     e.u.request_redirect.connect_uri = ev_uri;

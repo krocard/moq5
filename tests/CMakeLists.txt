@@ -146,6 +146,10 @@ add_executable(test_request_registry_streamref unit/test_request_registry_stream
 target_link_libraries(test_request_registry_streamref PRIVATE moq-core-test-internals)
 add_test(NAME request_registry_streamref COMMAND test_request_registry_streamref)
 
+add_executable(test_request_error_width unit/test_request_error_width.c)
+target_link_libraries(test_request_error_width PRIVATE moq-core-test-internals)
+add_test(NAME request_error_width COMMAND test_request_error_width)
+
 add_executable(test_action_uni_control unit/test_action_uni_control.c)
 target_link_libraries(test_action_uni_control PRIVATE moq-core-test-internals)
 add_test(NAME action_uni_control COMMAND test_action_uni_control)

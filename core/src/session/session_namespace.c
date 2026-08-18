@@ -543,7 +543,8 @@ moq_result_t session_core_on_publish_namespace_cancel(
     e.detail_size = (uint32_t)sizeof(moq_namespace_cancelled_event_t);
     e.borrow_epoch = s->borrow_epoch;
     e.u.namespace_cancelled.ann = s->announcements[d->target_slot].handle;
-    e.u.namespace_cancelled.error_code = (moq_request_error_t)d->error_code;
+    e.u.namespace_cancelled.error_code =
+        s->profile->semantic_request_error(d->error_code);
     e.u.namespace_cancelled.reason = reason;
 
     moq_result_t rc = push_event(s, &e);
@@ -634,7 +635,8 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
         e.detail_size = (uint32_t)sizeof(moq_namespace_rejected_event_t);
         e.borrow_epoch = s->borrow_epoch;
         e.u.namespace_rejected.ann = entry->handle;
-        e.u.namespace_rejected.error_code = (moq_request_error_t)d->error_code;
+        e.u.namespace_rejected.error_code =
+            s->profile->semantic_request_error(d->error_code);
         e.u.namespace_rejected.can_retry = d->can_retry;
         e.u.namespace_rejected.retry_after_ms = d->retry_after_ms;
         e.u.namespace_rejected.reason = reason;
@@ -918,6 +920,11 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
     if (cfg->struct_size < offsetof(moq_reject_namespace_cfg_t, redirect))
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 #define ANN_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_namespace_cfg_t, f) + sizeof(cfg->f))
 
@@ -1000,6 +1007,11 @@ moq_result_t moq_session_cancel_namespace(moq_session_t *s,
     if (cfg->struct_size < sizeof(moq_cancel_namespace_cfg_t))
         return MOQ_ERR_INVAL;
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;

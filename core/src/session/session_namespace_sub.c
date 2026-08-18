@@ -1375,6 +1375,11 @@ moq_result_t moq_session_reject_ns_sub(
     if (cfg->struct_size < offsetof(moq_reject_ns_sub_cfg_t, can_retry))
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 #define NS_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_ns_sub_cfg_t, f) + sizeof(cfg->f))
     session_begin_advance(s, now_us);
@@ -1868,7 +1873,8 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                 ev.detail_size = (uint32_t)sizeof(moq_ns_sub_error_event_t);
                 ev.borrow_epoch = s->borrow_epoch;
                 ev.u.ns_sub_error.handle = e->handle;
-                ev.u.ns_sub_error.error_code = (moq_request_error_t)resp.error_code;
+                ev.u.ns_sub_error.error_code =
+                    s->profile->semantic_request_error(resp.error_code);
                 ev.u.ns_sub_error.reason = reason_copy;
                 rc = push_event(s, &ev);
                 if (rc < 0) {

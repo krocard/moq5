@@ -2237,7 +2237,8 @@ moq_result_t session_core_on_subscribe_error(moq_session_t *s,
         e.detail_size = (uint32_t)sizeof(moq_subscribe_error_event_t);
         e.borrow_epoch = s->borrow_epoch;
         e.u.subscribe_error.sub = s->subs[d->target_slot].handle;
-        e.u.subscribe_error.error_code = (moq_request_error_t)d->error_code;
+        e.u.subscribe_error.error_code =
+            s->profile->semantic_request_error(d->error_code);
         e.u.subscribe_error.can_retry = d->can_retry;
         e.u.subscribe_error.retry_after_ms = d->retry_after_ms;
         e.u.subscribe_error.reason = reason;
@@ -3192,6 +3193,11 @@ moq_result_t moq_session_reject_subscribe(
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     if (cfg->can_retry && cfg->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
+        return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
         return MOQ_ERR_INVAL;
 #define SUB_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_subscribe_cfg_t, f) + sizeof(cfg->f))

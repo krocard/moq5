@@ -4748,6 +4748,18 @@ static moq_result_t d16_classify_bidi_stream(moq_session_t *s,
         "unsupported bidi request stream type");
 }
 
+/*
+ * Draft-16 states no unknown-code rule for REQUEST_ERROR: §13.4.2 assigns
+ * meanings to the codes it registers and says nothing about the rest, so the
+ * peer's value is surfaced unchanged. Normalizing here would import
+ * draft-18's rule, and truncating would alias an unknown value onto some
+ * other REGISTERED code -- a verdict the peer never sent.
+ */
+static moq_request_error_t d16_semantic_request_error(uint64_t raw)
+{
+    return (moq_request_error_t)raw;
+}
+
 static const moq_profile_ops_t d16_ops = {
     .state_size             = sizeof(moq_d16_profile_state_t),
     .state_align            = _Alignof(moq_d16_profile_state_t),
@@ -4817,6 +4829,8 @@ static const moq_profile_ops_t d16_ops = {
     .uses_request_streams            = false,
     .location_varint_max             = MOQ_QUIC_VARINT_MAX,
     .fetch_datagram_supported = false,   /* no datagram bit in the fetch header */
+    .request_error_wire_max          = MOQ_QUIC_VARINT_MAX,
+    .semantic_request_error          = d16_semantic_request_error,
     .fetch_descending_supported      = true,   /* absolute Group IDs on the wire */
     .uses_uni_control_channel        = false,
     .classify_uni_stream             = NULL,

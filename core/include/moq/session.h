@@ -839,20 +839,47 @@ typedef uint32_t moq_group_order_t;
 
 /* -- Request error codes (semantic, for reject_subscribe) ---------- */
 
-typedef uint32_t moq_request_error_t;
+typedef uint64_t moq_request_error_t;
 
+/*
+ * The codes below are the drafts' own registries -- draft-16 §13.4.2 and
+ * draft-18 §15.10.2 -- not an abbreviated convenience list. This type is 64
+ * bits wide because the protocol's error-code domain is, and the largest
+ * value a given protocol version can actually carry differs between
+ * versions; a reject/cancel call refuses a code its session cannot express
+ * rather than silently altering it.
+ *
+ * Codes present in BOTH registries.
+ */
 #define MOQ_REQUEST_ERROR_INTERNAL_ERROR         0x0u
 #define MOQ_REQUEST_ERROR_UNAUTHORIZED           0x1u
 #define MOQ_REQUEST_ERROR_TIMEOUT                0x2u
 #define MOQ_REQUEST_ERROR_NOT_SUPPORTED          0x3u
-#define MOQ_REQUEST_ERROR_GOING_AWAY             0x6u
+#define MOQ_REQUEST_ERROR_MALFORMED_AUTH_TOKEN   0x4u
+#define MOQ_REQUEST_ERROR_EXPIRED_AUTH_TOKEN     0x5u
 #define MOQ_REQUEST_ERROR_DOES_NOT_EXIST         0x10u
 #define MOQ_REQUEST_ERROR_INVALID_RANGE          0x11u
+#define MOQ_REQUEST_ERROR_MALFORMED_TRACK        0x12u
 #define MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION     0x19u
+#define MOQ_REQUEST_ERROR_UNINTERESTED               0x20u
 #define MOQ_REQUEST_ERROR_PREFIX_OVERLAP             0x30u
 #define MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID 0x32u
+
+/*
+ * Registered by draft-18 ONLY. A draft-16 peer does not know them, so a
+ * draft-16 session treats them like any other unknown value.
+ */
+#define MOQ_REQUEST_ERROR_GOING_AWAY                 0x6u
+#define MOQ_REQUEST_ERROR_EXCESSIVE_LOAD             0x9u
+#define MOQ_REQUEST_ERROR_NAMESPACE_TOO_LARGE        0x31u
 #define MOQ_REQUEST_ERROR_UNSUPPORTED_EXTENSION      0x33u
 #define MOQ_REQUEST_ERROR_REDIRECT                   0x34u
+
+/*
+ * Draft-18 §14 also reserves 0x7f*N + 0x9D for greasing. Those are
+ * deliberately NOT exposed as semantic constants: they carry no meaning, and
+ * a draft-18 session treats them as unknown per §15's unknown-code rule.
+ */
 
 /* -- Subscribe event detail structs -------------------------------- */
 
@@ -899,7 +926,7 @@ typedef struct moq_subscribe_error_event {
     moq_subscription_t  sub;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_subscribe_error_event_t;
@@ -1007,7 +1034,7 @@ typedef struct moq_namespace_rejected_event {
     moq_announcement_t  ann;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_namespace_rejected_event_t;
@@ -1019,7 +1046,6 @@ typedef struct moq_namespace_accepted_event {
 typedef struct moq_namespace_cancelled_event {
     moq_announcement_t  ann;
     moq_request_error_t error_code;
-    uint8_t             _pad[4];
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_namespace_cancelled_event_t;
 
@@ -1197,7 +1223,6 @@ typedef struct moq_ns_sub_ok_event {
 typedef struct moq_ns_sub_error_event {
     moq_ns_sub_handle_t  handle;
     moq_request_error_t  error_code;
-    uint8_t              _pad[4];
     moq_bytes_t          reason;  /* BORROWED from output scratch */
 } moq_ns_sub_error_event_t;
 
@@ -1231,7 +1256,7 @@ typedef struct moq_fetch_error_event {
     moq_fetch_t         fetch;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_fetch_error_event_t;
@@ -1331,7 +1356,7 @@ typedef struct moq_publish_error_event {
     moq_publication_t   pub;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;
 } moq_publish_error_event_t;
@@ -1452,7 +1477,7 @@ typedef struct moq_track_status_error_event {
     moq_track_status_handle_t handle;
     moq_request_error_t       error_code;
     bool                      can_retry;
-    uint8_t                   _pad[3];
+    uint8_t                   _pad[7];
     uint64_t                  retry_after_ms;
     moq_bytes_t               reason;
 } moq_track_status_error_event_t;
@@ -1481,7 +1506,7 @@ typedef struct moq_subscribe_tracks_error_event {
     moq_track_sub_handle_t handle;
     moq_request_error_t    error_code;
     bool                   can_retry;
-    uint8_t                _pad[3];
+    uint8_t                _pad[7];
     uint64_t               retry_after_ms;
     moq_bytes_t            reason;  /* BORROWED from output scratch */
 } moq_subscribe_tracks_error_event_t;

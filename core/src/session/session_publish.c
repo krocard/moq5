@@ -822,7 +822,7 @@ moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
     e.detail_size = (uint32_t)sizeof(moq_publish_error_event_t);
     e.borrow_epoch = s->borrow_epoch;
     e.u.publish_error.pub = s->publishes[slot].handle;
-    e.u.publish_error.error_code = (moq_request_error_t)error_code;
+    e.u.publish_error.error_code = s->profile->semantic_request_error(error_code);
     e.u.publish_error.can_retry = can_retry;
     e.u.publish_error.retry_after_ms = retry_after_ms;
     e.u.publish_error.reason = ev_reason;
@@ -1263,6 +1263,11 @@ moq_result_t moq_session_reject_publish(
     /* PUBLISH is not REDIRECT-eligible (§10.6 lists 5 families; PUBLISH not among
      * them); refuse a REDIRECT code rather than emit an unacceptable response. */
     if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;

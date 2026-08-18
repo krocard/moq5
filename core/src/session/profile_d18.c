@@ -2934,6 +2934,48 @@ static moq_result_t d18_encode_goaway(moq_session_t *s,
  * are unreachable on draft-18 (UNSUBSCRIBE has no wire message; bidi classify
  * is pre-empted by the request-stream router) or intentionally absent
  * (request-capacity: draft-18 has no MAX_REQUEST_ID). */
+/*
+ * Draft-18 §15 (:6411-6415): "Receipt of an unknown error code in any error
+ * context ... MUST be treated as equivalent to INTERNAL_ERROR for that
+ * context." The registry is §15.10.2 (:6839) -- 18 codes. The GREASE row
+ * (§14, 0x7f*N + 0x9D) is reserved precisely so implementations exercise
+ * values they do not understand, so it is NOT a semantic code and falls
+ * under the same rule.
+ */
+static bool d18_request_error_registered(uint64_t raw)
+{
+    switch (raw) {
+    case MOQ_REQUEST_ERROR_INTERNAL_ERROR:
+    case MOQ_REQUEST_ERROR_UNAUTHORIZED:
+    case MOQ_REQUEST_ERROR_TIMEOUT:
+    case MOQ_REQUEST_ERROR_NOT_SUPPORTED:
+    case MOQ_REQUEST_ERROR_MALFORMED_AUTH_TOKEN:
+    case MOQ_REQUEST_ERROR_EXPIRED_AUTH_TOKEN:
+    case MOQ_REQUEST_ERROR_GOING_AWAY:
+    case MOQ_REQUEST_ERROR_EXCESSIVE_LOAD:
+    case MOQ_REQUEST_ERROR_DOES_NOT_EXIST:
+    case MOQ_REQUEST_ERROR_INVALID_RANGE:
+    case MOQ_REQUEST_ERROR_MALFORMED_TRACK:
+    case MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION:
+    case MOQ_REQUEST_ERROR_UNINTERESTED:
+    case MOQ_REQUEST_ERROR_PREFIX_OVERLAP:
+    case MOQ_REQUEST_ERROR_NAMESPACE_TOO_LARGE:
+    case MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID:
+    case MOQ_REQUEST_ERROR_UNSUPPORTED_EXTENSION:
+    case MOQ_REQUEST_ERROR_REDIRECT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static moq_request_error_t d18_semantic_request_error(uint64_t raw)
+{
+    if (d18_request_error_registered(raw))
+        return (moq_request_error_t)raw;
+    return MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+}
+
 static const moq_profile_ops_t d18_ops = {
     .state_size              = sizeof(moq_d18_profile_state_t),
     .state_align             = _Alignof(moq_d18_profile_state_t),
@@ -2945,6 +2987,8 @@ static const moq_profile_ops_t d18_ops = {
     .uses_request_streams    = true,
     .location_varint_max     = MOQ_VI64_MAX,
     .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */
+    .request_error_wire_max  = MOQ_VI64_MAX,
+    .semantic_request_error  = d18_semantic_request_error,
     .fetch_descending_supported = false,   /* ascending-only delta reconstruction */
     .uses_uni_control_channel = true,
     .classify_uni_stream     = d18_classify_uni_stream,
