@@ -174,6 +174,12 @@ struct moq_msquic_managed_lane {
     _Atomic uint64_t st_wake_stamp_us;
     uint64_t st_pump_sweeps;
     uint64_t st_deadline_sweeps;
+#ifdef MOQ_MSQUIC_TESTING
+    uint64_t st_deadline_queries;
+    uint64_t st_deadline_class_none;
+    uint64_t st_deadline_class_future;
+    uint64_t st_deadline_class_due;
+#endif
     uint64_t st_idle_cap_wakes;
     uint64_t st_wake_to_pump_max_us;
     uint64_t st_wake_to_pump_total_us;
@@ -790,6 +796,36 @@ bool moq_msq_test_lane_inject_terminal_child(moq_msquic_managed_lane_t *lane,
     pthread_mutex_unlock(&lane->mu);
     return true;
 }
+
+/* A live child that is present and idle: same production construction and
+ * lane-membership path as the terminal injector above, and nothing else. It
+ * does NOT close, terminalize, latch reapability, or arm a pump, because the
+ * scan under test is the one the doorbell runs when there is no work — a
+ * child that arms anything would take the pump path instead and the scan
+ * would never be reached. */
+bool moq_msq_test_lane_inject_idle_child(moq_msquic_managed_lane_t *lane)
+{
+    moq_msquic_managed_t *m = lane->owner;
+    moq_msquic_managed_conn_t *mc = NULL;
+
+    pthread_mutex_lock(&m->mu);
+    if (m->conn_count >= m->max_connections) {
+        pthread_mutex_unlock(&m->mu);
+        return false;
+    }
+    m->conn_count++;
+    pthread_mutex_unlock(&m->mu);
+
+    if (mgd_make_child(m, m->version, &mc) != MOQ_OK) {
+        mgd_release_reserve(m);
+        return false;
+    }
+
+    pthread_mutex_lock(&lane->mu);
+    mgd_lane_append(lane, mc);
+    pthread_mutex_unlock(&lane->mu);
+    return true;
+}
 #endif
 
 /* May this child be reclaimed? (lane->mu held.)
@@ -1205,10 +1241,32 @@ static mgd_step_kind_t mgd_doorbell_step(moq_msquic_managed_lane_t *lane,
         atomic_load_explicit(&m->stop_requested, memory_order_acquire))
         return MGD_STEP_STOP;
 
+#ifdef MOQ_MSQUIC_TESTING
+    /* ONE instant for the whole scan, sampled before the loop: a clock read
+     * per connection would add an O(N) cost to the exact O(N) path this
+     * instrumentation exists to measure, and would classify different
+     * connections against different instants. The scheduler's own decision
+     * still uses its later timestamp below, so the diagnostic changes no
+     * behaviour. */
+    const uint64_t scan_now = mgd_now_us();
+#endif
     uint64_t deadline = UINT64_MAX;
     for (moq_msquic_managed_conn_t *mc = lane->conns; mc != NULL;
          mc = mc->next) {
         uint64_t dl = moq_session_next_deadline_us(mc->session);
+#ifdef MOQ_MSQUIC_TESTING
+        /* Counted at the query itself, not at the branch below: the branch
+         * counts a deadline that fired, while the cost being measured is this
+         * scan, which runs whether or not anything is due. The classes
+         * partition the queries exactly — every query lands in one. */
+        lane->st_deadline_queries++;
+        if (dl == UINT64_MAX)
+            lane->st_deadline_class_none++;
+        else if (dl > scan_now)
+            lane->st_deadline_class_future++;
+        else
+            lane->st_deadline_class_due++;
+#endif
 
         if (dl < deadline)
             deadline = dl;
@@ -2523,6 +2581,12 @@ static void mgd_lane_stats_fill(const moq_msquic_managed_lane_t *lane,
     full->wakes_coalesced = atomic_load(&lane->st_wakes_coalesced);
     full->pump_sweeps = lane->st_pump_sweeps;
     full->deadline_sweeps = lane->st_deadline_sweeps;
+#ifdef MOQ_MSQUIC_TESTING
+    full->deadline_queries = lane->st_deadline_queries;
+    full->deadline_class_none = lane->st_deadline_class_none;
+    full->deadline_class_future = lane->st_deadline_class_future;
+    full->deadline_class_due = lane->st_deadline_class_due;
+#endif
     full->idle_cap_wakes = lane->st_idle_cap_wakes;
     full->wake_to_pump_max_us = lane->st_wake_to_pump_max_us;
     full->wake_to_pump_total_us = lane->st_wake_to_pump_total_us;

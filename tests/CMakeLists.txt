@@ -57,6 +57,26 @@ target_link_libraries(test_session_sweep PRIVATE moq-core-test-internals)
 target_compile_definitions(test_session_sweep PRIVATE MOQ_SESSION_SWEEP_TESTING)
 add_test(NAME session_sweep COMMAND test_session_sweep)
 
+add_executable(test_session_occupancy unit/test_session_occupancy.c)
+target_link_libraries(test_session_occupancy PRIVATE moq-core-test-internals)
+add_test(NAME session_occupancy COMMAND test_session_occupancy)
+
+# Exact-work oracle: advancing-preamble work must scale with the active/ready
+# owner set, not with configured pool capacity.
+add_executable(test_session_exact_work unit/test_session_exact_work.c)
+target_link_libraries(test_session_exact_work PRIVATE moq-core-test-internals)
+target_compile_definitions(test_session_exact_work PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME session_exact_work COMMAND test_session_exact_work)
+
+# Same fixture with ONLY the complexity family compiled out. It proves the
+# probe counters are observational: every lifecycle/output/model control still
+# passes while the capacity defect is simply no longer reported.
+add_executable(test_session_exact_work_controls unit/test_session_exact_work.c)
+target_link_libraries(test_session_exact_work_controls PRIVATE moq-core-test-internals)
+target_compile_definitions(test_session_exact_work_controls PRIVATE
+    MOQ_SESSION_SWEEP_TESTING EXACT_WORK_NO_COMPLEXITY)
+add_test(NAME session_exact_work_controls COMMAND test_session_exact_work_controls)
+
 add_executable(test_transport_bridge unit/test_transport_bridge.c)
 target_link_libraries(test_transport_bridge PRIVATE moq-core-test-internals)
 target_compile_definitions(test_transport_bridge PRIVATE MOQ_SESSION_SWEEP_TESTING)

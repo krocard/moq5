@@ -94,8 +94,14 @@ int sub_find_by_alias_subscriber(moq_session_t *s, uint64_t alias)
 
 bool session_has_forwarding_pending_subscriber(moq_session_t *s)
 {
-    for (size_t i = 0; i < s->sub_cap; i++) {
+    /* Only allocated subscriptions can be forwarding-pending, and only those
+     * are linked, so the early-exit search no longer tracks the matching
+     * owner's physical slot. */
+    for (int32_t i = s->sub_occ_head; i >= 0; i = s->subs[i].occ_next) {
         moq_sub_entry_t *e = &s->subs[i];
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_fwd_pending_probes++;
+#endif
         if (e->state == MOQ_SUB_PENDING_SUBSCRIBER &&
             e->role == MOQ_SUB_ROLE_SUBSCRIBER &&
             e->forward)
@@ -152,6 +158,7 @@ const moq_resolved_window_t *moq_session_sub_resolved_window(
 static void sub_free_entry(moq_session_t *s, size_t slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
+    sub_occ_unlink(s, slot);
     /* Safety net for any Joining FETCHes (§10.12.2) still buffered against a
      * pending subscription: free them (dropping their entry-owned token storage)
      * with no control message. The alive teardown paths -- public reject and
@@ -319,14 +326,33 @@ void sub_note_stream_processed(moq_session_t *s, moq_subscription_t sub)
  * evaluates against s->sweep_now_us, skips non-runnable owners UNCHARGED, charges
  * the due-mark / stop / finalize transitions separately, and
  * returns false when it suspended with sweep_slot left on the pending owner. */
+/* See PUB_SWEEP_ADVANCE: advance unless a free already moved the cursor. */
+#define SUB_SWEEP_ADVANCE()                                                   \
+    do { if (s->sweep_slot == i)                                              \
+             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sub_cap; } while (0)
+
 bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
 {
-    for (; s->sweep_slot < s->sub_cap; s->sweep_slot++) {
+    /*
+     * Walks the subscription OCCUPANCY list, not the pool -- the mirror of
+     * pub_reap_deferred_dones_resumable(); see the note there.
+     */
+    while (s->sweep_slot < s->sub_cap) {
         if (s->state == MOQ_SESS_CLOSED) return true;  /* finalize may close */
 
         size_t i = s->sweep_slot;
+        int32_t nxt = s->subs[i].occ_next;
         moq_sub_entry_t *e = &s->subs[i];
-        if (!e->done_pending) continue;    /* costs nothing; never suspends */
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_sub_reap_probes++;
+#endif
+        if (!e->done_pending) {            /* costs nothing; never suspends */
+            SUB_SWEEP_ADVANCE();
+            continue;
+        }
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_sub_reap_pending++;
+#endif
 
         /* A suspension inside STOP_STREAMS or FINALIZE resumes in that phase:
          * SELECT already qualified this owner, and re-running it could reach a
@@ -339,8 +365,10 @@ bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
                 (e->done_stream_count != MOQ_QUIC_VARINT_MAX &&
                  e->processed_stream_count >= e->done_stream_count);
             bool due = (s->sweep_now_us >= e->done_deadline_us);
-            if (!e->done_expired && !count_satisfied && !due)
+            if (!e->done_expired && !count_satisfied && !due) {
+                SUB_SWEEP_ADVANCE();
                 continue;
+            }
 
             if (count_satisfied && !e->done_expired) {
                 if (budget) {
@@ -348,6 +376,7 @@ bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
                     (*budget)--;
                 }
                 (void)sub_finalize_done(s, (int)i);
+                SUB_SWEEP_ADVANCE();
                 continue;
             }
 
@@ -372,6 +401,10 @@ bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
          * the rx pool on re-entry instead of finalizing. */
         if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT ||
             s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS) {
+            if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT)
+                /* A FRESH rx scan for this owner starts at the rx occupancy
+                 * head; a RESUMED one keeps the position it suspended at. */
+                s->sweep_rx_pos = moq_occ_first(s->rx_occ_head, s->rx_cap);
             s->sweep_phase = MOQ_SWEEP_PHASE_STOP_STREAMS;
             moq_result_t src = session_stop_bound_streams_resumable(s, e->handle,
                                                      MOQ_PUBLICATION_INVALID, budget);
@@ -381,6 +414,7 @@ bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
                 /* Action capacity: this owner is abandoned for now, so its rx
                  * cursor must NOT leak into the next owner's scan. */
                 session_sweep_owner_reset(s);
+                SUB_SWEEP_ADVANCE();
                 continue;
             }
             /* Owner's rx scan is complete; the next phase owns a clean cursor. */
@@ -395,10 +429,13 @@ bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
         }
         (void)sub_finalize_done(s, (int)i);
         session_sweep_owner_reset(s);
+        SUB_SWEEP_ADVANCE();
     }
     s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
     return true;
 }
+
+#undef SUB_SWEEP_ADVANCE
 
 
 /* The canonical full-track-name key builder lives in session_track_hist.c
@@ -664,6 +701,8 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
 
     /* Commit: now safe to mutate entry. */
     entry->generation = live_gen;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    sub_occ_link(s, (size_t)slot);
     entry->state = MOQ_SUB_PENDING_PUBLISHER;
     entry->role = MOQ_SUB_ROLE_PUBLISHER;
     entry->handle = handle;
@@ -1452,6 +1491,8 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         }
         moq_sub_entry_t *re = &s->subs[slot];
         re->generation |= 1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+        sub_occ_link(s, (size_t)slot);
         re->state = MOQ_SUB_RECVING_REQUEST;
         re->role = MOQ_SUB_ROLE_PUBLISHER;
         re->request_id = 0;   /* stream-correlated; no by-id key while receiving */
@@ -2956,6 +2997,8 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     /* Commit. */
     moq_sub_entry_t *entry = &s->subs[slot];
     entry->generation |= 1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    sub_occ_link(s, (size_t)slot);
     entry->state = MOQ_SUB_PENDING_SUBSCRIBER;
     entry->role = MOQ_SUB_ROLE_SUBSCRIBER;
     entry->request_id = req_ep.request_id;

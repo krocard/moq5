@@ -48,6 +48,104 @@ moq_result_t session_scan_dt_props(const moq_session_t *s,
 }
 
 /*
+ * ---- Pool occupancy lists ------------------------------------------------
+ *
+ * Every advancing-preamble scan used to walk its whole pool looking for the
+ * few slots that were allocated, so its cost followed the CONFIGURED CAPACITY
+ * instead of the live owner set. Each pool now carries an intrusive
+ * doubly-linked list of its allocated slots, and the scans walk that.
+ *
+ * The list is kept in ASCENDING SLOT ORDER, which is deliberate: the sweeps
+ * then serve owners in exactly the order the full scan served them, so the
+ * correction changes only the cost of FINDING live owners and never the order
+ * in which completions are emitted.
+ *
+ * Insertion is O(1) in the common case. `*_find_free()` returns the lowest
+ * free slot, so every slot below a newly allocated one is allocated and the
+ * predecessor is simply `slot - 1`; the general walk from the head is kept as
+ * the correct fallback for any allocator that does not have that property.
+ */
+#define MOQ_DEFINE_POOL_OCC(NAME, ARR, CAP, HEAD, CURSOR_FIXUP)               \
+void NAME##_occ_link(moq_session_t *s, size_t slot)                           \
+{                                                                             \
+    if (!s || slot >= s->CAP) return;                                         \
+    if (s->ARR[slot].occ_linked) return;                                      \
+    int32_t prev = -1;                                                        \
+    if (slot > 0 && s->ARR[slot - 1].occ_linked) {                            \
+        prev = (int32_t)(slot - 1);                                           \
+    } else {                                                                  \
+        int32_t it = s->HEAD;                                                 \
+        while (it >= 0 && (size_t)it < slot) {                                \
+            prev = it;                                                        \
+            it = s->ARR[it].occ_next;                                         \
+        }                                                                     \
+    }                                                                         \
+    int32_t next = (prev >= 0) ? s->ARR[prev].occ_next : s->HEAD;             \
+    s->ARR[slot].occ_prev = prev;                                             \
+    s->ARR[slot].occ_next = next;                                             \
+    if (prev >= 0) s->ARR[prev].occ_next = (int32_t)slot;                     \
+    else           s->HEAD = (int32_t)slot;                                   \
+    if (next >= 0) s->ARR[next].occ_prev = (int32_t)slot;                     \
+    s->ARR[slot].occ_linked = true;                                           \
+}                                                                             \
+                                                                              \
+void NAME##_occ_unlink(moq_session_t *s, size_t slot)                         \
+{                                                                             \
+    if (!s || slot >= s->CAP) return;                                         \
+    if (!s->ARR[slot].occ_linked) return;                                     \
+    int32_t prev = s->ARR[slot].occ_prev;                                     \
+    int32_t next = s->ARR[slot].occ_next;                                     \
+    if (prev >= 0) s->ARR[prev].occ_next = next;                              \
+    else           s->HEAD = next;                                            \
+    if (next >= 0) s->ARR[next].occ_prev = prev;                              \
+    s->ARR[slot].occ_prev = -1;                                               \
+    s->ARR[slot].occ_next = -1;                                               \
+    s->ARR[slot].occ_linked = false;                                          \
+    CURSOR_FIXUP                                                              \
+}
+
+/*
+ * A sweep parked on the slot being removed must move to its successor here:
+ * the entry is about to leave the list, so resuming from it would follow a
+ * stale link. The pools the sweep cursors over carry the fixup; the others
+ * need none.
+ */
+MOQ_DEFINE_POOL_OCC(pub, publishes, pub_cap, pub_occ_head,
+    if (s->sweep_active && s->sweep_stage == MOQ_SWEEP_STAGE_PUB &&
+        s->sweep_slot == slot) {
+        s->sweep_slot = (next >= 0) ? (size_t)next : s->pub_cap;
+        session_sweep_owner_reset(s);
+    })
+MOQ_DEFINE_POOL_OCC(sub, subs, sub_cap, sub_occ_head,
+    if (s->sweep_active && s->sweep_stage == MOQ_SWEEP_STAGE_SUB &&
+        s->sweep_slot == slot) {
+        s->sweep_slot = (next >= 0) ? (size_t)next : s->sub_cap;
+        session_sweep_owner_reset(s);
+    })
+MOQ_DEFINE_POOL_OCC(sg, subgroups, sg_cap, sg_occ_head,
+    if (s->sweep_active && s->sweep_stage == MOQ_SWEEP_STAGE_REAP_SUBGROUPS &&
+        s->sweep_slot == slot)
+        s->sweep_slot = (next >= 0) ? (size_t)next : s->sg_cap;)
+/*
+ * The rx cursor is only meaningful while a PUB/SUB owner's bound-stream scan is
+ * actually running, and it is a plain reset 0 at every other time. Gating on
+ * that state is what keeps a retired session's cursor image from becoming a
+ * function of which stream happened to be freed last -- an ungated fixup would
+ * move it whenever slot 0 was freed outside any sweep.
+ */
+MOQ_DEFINE_POOL_OCC(rx, rx_streams, rx_cap, rx_occ_head,
+    if (s->sweep_active &&
+        (s->sweep_stage == MOQ_SWEEP_STAGE_PUB ||
+         s->sweep_stage == MOQ_SWEEP_STAGE_SUB) &&
+        s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS &&
+        s->sweep_rx_pos == slot)
+        s->sweep_rx_pos = (next >= 0) ? (size_t)next : s->rx_cap;)
+MOQ_DEFINE_POOL_OCC(fetch, fetches, fetch_cap, fetch_occ_head, /* no cursor */)
+
+#undef MOQ_DEFINE_POOL_OCC
+
+
+/*
  * Drive the two-pool deferred-completion sweep to its next stopping point.
  *
  * Pool order is fixed (publications, then subscriptions) so a resumed sweep
@@ -65,14 +163,14 @@ static bool session_sweep_run(moq_session_t *s, uint32_t *budget)
             !sg_reap_terminal_resumable(s, budget))
             return false;
         s->sweep_stage = MOQ_SWEEP_STAGE_PUB;
-        s->sweep_slot = 0;
+        s->sweep_slot = moq_occ_first(s->pub_occ_head, s->pub_cap);
         s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
     }
     if (s->sweep_stage == MOQ_SWEEP_STAGE_PUB) {
         if (!pub_reap_deferred_dones_resumable(s, budget))
             return false;
         s->sweep_stage = MOQ_SWEEP_STAGE_SUB;
-        s->sweep_slot = 0;
+        s->sweep_slot = moq_occ_first(s->sub_occ_head, s->sub_cap);
         s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
     }
     if (s->sweep_stage == MOQ_SWEEP_STAGE_SUB) {
@@ -118,7 +216,7 @@ static bool session_sweep_arm(moq_session_t *s, uint64_t now_us)
     if (s->sweep_active) return false;       /* resume: keep sweep_now_us */
     s->sweep_active = true;
     s->sweep_stage = MOQ_SWEEP_STAGE_REAP_SUBGROUPS;
-    s->sweep_slot = 0;
+    s->sweep_slot = moq_occ_first(s->sg_occ_head, s->sg_cap);
     s->sweep_rx_pos = 0;
     s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
     s->sweep_reaped_subgroup = false;
@@ -159,6 +257,40 @@ void session_sweep_discard(moq_session_t *s)
 #if defined(MOQ_SESSION_SWEEP_TESTING)
 uint64_t session_budget_enter_count;
 uint64_t session_budget_suspend_count;
+
+/* Exact-work probe counters (session_internal.h documents the unit). Defined
+ * here so every preamble stage shares one definition site; incremented at the
+ * loop bodies they name. Observational: no control flow reads them. */
+uint64_t session_work_sg_reap_probes;
+uint64_t session_work_sg_reap_charged;
+uint64_t session_work_sg_deadline_probes;
+uint64_t session_work_pub_reap_probes;
+uint64_t session_work_pub_reap_pending;
+uint64_t session_work_sub_reap_probes;
+uint64_t session_work_sub_reap_pending;
+uint64_t session_work_retry_sub_probes;
+uint64_t session_work_retry_pub_probes;
+uint64_t session_work_rx_probes;
+uint64_t session_work_rx_charged;
+uint64_t session_work_close_sg_probes;
+uint64_t session_work_close_rx_probes;
+uint64_t session_work_fwd_pending_probes;
+uint64_t session_work_deferred_rx_probes;
+uint64_t session_work_join_probes;
+uint64_t session_work_join_resolve_probes;
+uint64_t session_work_join_reject_probes;
+uint64_t session_work_staged_probes;
+uint64_t session_work_queued_action;
+uint64_t session_work_queued_event;
+uint64_t session_work_tomb_probes;
+uint64_t session_work_auth_staging;
+uint64_t session_work_index_find;
+uint64_t session_work_index_find_calls;
+uint64_t session_work_index_rm_calls;
+uint64_t session_work_index_rm_search;
+uint64_t session_work_index_rm_backshift;
+uint64_t session_work_catchup_passes;
+uint64_t session_work_rx_rescan_passes;
 #endif
 
 uint32_t session_budget_remaining(const moq_session_t *s)
@@ -201,12 +333,29 @@ static void session_expiry_retry_recompute(moq_session_t *s)
         return;
     }
     bool blocked = false;
-    for (size_t i = 0; !blocked && i < s->sub_cap; i++)
+    /*
+     * Only an ALLOCATED owner can be deferred-and-expired, and only allocated
+     * slots are linked -- so the early-exit search now walks the live owners
+     * instead of the pool. That also removes the old scan's dependence on an
+     * owner's PHYSICAL SLOT: it used to stop at the first blocked owner, so its
+     * cost tracked that owner's index rather than the live set.
+     */
+    for (int32_t i = s->sub_occ_head; !blocked && i >= 0;
+         i = s->subs[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_retry_sub_probes++;
+#endif
         if (s->subs[i].done_pending && s->subs[i].done_expired)
             blocked = true;
-    for (size_t i = 0; !blocked && i < s->pub_cap; i++)
+    }
+    for (int32_t i = s->pub_occ_head; !blocked && i >= 0;
+         i = s->publishes[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_retry_pub_probes++;
+#endif
         if (s->publishes[i].done_pending && s->publishes[i].done_expired)
             blocked = true;
+    }
     s->expiry_retry_deadline_us = blocked
         ? deadline_add(s->last_now_us, MOQ_DONE_EXPIRY_RETRY_US)
         : UINT64_MAX;
@@ -235,6 +384,9 @@ static bool session_advance_sweep(moq_session_t *s, uint64_t now_us,
     session_call_prepare(s);
 
     for (;;) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_catchup_passes++;
+#endif
         bool fresh = session_sweep_arm(s, now_us);
         if (!session_sweep_run(s, budget))
             return false;                    /* suspended: cursor holds place */
@@ -318,6 +470,9 @@ void decref_queued_data_payloads(moq_session_t *s)
 {
     for (size_t i = s->action_head; i < s->action_tail; i++) {
         moq_action_t *a = &s->actions[i % s->action_cap];
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_queued_action++;
+#endif
         if (a->kind == MOQ_ACTION_SEND_DATA && a->u.send_data.payload) {
             moq_rcbuf_decref(a->u.send_data.payload);
             a->u.send_data.payload = NULL;
@@ -329,6 +484,9 @@ void decref_queued_event_payloads(moq_session_t *s)
 {
     for (size_t i = s->event_head; i < s->event_tail; i++) {
         moq_event_t *e = &s->events[i % s->event_cap];
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_queued_event++;
+#endif
         if (e->kind == MOQ_EVENT_OBJECT_RECEIVED) {
             if (e->u.object_received.payload) {
                 size_t plen = moq_rcbuf_len(e->u.object_received.payload);
@@ -387,8 +545,14 @@ void decref_queued_event_payloads(moq_session_t *s)
 
 void free_rx_stream_bufs(moq_session_t *s)
 {
-    for (size_t i = 0; i < s->rx_cap; i++) {
+    /* Walks the rx OCCUPANCY list; only active streams hold buffers, and the
+     * successor is captured before the unlink below. */
+    for (int32_t i = s->rx_occ_head, nxt; i >= 0; i = nxt) {
         moq_rx_stream_t *rx = &s->rx_streams[i];
+        nxt = rx->occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_close_rx_probes++;
+#endif
         if (rx->active) {
             moq_index_remove(s->idx_rx_by_ref, s->idx_rx_mask,
                               rx->stream_ref._v);
@@ -426,6 +590,7 @@ void free_rx_stream_bufs(moq_session_t *s)
             }
         }
         rx->active = false;
+        rx_occ_unlink(s, (size_t)i);
     }
 }
 
@@ -443,7 +608,13 @@ static uint64_t idx_hash(uint64_t key) {
 int moq_index_find(const moq_index_entry_t *tbl, size_t mask, uint64_t key)
 {
     size_t i = (size_t)(idx_hash(key) & mask);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    session_work_index_find_calls++;
+#endif
     for (;;) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_index_find++;
+#endif
         if (tbl[i].slot < 0) return -1;
         if (tbl[i].key == key) return tbl[i].slot;
         i = (i + 1) & mask;
@@ -464,7 +635,13 @@ void moq_index_insert(moq_index_entry_t *tbl, size_t mask,
 void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key)
 {
     size_t i = (size_t)(idx_hash(key) & mask);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    session_work_index_rm_calls++;
+#endif
     for (;;) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_index_rm_search++;
+#endif
         if (tbl[i].slot < 0) return;
         if (tbl[i].key == key) break;
         i = (i + 1) & mask;
@@ -473,6 +650,9 @@ void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key)
     /* Backshift to maintain probe chains. */
     size_t j = i;
     for (;;) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_index_rm_backshift++;
+#endif
         j = (j + 1) & mask;
         if (tbl[j].slot < 0) break;
         size_t home = (size_t)(idx_hash(tbl[j].key) & mask);
@@ -1167,9 +1347,13 @@ moq_result_t queue_open_uni_control(moq_session_t *s, moq_stream_ref_t ref,
 /*
  * Close the session with an error code. Internal helper.
  *
- * reason must point to static storage (string literal) or NULL.
- * The pointer is stored directly in the closed event without copy.
- * Do not pass heap-allocated or stack-allocated reason strings.
+ * reason is BORROWED, not copied: the pointer is stored directly in the
+ * queued CLOSE_SESSION action and SESSION_CLOSED event, so it must remain
+ * valid until BOTH have been consumed. Internal callers pass string
+ * literals and are safe unconditionally; moq_session_close() callers
+ * supply their own storage under the public borrow contract
+ * (moq/session.h), which permits caller storage of any duration that
+ * outlives those two consumers. NULL means no reason phrase.
  */
 moq_result_t close_with_error(moq_session_t *s,
                                uint64_t code, const char *reason)
@@ -1190,10 +1374,16 @@ moq_result_t close_with_error(moq_session_t *s,
     s->send_len = 0;
     s->event_head = s->event_tail = 0;
 
-    /* Invalidate all subgroup entries. */
-    for (size_t i = 0; i < s->sg_cap; i++)
+    /* Invalidate all subgroup entries -- walking the occupancy list, so the
+     * close's cost follows the live subgroups rather than `sg_cap`. */
+    for (int32_t i = s->sg_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->subgroups[i].occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_close_sg_probes++;
+#endif
         if (s->subgroups[i].state != MOQ_SG_FREE)
-            sg_free_entry(i, s->subgroups);
+            sg_free_entry(s, (size_t)i);
+    }
 
     moq_action_t a;
     memset(&a, 0, sizeof(a));
@@ -1349,6 +1539,9 @@ static void staged_clear_unresolved(moq_session_t *s)
 {
     if (!s->staged_dg) return;
     for (size_t i = 0; i < s->staged_cap; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_staged_probes++;
+#endif
         if (s->staged_dg[i].in_use &&
             sub_find_by_alias_subscriber(s, s->staged_dg[i].alias) < 0)
             staged_slot_free(s, i);
@@ -2122,6 +2315,27 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
             mem + off_pub_req_recv + i * pub_req_recv_cap;
         s->publishes[i].req_recv_cap = pub_req_recv_cap;
     }
+    /*
+     * The occupancy lists start EMPTY. -1 is written explicitly because the
+     * session slab is zero-filled and slot 0 is a valid member, so a zeroed
+     * head would name a slot that is not allocated.
+     */
+    s->pub_occ_head   = -1;
+    s->sub_occ_head   = -1;
+    s->sg_occ_head    = -1;
+    s->rx_occ_head    = -1;
+    s->fetch_occ_head = -1;
+    for (size_t i = 0; i < pub_cap; i++)
+        { s->publishes[i].occ_next = -1; s->publishes[i].occ_prev = -1; }
+    for (size_t i = 0; i < sub_cap; i++)
+        { s->subs[i].occ_next = -1; s->subs[i].occ_prev = -1; }
+    for (size_t i = 0; i < sg_cap; i++)
+        { s->subgroups[i].occ_next = -1; s->subgroups[i].occ_prev = -1; }
+    for (size_t i = 0; i < rx_cap; i++)
+        { s->rx_streams[i].occ_next = -1; s->rx_streams[i].occ_prev = -1; }
+    for (size_t i = 0; i < fetch_cap; i++)
+        { s->fetches[i].occ_next = -1; s->fetches[i].occ_prev = -1; }
+
     s->output_scratch     = mem + off_scratch;
     s->output_scratch_cap = scratch_cap;
     s->event_scratch      = mem + off_evscratch;
@@ -2603,9 +2817,11 @@ moq_result_t moq_session_on_transport_close(moq_session_t *s,
     s->send_len = 0;
     s->event_head = s->event_tail = 0;
 
-    for (size_t i = 0; i < s->sg_cap; i++)
+    for (int32_t i = s->sg_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->subgroups[i].occ_next;
         if (s->subgroups[i].state != MOQ_SG_FREE)
-            sg_free_entry(i, s->subgroups);
+            sg_free_entry(s, (size_t)i);
+    }
 
     moq_event_t e;
     memset(&e, 0, sizeof(e));

@@ -861,21 +861,78 @@ if(MOQ_BUILD_TESTS)
         # an empty or unrecognized mode, because such a mode fails the
         # registration conjunction below and the script never runs: the test
         # would silently disappear instead of failing.
-        if(NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
+        if(NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "pinned"
+           AND NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
            AND NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"
            AND NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "preexisting")
             message(FATAL_ERROR
                 "MsQuic was found but FindMsQuic recorded discovery mode "
                 "'${MOQ_MSQUIC_DISCOVERY_MODE}', which is not one of "
-                "package/root/preexisting. Every branch that resolves MsQuic "
+                "pinned/package/root/preexisting. Every branch that resolves MsQuic "
                 "must record which one it was, or the configure-order "
                 "regression silently stops being registered.")
         endif()
 
         # The recorded branch, surfaced so a nested control can observe it
-        # without it having to live in (and pollute) the cache.
+        # without it having to live in (and pollute) the cache. The artifacts
+        # are surfaced the same way and for the same reason: the pin branch
+        # publishes them as configure-scope variables, so the cache is not a
+        # place either a human or a nested control can read them from.
         message(STATUS
             "MsQuic discovery mode: ${MOQ_MSQUIC_DISCOVERY_MODE}")
+        # Only the branches that RESOLVE a header/library pair have one to
+        # report, and the test is on the MODE rather than on the variables:
+        # a package or an injected target can be configured in a tree whose
+        # cache still holds an earlier root search's results, and publishing
+        # those would attribute one dependency's paths to another. Those two
+        # branches carry their artifacts on the imported target instead, under
+        # config-specific property names that are not this project's to guess.
+        set(_moq_msquic_owns_pair FALSE)
+        if(MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "pinned"
+           OR MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root")
+            set(_moq_msquic_owns_pair TRUE)
+        endif()
+
+        # A pinned tree's results are configure-scope variables, so this is the
+        # one place the equality can be checked at all -- and it is what lets
+        # the identity below be read from the pin INPUTS, which are cached and
+        # survive any path a filesystem accepts.
+        if(MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "pinned")
+            if(NOT MOQ_MSQUIC_INCLUDE_DIR STREQUAL "${MOQ_MSQUIC_PIN_INCLUDE_DIR}"
+               OR NOT MOQ_MSQUIC_LIBRARY STREQUAL "${MOQ_MSQUIC_PIN_LIBRARY}")
+                message(FATAL_ERROR
+                    "MsQuic resolved through the pin branch but published "
+                    "something other than the pinned pair.\n"
+                    "  pin include dir: ${MOQ_MSQUIC_PIN_INCLUDE_DIR}\n"
+                    "  published:       ${MOQ_MSQUIC_INCLUDE_DIR}\n"
+                    "  pin library:     ${MOQ_MSQUIC_PIN_LIBRARY}\n"
+                    "  published:       ${MOQ_MSQUIC_LIBRARY}")
+            endif()
+        endif()
+
+        if(_moq_msquic_owns_pair)
+            message(STATUS
+                "MsQuic include dir: ${MOQ_MSQUIC_INCLUDE_DIR}")
+            message(STATUS
+                "MsQuic library: ${MOQ_MSQUIC_LIBRARY}")
+        endif()
+
+        # A machine-readable copy of the same facts. Status text is for people:
+        # a nested control that parsed paths out of it would be parsing a
+        # human-formatted, wrapped, space-separated stream, and would silently
+        # truncate any path containing a space. Bracket arguments hand the
+        # values over exactly as they are.
+        set(_moq_msquic_ident_inc "")
+        set(_moq_msquic_ident_lib "")
+        if(_moq_msquic_owns_pair)
+            set(_moq_msquic_ident_inc "${MOQ_MSQUIC_INCLUDE_DIR}")
+            set(_moq_msquic_ident_lib "${MOQ_MSQUIC_LIBRARY}")
+        endif()
+        file(WRITE "${CMAKE_BINARY_DIR}/msquic-discovery.cmake"
+"set(MOQ_MSQUIC_DISCOVERY_MODE [==[${MOQ_MSQUIC_DISCOVERY_MODE}]==])\n"
+"set(MOQ_MSQUIC_OWNS_PAIR [==[${_moq_msquic_owns_pair}]==])\n"
+"set(MOQ_MSQUIC_INCLUDE_DIR [==[${_moq_msquic_ident_inc}]==])\n"
+"set(MOQ_MSQUIC_LIBRARY [==[${_moq_msquic_ident_lib}]==])\n")
 
         # The registration set is no longer gated on an ambient tool: the
         # loopback identity is committed, so the certificate-consuming tests
@@ -885,8 +942,9 @@ if(MOQ_BUILD_TESTS)
         # the first one, so a guard that read a cache entry before its own
         # discovery wrote it still fails here.
         #
-        # Only for the two discovery branches an independent child can
-        # reproduce. FindMsQuic also supports a caller-supplied
+        # Only for the discovery branches an independent child can reproduce:
+        # a pinned artifact pair, a package, or a checkout root. FindMsQuic
+        # also supports a caller-supplied
         # msquic::msquic target ("preexisting"); that dependency exists only
         # in the parent's own scope, so a nested configure cannot be given it
         # -- and inventing a fake package/root identity for it would test a
@@ -895,7 +953,8 @@ if(MOQ_BUILD_TESTS)
         # already failed the configure-scope check above -- it is not silently
         # dropped here.
         if(NOT MOQ_MSQUIC_REGISTRATION_CHILD
-           AND (MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
+           AND (MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "pinned"
+                OR MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "package"
                 OR MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"))
             # Which of FindMsQuic's discovery branches ACTUALLY resolved
             # MsQuic this configure. Read from the module's own record, not
@@ -923,6 +982,33 @@ if(MOQ_BUILD_TESTS)
                 TIMEOUT 600)
         endif()
 
+        # The pinned-artifact contract, proved by refusal. Registered wherever
+        # a concrete header/library pair is known, which is the only thing the
+        # cases need -- the pin under test is passed to each child explicitly,
+        # so this does not depend on how THIS tree resolved MsQuic.
+        if(NOT MOQ_MSQUIC_REGISTRATION_CHILD AND _moq_msquic_owns_pair)
+            add_test(NAME msquic_pinned_fail_closed
+                COMMAND ${CMAKE_COMMAND}
+                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                    -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/pinned-fail-closed-child
+                    -DCMAKE_CMD=${CMAKE_COMMAND}
+                    -DCTEST_CMD=${CMAKE_CTEST_COMMAND}
+                    "-DMSQUIC_INCLUDE_DIR=${MOQ_MSQUIC_INCLUDE_DIR}"
+                    "-DMSQUIC_LIBRARY=${MOQ_MSQUIC_LIBRARY}"
+                    # The synthetic checkout root the test builds has to be
+                    # findable by find_library on THIS platform. Its naming is
+                    # taken from CMake's own platform knowledge rather than
+                    # guessed from the pinned file, whose name may be versioned
+                    # (libmsquic.so.2.6.0) or otherwise unrepresentative.
+                    "-DLIB_PREFIX=${CMAKE_SHARED_LIBRARY_PREFIX}"
+                    "-DLIB_SUFFIX=${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                    "-DLIB_SUFFIXES=${CMAKE_FIND_LIBRARY_SUFFIXES}"
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/pinned_msquic_fail_closed.cmake)
+            set_tests_properties(msquic_pinned_fail_closed PROPERTIES
+                LABELS "msquic"
+                TIMEOUT 600)
+        endif()
+
         # FindMsQuic's preexisting-target branch: prove a caller-supplied
         # msquic::msquic configures cleanly, records that branch, OMITS the
         # nested-configure regression above rather than registering it to fail,
@@ -931,7 +1017,8 @@ if(MOQ_BUILD_TESTS)
         # are known; the child it configures is a plain project configure, so it
         # needs no recursion guard of its own.
         if(NOT MOQ_MSQUIC_REGISTRATION_CHILD
-           AND MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"
+           AND (MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "root"
+                OR MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "pinned")
            AND MOQ_MSQUIC_INCLUDE_DIR AND MOQ_MSQUIC_LIBRARY)
             add_test(NAME msquic_preexisting_target
                 COMMAND ${CMAKE_COMMAND}

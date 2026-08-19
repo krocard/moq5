@@ -96,6 +96,11 @@ typedef struct moq_msq_test_lane_row {
  * treat the picture as incomplete and fail closed rather than read a
  * silently truncated set.
  */
+/* Append one LIVE, IDLE child through the production construction and
+ * lane-membership path: no close, no terminal, no reapability latch, no pump
+ * arm. The population the no-work deadline scan walks. */
+bool moq_msq_test_lane_inject_idle_child(moq_msquic_managed_lane_t *lane);
+
 size_t moq_msq_test_lane_snapshot(moq_msquic_managed_lane_t *lane,
                                   moq_msq_test_lane_row_t *lane_row,
                                   moq_msq_test_child_row_t *rows, size_t cap);

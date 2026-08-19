@@ -18,6 +18,7 @@ static int rx_find_free(moq_session_t *s)
 static void rx_free_entry(moq_session_t *s, size_t slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
+    rx_occ_unlink(s, slot);
     moq_index_remove(s->idx_rx_by_ref, s->idx_rx_mask, rx->stream_ref._v);
     if (rx->payload_rcbuf) {
         /* An object assembled but not yet emitted: the payload lives inside
@@ -53,6 +54,8 @@ static void rx_free_entry(moq_session_t *s, size_t slot)
         rx->pending_chunk = NULL;
     }
     memset(rx, 0, sizeof(*rx));
+    rx->occ_next = -1;     /* the memset zeroed these; -1 is "unlinked" */
+    rx->occ_prev = -1;
 }
 
 /* An IDENTIFIABLE (post-header, publication- or subscription-bound) data
@@ -156,10 +159,24 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
     session_stop_scan_entries++;
 #endif
     for (;;) {
-        for (; s->sweep_rx_pos < s->rx_cap; s->sweep_rx_pos++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_rx_rescan_passes++;
+#endif
+        /* Walks the rx OCCUPANCY list: the scan's cost follows the live
+         * streams, not `rx_cap`. `nxt` is captured before rx_try_stop(), which
+         * frees the entry and unlinks it (that unlink also advances this
+         * cursor, hence the conditional advance). */
+        while (s->sweep_rx_pos < s->rx_cap) {
             size_t i = s->sweep_rx_pos;
+            int32_t nxt = s->rx_streams[i].occ_next;
+#define RX_SCAN_ADVANCE()                                                     \
+    do { if (s->sweep_rx_pos == i)                                            \
+             s->sweep_rx_pos = (nxt >= 0) ? (size_t)nxt : s->rx_cap; } while (0)
             moq_rx_stream_t *rx = &s->rx_streams[i];
-            if (!rx->active) continue;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            session_work_rx_probes++;
+#endif
+            if (!rx->active) { RX_SCAN_ADVANCE(); continue; }
             bool match = false;
             if (moq_subscription_is_valid(sub) &&
                 moq_subscription_is_valid(rx->sub) &&
@@ -169,21 +186,26 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                 moq_publication_is_valid(rx->pub_handle) &&
                 moq_publication_eq(rx->pub_handle, pub))
                 match = true;
-            if (!match) continue;
+            if (!match) { RX_SCAN_ADVANCE(); continue; }
 
             if (budget) {
                 if (*budget == 0) return MOQ_SESSION_SUSPENDED;
                 (*budget)--;
             }
             s->sweep_rx_found = true;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            session_work_rx_charged++;
+#endif
             moq_result_t rc = rx_try_stop(s, (int)i);
             if (rc < 0) return rc;
+            RX_SCAN_ADVANCE();
         }
+#undef RX_SCAN_ADVANCE
         /* A completed scan that stopped nothing means no bound stream remains.
          * Otherwise rescan from zero: stopping frees entries, so the pool must
          * settle to a clean pass before the owner may finalize. */
         bool found = s->sweep_rx_found;
-        s->sweep_rx_pos = 0;
+        s->sweep_rx_pos = moq_occ_first(s->rx_occ_head, s->rx_cap);
         s->sweep_rx_found = false;
         if (!found) return MOQ_OK;
     }
@@ -730,6 +752,10 @@ static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref
     }
     moq_rx_stream_t *rx = &s->rx_streams[slot];
     memset(rx, 0, sizeof(*rx));
+    rx->occ_next = -1;
+    rx->occ_prev = -1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    rx_occ_link(s, (size_t)slot);
     rx->active = true;
     rx->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
     rx->stream_ref = stream_ref;
@@ -1633,8 +1659,14 @@ void session_retry_resumed_deferred(moq_session_t *s)
 
 void session_discard_deferred_streams(moq_session_t *s)
 {
-    for (size_t i = 0; i < s->rx_cap; i++) {
+    /* Walks the rx OCCUPANCY list: only active streams can be deferred, and the
+     * successor is captured before the free that unlinks the entry. */
+    for (int32_t i = s->rx_occ_head, nxt; i >= 0; i = nxt) {
         moq_rx_stream_t *rx = &s->rx_streams[i];
+        nxt = rx->occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_deferred_rx_probes++;
+#endif
         if (!rx->active || rx->parse_state != MOQ_RX_DEFERRED_ALIAS)
             continue;
         /* Best-effort STOP_DATA. If the action queue is full, rx_try_stop

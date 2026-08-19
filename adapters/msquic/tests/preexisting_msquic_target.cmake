@@ -128,7 +128,38 @@ foreach(want IN LISTS cert_tests)
     endif()
 endforeach()
 
+# 4. an injected target outranks an explicit pin
+# Target injection is priority zero: the caller has not asked the project to
+# find MsQuic, they have handed it one. A pin is an instruction about how to
+# FIND it, so it does not apply. Pinning this precedence keeps it from drifting
+# now that a pin exists to compete with it.
+set(pin_build "${BUILD_DIR}-with-pin")
+file(REMOVE_RECURSE "${pin_build}")
+file(MAKE_DIRECTORY "${pin_build}")
+execute_process(
+    COMMAND "${CMAKE_CMD}" -S "${SOURCE_DIR}" -B "${pin_build}"
+            -DMOQ_BUILD_ADAPTER_MSQUIC=ON
+            -DMOQ_BUILD_MSQUIC_MANAGED=ON
+            -DMOQ_MSQUIC_REGISTRATION_CHILD=ON
+            "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${inject}"
+            "-DMOQ_MSQUIC_PIN_INCLUDE_DIR=${MSQUIC_INCLUDE_DIR}"
+            "-DMOQ_MSQUIC_PIN_LIBRARY=${MSQUIC_LIBRARY}"
+    RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0)
+    message(FATAL_ERROR
+        "preexisting_msquic_target: a preexisting target combined with a pin "
+        "must configure (rc=${rc}).\n--- stdout ---\n${out}\n"
+        "--- stderr ---\n${err}")
+endif()
+if(NOT out MATCHES "MsQuic discovery mode: preexisting")
+    message(FATAL_ERROR
+        "preexisting_msquic_target: a pin displaced the caller's injected "
+        "msquic::msquic target. Target injection is priority zero.\n"
+        "--- stdout ---\n${out}")
+endif()
+file(REMOVE_RECURSE "${pin_build}")
+
 file(REMOVE_RECURSE "${BUILD_DIR}")
 message(STATUS
     "preexisting_msquic_target: ${n_tests} tests, nested-configure regression "
-    "correctly omitted")
+    "correctly omitted, and an injected target outranks a pin")

@@ -637,6 +637,17 @@ static moq_transport_result_t ep_close_transport(void *ctx, uint64_t code,
         return MOQ_TRANSPORT_ERROR;
     if (c->conn == NULL)
         return MOQ_TRANSPORT_ERROR;
+    /* A local close is a terminal cause in its own right: orderly, carrying
+     * the application's code. Record it BEFORE telling the transport --
+     * afterwards the connection delivers only SHUTDOWN_COMPLETE, whose
+     * fallback would read this as an unclean death with code 0, which is
+     * indistinguishable from a transport failure reporting 0. First-wins, as
+     * at every other initiating site: a cause already recorded stands. */
+    if (!c->close_pending) {
+        c->close_pending = true;
+        c->close_clean = true;
+        c->close_code = code;
+    }
     /* async, never blocks; SHUTDOWN_COMPLETE follows on the worker */
     c->api->ConnectionShutdown(c->conn,
                                QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, code);

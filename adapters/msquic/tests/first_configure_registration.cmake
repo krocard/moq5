@@ -23,12 +23,18 @@
 # dependency than its parent.
 #
 # DISCOVERY MODE IS AN EXPLICIT CONTRACT, not a guess. The project finds MsQuic
-# two documented ways (cmake/FindMsQuic.cmake): an installed msquic CONFIG
-# package, or a checkout root. The config path RETURNS before MOQ_MSQUIC_ROOT is
-# ever set, so a child told only "use this root" cannot reproduce a parent that
-# used the package. The parent therefore states which mode it used and the child
-# is pinned to exactly that one -- never left to discover whichever dependency
+# three documented ways (cmake/FindMsQuic.cmake): an explicit artifact pin, an
+# installed msquic CONFIG package, or a checkout root. The pin is honoured
+# first and the config path RETURNS before MOQ_MSQUIC_ROOT is ever set, so a
+# child told only "use this root" cannot reproduce a parent that used either of
+# the others. The parent therefore states which mode it used and the child is
+# pinned to exactly that one -- never left to discover whichever dependency
 # happens to win.
+#
+# `pinned` is what an MsQuic built OUTSIDE its checkout needs: there is no root
+# whose build/bin holds the library, so the header and library are named
+# directly. Forwarding them is not a convenience -- a child given only a root
+# cannot configure at all against such a build.
 #
 # The name set comes from CTest's STRUCTURED output (--show-only=json-v1),
 # parsed with string(JSON) -- both within the project's declared CMake 3.20
@@ -55,7 +61,24 @@ foreach(_v SOURCE_DIR BUILD_DIR CMAKE_CMD CTEST_CMD MSQUIC_MODE
 endforeach()
 
 # -- pin the child to the parent's ACTUAL MsQuic discovery mode --------------
-if(MSQUIC_MODE STREQUAL "package")
+if(MSQUIC_MODE STREQUAL "pinned")
+    if(NOT DEFINED MSQUIC_INCLUDE_DIR OR MSQUIC_INCLUDE_DIR STREQUAL ""
+       OR NOT DEFINED MSQUIC_LIBRARY OR MSQUIC_LIBRARY STREQUAL "")
+        message(FATAL_ERROR
+            "first_configure_registration: MSQUIC_MODE=pinned but the parent "
+            "did not forward both artifacts.\n"
+            "  MSQUIC_INCLUDE_DIR: '${MSQUIC_INCLUDE_DIR}'\n"
+            "  MSQUIC_LIBRARY:     '${MSQUIC_LIBRARY}'")
+    endif()
+    # The pin variables are inputs, so forwarding them is all the child needs;
+    # its own MOQ_MSQUIC_INCLUDE_DIR/LIBRARY are results it will derive. Package
+    # discovery is disabled anyway, so a failure to honour the pin shows up here
+    # as a wrong identity rather than as a package quietly standing in.
+    set(MSQUIC_ARGS
+        "-DCMAKE_DISABLE_FIND_PACKAGE_msquic=TRUE"
+        "-DMOQ_MSQUIC_PIN_INCLUDE_DIR:PATH=${MSQUIC_INCLUDE_DIR}"
+        "-DMOQ_MSQUIC_PIN_LIBRARY:FILEPATH=${MSQUIC_LIBRARY}")
+elseif(MSQUIC_MODE STREQUAL "package")
     if(NOT DEFINED MSQUIC_DIR OR MSQUIC_DIR STREQUAL "")
         message(FATAL_ERROR
             "first_configure_registration: MSQUIC_MODE=package but no "
@@ -94,7 +117,7 @@ if(EXISTS "${BUILD_DIR}")
         "refusing to run against a directory that may already be configured")
 endif()
 
-function(ar_configure_child pass_label)
+function(ar_configure_child pass_label out_text)
     execute_process(
         COMMAND "${CMAKE_CMD}" -S "${SOURCE_DIR}" -B "${BUILD_DIR}"
                 -DMOQ_BUILD_ADAPTER_MSQUIC=ON
@@ -109,6 +132,8 @@ function(ar_configure_child pass_label)
             "first_configure_registration: ${pass_label} configure failed "
             "(rc=${rc})\n--- stdout ---\n${out}\n--- stderr ---\n${err}")
     endif()
+    string(REGEX REPLACE "[ \t\r\n]+" " " flat "${out}\n${err}")
+    set(${out_text} "${flat}" PARENT_SCOPE)
 endfunction()
 
 # Returns the sorted CTest name list, read from the structured listing. Every
@@ -266,8 +291,74 @@ function(ar_path_under label path root)
 endfunction()
 
 # After a child configure, prove it resolved the SAME dependency the parent did.
-function(ar_check_identity pass_label)
-    if(MSQUIC_MODE STREQUAL "package")
+# Read the child's machine-readable discovery record. Paths are never parsed
+# out of the human status text: that stream is wrapped and space-separated, so
+# any path containing a space would be silently truncated and the identity
+# check would fail on a configure that was perfectly correct.
+function(ar_discovery_record pass_label)
+    set(record "${BUILD_DIR}/msquic-discovery.cmake")
+    if(NOT EXISTS "${record}")
+        message(FATAL_ERROR
+            "first_configure_registration: ${pass_label} child left no "
+            "discovery record at ${record}")
+    endif()
+    include("${record}")
+    foreach(_v MOQ_MSQUIC_DISCOVERY_MODE MOQ_MSQUIC_OWNS_PAIR
+               MOQ_MSQUIC_INCLUDE_DIR MOQ_MSQUIC_LIBRARY)
+        set(${_v} "${${_v}}" PARENT_SCOPE)
+    endforeach()
+endfunction()
+
+function(ar_check_identity pass_label text)
+    if(MSQUIC_MODE STREQUAL "pinned")
+        ar_cache_get("CMAKE_DISABLE_FIND_PACKAGE_msquic" child_disable)
+        if(NOT child_disable)
+            message(FATAL_ERROR
+                "first_configure_registration: ${pass_label} pinned mode but "
+                "the child left package discovery enabled "
+                "(CMAKE_DISABLE_FIND_PACKAGE_msquic='${child_disable}'), so an "
+                "ambient package could have shadowed the pin")
+        endif()
+        # The pair IS the identity here: there is no root to fall back on, so
+        # both halves are compared against exactly what the parent used. They
+        # are read from the child's configure log rather than its cache: a
+        # pinned tree publishes its results in configure scope so that clearing
+        # the pin cannot leave them behind.
+        ar_discovery_record("${pass_label}")
+        if(NOT MOQ_MSQUIC_DISCOVERY_MODE STREQUAL "pinned")
+            message(FATAL_ERROR
+                "first_configure_registration: ${pass_label} child recorded "
+                "mode '${MOQ_MSQUIC_DISCOVERY_MODE}', not 'pinned'")
+        endif()
+        set(child_inc "${MOQ_MSQUIC_INCLUDE_DIR}")
+        set(child_lib "${MOQ_MSQUIC_LIBRARY}")
+        # Preseeding the RESULT variables still reaches the pin branch, by way
+        # of the legacy migration. That is for other people's build scripts,
+        # not for this project's own harness: forwarding the deprecated
+        # spelling here would test the compatibility path instead of the
+        # contract, and would go on passing after the compatibility path is
+        # eventually removed.
+        string(FIND "${text}" "switch to MOQ_MSQUIC_PIN_INCLUDE_DIR" _dep)
+        if(NOT _dep EQUAL -1)
+            message(FATAL_ERROR
+                "first_configure_registration: ${pass_label} child reached the "
+                "pin through the deprecated result-variable spelling. The "
+                "fixture must forward MOQ_MSQUIC_PIN_* directly.\n"
+                "--- child output ---\n${text}")
+        endif()
+        ar_same_path("${pass_label} include dir" "${child_inc}"
+                     "${MSQUIC_INCLUDE_DIR}")
+        ar_same_path("${pass_label} library" "${child_lib}" "${MSQUIC_LIBRARY}")
+        # And that the child reached them through the pin branch rather than
+        # arriving at the same paths by searching: the pin inputs it was given
+        # must be the ones it published as results.
+        ar_cache_get("MOQ_MSQUIC_PIN_INCLUDE_DIR" child_pin_inc)
+        ar_cache_get("MOQ_MSQUIC_PIN_LIBRARY" child_pin_lib)
+        ar_same_path("${pass_label} pin include dir" "${child_pin_inc}"
+                     "${MSQUIC_INCLUDE_DIR}")
+        ar_same_path("${pass_label} pin library" "${child_pin_lib}"
+                     "${MSQUIC_LIBRARY}")
+    elseif(MSQUIC_MODE STREQUAL "package")
         ar_cache_get("msquic_DIR" child_pkg)
         ar_same_path("${pass_label} msquic_DIR" "${child_pkg}" "${MSQUIC_DIR}")
     else()
@@ -302,12 +393,12 @@ function(ar_check_identity pass_label)
 
 endfunction()
 
-ar_configure_child("first")
-ar_check_identity("first")
+ar_configure_child("first" first_log)
+ar_check_identity("first" "${first_log}")
 ar_test_names("first" first_names)
 
-ar_configure_child("second")
-ar_check_identity("second")
+ar_configure_child("second" second_log)
+ar_check_identity("second" "${second_log}")
 ar_test_names("second" second_names)
 
 # -- 1. the two passes must agree exactly, multiplicity included -------------

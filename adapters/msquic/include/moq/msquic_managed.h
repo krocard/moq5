@@ -379,6 +379,27 @@ typedef struct moq_msquic_lane_stats {
      * validates against sizeof(current) is observable before a real public
      * field is appended. Never part of the production ABI. */
     uint64_t test_appended;
+
+    /* Diagnostic-only, appended AFTER the frozen v0 prefix so no existing
+     * field offset moves and MOQ_MSQUIC_LANE_STATS_V0_SIZE stays put.
+     *
+     * `deadline_sweeps` counts a deadline that FIRED. The no-work path first
+     * queries every present connection, and each query walks that session's
+     * capacity tables; nothing counted that scan. These do:
+     *   deadline_queries  one per connection per no-work scan
+     *   deadline_class_*  that query's outcome, partitioning the queries
+     * Classification is relative to ONE scan-entry instant sampled before the
+     * loop, not to a moving `now`: none = no deadline at all, future = later
+     * than that instant, due = at or before it. Cumulative; never read by the
+     * product.
+     *
+     * These are plain uint64_t and wrap modulo 2^64; readers take differences
+     * with unsigned modular subtraction, which stays correct across a wrap.
+     * The scan path deliberately carries no saturation branch. */
+    uint64_t deadline_queries;
+    uint64_t deadline_class_none;
+    uint64_t deadline_class_future;
+    uint64_t deadline_class_due;
 #endif
 } moq_msquic_lane_stats_t;
 

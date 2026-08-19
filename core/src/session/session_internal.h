@@ -260,6 +260,17 @@ typedef struct moq_sub_entry {
     uint64_t           dt_upd_object_ms;
     bool               dt_upd_has_subgroup;
     uint64_t           dt_upd_subgroup_ms;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_sub_entry_t;
 
 typedef enum moq_ann_state {
@@ -454,6 +465,17 @@ typedef struct moq_fetch_entry {
     moq_resolved_token_t join_tokens[MOQ_DECODED_MAX_TOKENS];
     bool                 join_token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t               join_token_count;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_fetch_entry_t;
 
 typedef enum moq_pub_state {
@@ -573,6 +595,17 @@ typedef struct moq_pub_entry {
      * filter (and re-resolved on REQUEST_UPDATE snapshots) against this
      * side's registry largest. */
     moq_resolved_window_t window;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_pub_entry_t;
 
 typedef enum moq_ts_state {
@@ -853,6 +886,17 @@ typedef struct moq_sg_entry {
     uint64_t               streaming_bytes_written;
     uint64_t               delivery_deadline_us;
     bool                   has_extensions;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_sg_entry_t;
 
 /* -- Auth token cache ---------------------------------------------- */
@@ -1304,6 +1348,17 @@ typedef struct moq_rx_stream {
      * on_data_reset, or the generic pending-chunk path of on_data_bytes --
      * completes this same obligation. */
     bool                   reset_owed;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_rx_stream_t;
 
 /* A datagram that arrived for an alias not yet established by a SUBSCRIBE_OK;
@@ -1462,6 +1517,17 @@ struct moq_session {
 
     moq_sub_entry_t *subs;
     size_t           sub_cap;
+
+    /*
+     * Heads of the five intrusive occupancy lists (see the per-entry fields).
+     * -1 means empty; they are initialized explicitly because the session slab
+     * is zero-filled and slot 0 is a valid member.
+     */
+    int32_t          pub_occ_head;
+    int32_t          sub_occ_head;
+    int32_t          sg_occ_head;
+    int32_t          rx_occ_head;
+    int32_t          fetch_occ_head;
 
     moq_ann_entry_t *announcements;
     size_t           ann_cap;
@@ -1912,7 +1978,7 @@ moq_result_t session_core_emit_request_redirect(
     bool can_retry, uint64_t retry_after_ms,
     const uint8_t *reason, size_t reason_len);
 
-void sg_free_entry(size_t slot, moq_sg_entry_t *entries);
+void sg_free_entry(moq_session_t *s, size_t slot);
 bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget);
 
 /* -- Inbound data reordering buffer (data before SUBSCRIBE_OK) ------ *
@@ -2674,6 +2740,32 @@ moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
 
 int pub_resolve_handle(moq_session_t *s, moq_publication_t h);
 int pub_find_free(moq_session_t *s);
+
+/*
+ * Occupancy-list maintenance. A slot must be linked exactly when it becomes
+ * allocated and unlinked exactly when it is freed; the sweeps then walk the
+ * list instead of the pool. `*_occ_unlink` also advances any live sweep cursor
+ * that is parked on the slot being removed, so a suspended sweep resumes at
+ * the successor rather than following a stale link.
+ */
+/* First slot of an occupancy list, or `cap` when the list is empty. Every
+ * scan cursor that used to start at slot 0 starts here instead. */
+static inline size_t moq_occ_first(int32_t head, size_t cap)
+{
+    return head >= 0 ? (size_t)head : cap;
+}
+
+void pub_occ_link(moq_session_t *s, size_t slot);
+void pub_occ_unlink(moq_session_t *s, size_t slot);
+void sub_occ_link(moq_session_t *s, size_t slot);
+void sub_occ_unlink(moq_session_t *s, size_t slot);
+void sg_occ_link(moq_session_t *s, size_t slot);
+void sg_occ_unlink(moq_session_t *s, size_t slot);
+void rx_occ_link(moq_session_t *s, size_t slot);
+void rx_occ_unlink(moq_session_t *s, size_t slot);
+void fetch_occ_link(moq_session_t *s, size_t slot);
+void fetch_occ_unlink(moq_session_t *s, size_t slot);
+
 void pub_free_entry(moq_session_t *s, int slot);
 /* Alias resolution for subscriber-role publications, independent of Forward
  * State (streams bind/count regardless; prohibited objects are dropped at
@@ -2714,6 +2806,79 @@ void sub_note_stream_processed(moq_session_t *s, moq_subscription_t sub);
  * bound to the handle; MOQ_OK = none remain, WOULD_BLOCK = action-blocked. */
 #ifdef MOQ_SESSION_SWEEP_TESTING
 extern uint64_t session_stop_scan_entries;
+
+/*
+ * Exact-work probe counters for the advancing-call preamble.
+ *
+ * OBSERVATIONAL ONLY: each is a plain increment at one loop-body entry or one
+ * charged transition; none participates in any control decision, so removing
+ * them cannot change behaviour. Compiled solely into moq-core-test-internals,
+ * exactly like session_stop_scan_entries above.
+ *
+ * A PROBE is one visit to a candidate owner slot -- the unit that scales with
+ * configured pool capacity when a scan is capacity-bounded rather than
+ * ownership-bounded. A CHARGED transition is work performed on an owner that
+ * actually had work. They are counted separately, and each stage keeps its own
+ * counter, so a scan moving from one stage to another cannot hide inside an
+ * aggregate.
+ *
+ * Tests assert DELTAS around one declared advancing call: several tests in one
+ * binary accumulate into them.
+ */
+extern uint64_t session_work_sg_reap_probes;    /* subgroup slots visited, terminal reap */
+extern uint64_t session_work_sg_reap_charged;   /* subgroups actually reaped */
+extern uint64_t session_work_sg_deadline_probes;/* subgroup slots visited, deadline recompute */
+extern uint64_t session_work_pub_reap_probes;   /* publication slots visited, deferred-done reap */
+extern uint64_t session_work_pub_reap_pending;  /* publication owners found with deferred work */
+extern uint64_t session_work_sub_reap_probes;   /* subscription slots visited, deferred-done reap */
+extern uint64_t session_work_sub_reap_pending;  /* subscription owners found with deferred work */
+extern uint64_t session_work_retry_sub_probes;  /* subscription slots visited, retry-deadline recompute */
+extern uint64_t session_work_retry_pub_probes;  /* publication slots visited, retry-deadline recompute */
+extern uint64_t session_work_rx_probes;         /* rx slots visited, bound-stream scan */
+
+/*
+ * The remaining configured-capacity scans transitively reachable from
+ * session_advance_sweep(). Each is a distinct named site: a cleanup scan must
+ * never fold into the bound-stream counter, or a correction that moved work
+ * from one into the other would cancel in an aggregate.
+ */
+extern uint64_t session_work_close_sg_probes;   /* subgroup slots, close_with_error */
+extern uint64_t session_work_close_rx_probes;   /* rx slots, free_rx_stream_bufs */
+extern uint64_t session_work_fwd_pending_probes;/* subscription slots, session_has_forwarding_pending_subscriber */
+extern uint64_t session_work_deferred_rx_probes;/* rx slots, session_discard_deferred_streams */
+extern uint64_t session_work_join_probes;       /* fetch slots, session_core_discard_pending_joins */
+extern uint64_t session_work_join_resolve_probes; /* fetch slots, session_core_pending_joins_can_resolve */
+extern uint64_t session_work_join_reject_probes;  /* fetch slots, session_core_reject_pending_joins */
+extern uint64_t session_work_staged_probes;     /* staged-datagram slots, staged_clear_unresolved */
+
+/*
+ * NON-CAPACITY loops in the same reachable set: one counter per LOOP SITE, the
+ * same rule the capacity scans follow. Each is bounded by live occupancy, by a
+ * caller-supplied count, or by the live index population -- never by a
+ * configured pool size -- so they are excluded from the capacity-invariance
+ * comparator and carry an absolute declared model instead.
+ */
+extern uint64_t session_work_queued_action;      /* queued actions visited, close-time decref */
+extern uint64_t session_work_queued_event;       /* queued events visited, close-time decref */
+extern uint64_t session_work_tomb_probes;        /* live fetch-cancel tombstones scanned */
+extern uint64_t session_work_auth_staging;       /* auth staging slots freed (argument-bounded) */
+extern uint64_t session_work_index_find;         /* moq_index_find probe steps */
+extern uint64_t session_work_index_find_calls;   /* moq_index_find invocations */
+extern uint64_t session_work_index_rm_calls;     /* moq_index_remove invocations */
+extern uint64_t session_work_index_rm_search;    /* moq_index_remove search steps */
+extern uint64_t session_work_index_rm_backshift; /* moq_index_remove backshift steps */
+
+/*
+ * CONTROL loops: bounded by active work, not by capacity and not by occupancy.
+ * Counted so the image can claim completeness without describing them.
+ */
+extern uint64_t session_work_catchup_passes;     /* session_advance_sweep catch-up iterations */
+extern uint64_t session_work_rx_rescan_passes;   /* bound-stream scan rescan passes */
+/* One charged bound-stream terminal transition: the unit the sweep budget
+ * spends, taken immediately before the STOP attempt. It counts the ATTEMPT, so
+ * a stop that action capacity refuses is still one charged transition -- which
+ * is what the budget itself charges. */
+extern uint64_t session_work_rx_charged;
 #endif
 moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                                                   moq_subscription_t sub,

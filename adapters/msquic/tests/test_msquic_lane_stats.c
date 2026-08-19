@@ -14,6 +14,39 @@
 
 #include "msquic_internal.h"
 #include "support/fake_msq_table.h"
+#include "support/msq_test_seams.h"
+
+#include <stddef.h>
+
+/* --- the frozen v0 prefix, pinned to a constant ---------------------------- *
+ *
+ * The floor is defined from offsetof(flush_bytes), so a field inserted ANYWHERE
+ * before it silently moves the floor -- the definition cannot catch that on its
+ * own. Pinning the byte count to a literal makes the drift a build failure, and
+ * requiring every diagnostic field to begin at or after the floor proves the
+ * additions are appended rather than interleaved. */
+_Static_assert(MOQ_MSQUIC_LANE_STATS_V0_SIZE == 112u,
+               "the frozen v0 lane-stats floor must never move");
+_Static_assert(offsetof(moq_msquic_lane_stats_t, idle_cap_wakes) == 56u,
+               "v0 field offsets are frozen");
+_Static_assert(offsetof(moq_msquic_lane_stats_t, service_passes) == 88u,
+               "v0 field offsets are frozen");
+_Static_assert(offsetof(moq_msquic_lane_stats_t, flush_bytes) == 104u,
+               "v0 field offsets are frozen");
+#ifdef MOQ_MSQUIC_TESTING
+_Static_assert(offsetof(moq_msquic_lane_stats_t, deadline_queries) >=
+                   MOQ_MSQUIC_LANE_STATS_V0_SIZE,
+               "diagnostic fields are appended past the frozen prefix");
+_Static_assert(offsetof(moq_msquic_lane_stats_t, deadline_class_none) >=
+                   MOQ_MSQUIC_LANE_STATS_V0_SIZE,
+               "diagnostic fields are appended past the frozen prefix");
+_Static_assert(offsetof(moq_msquic_lane_stats_t, deadline_class_future) >=
+                   MOQ_MSQUIC_LANE_STATS_V0_SIZE,
+               "diagnostic fields are appended past the frozen prefix");
+_Static_assert(offsetof(moq_msquic_lane_stats_t, deadline_class_due) >=
+                   MOQ_MSQUIC_LANE_STATS_V0_SIZE,
+               "diagnostic fields are appended past the frozen prefix");
+#endif
 
 #include <moq/msquic_managed.h>
 
@@ -33,6 +66,8 @@ extern void moq_msq_test_bell_ring_raw(moq_msquic_managed_lane_t *lane);
 extern moq_result_t moq_msq_test_managed_create_lanes_only_api(
     const moq_msquic_managed_cfg_t *cfg, const QUIC_API_TABLE *api,
     moq_msquic_managed_t **out);
+extern bool moq_msq_test_lane_inject_idle_child(
+    moq_msquic_managed_lane_t *lane);
 extern moq_result_t moq_msq_test_lane_inject_live_child(
     moq_msquic_managed_lane_t *lane, HQUIC connection,
     moq_msquic_managed_conn_t **out);
@@ -66,8 +101,11 @@ static void guard_deadline(struct timespec *abs)
 
 static _Atomic uint64_t g_now_us;
 
+static _Atomic uint64_t g_now_calls;
+
 static uint64_t test_now_us(void)
 {
+    atomic_fetch_add(&g_now_calls, 1);
     return atomic_load(&g_now_us);
 }
 
@@ -1179,6 +1217,330 @@ static void t_flush_survives_stop(void)
         printf("PASS: accepted sends survive stop cleanup exactly\n");
 }
 
+
+/* --- the no-work deadline scan ------------------------------------------- *
+ *
+ * The doorbell's no-work path queries EVERY present connection for its next
+ * deadline, and each query walks that session's capacity tables. Nothing
+ * counted that: `deadline_sweeps` counts only a deadline that actually FIRED,
+ * so an idle lane reports zero sweeps while paying for one full scan per pass.
+ * These cases pin the scan itself — how many queries a step makes, how they
+ * classify, and that the population is stable across steps — with no clock
+ * oracle: virtual time is set explicitly and every step is a single production
+ * `mgd_doorbell_step` on this thread.
+ */
+
+/* One no-work step with N active-idle children. */
+static void scan_case(unsigned n)
+{
+    int before = failures;
+    struct rig r;
+    moq_msquic_lane_stats_t a, b;
+
+    set_now(9000000);
+    moq_msq_test_no_doorbell = true;
+    CHECK(rig_up(&r, 1, 0, NULL, NULL, sizeof(moq_msquic_managed_cfg_t)));
+    if (r.m == NULL) {
+        moq_msq_test_no_doorbell = false;
+        return;
+    }
+    for (unsigned i = 0; i < n; i++)
+        CHECK(moq_msq_test_lane_inject_idle_child(r.lane[0]));
+
+    /* Every injected child must be LIVE and IDLE, not merely present: a
+     * terminal or reapable child is a different population and would make the
+     * scan counts mean something else. */
+    moq_msq_test_lane_row_t row;
+    moq_msq_test_child_row_t kids[4];
+    CHECK(n <= 4u);
+    CHECK(moq_msq_test_lane_snapshot(r.lane[0], &row, kids, 4) == n);
+    CHECK(row.conn_count == n);
+    CHECK(!row.pump_pending);
+    CHECK(!row.wake_pending);
+    for (unsigned i = 0; i < n; i++) {
+        CHECK(!kids[i].shutdown_complete);
+        CHECK(!kids[i].reapable);
+        CHECK(!kids[i].app_terminal_acked);
+        CHECK(!kids[i].terminal_enqueued);
+        CHECK(!kids[i].terminal_observed);
+        CHECK(!kids[i].bridge_fatal);
+        CHECK(kids[i].bridge_fatal_code == 0);
+        CHECK(kids[i].close_feed_commits == 0);
+    }
+
+    CHECK(stats_of(r.lane[0], &a) == MOQ_OK);
+    CHECK(moq_msq_test_lane_step(r.lane[0]) == MOQ_MSQ_TEST_STEP_IDLE);
+    CHECK(stats_of(r.lane[0], &b) == MOQ_OK);
+
+    /* exactly one query per present connection */
+    CHECK(b.deadline_queries == a.deadline_queries + n);
+    /* the partition is complete AND exact: an idle session with no timeout
+     * has no deadline at all, so every query must land in `none`. A sum-only
+     * check would let a query move between classes unnoticed. */
+    CHECK((b.deadline_class_none - a.deadline_class_none) +
+              (b.deadline_class_future - a.deadline_class_future) +
+              (b.deadline_class_due - a.deadline_class_due) ==
+          b.deadline_queries - a.deadline_queries);
+    CHECK(b.deadline_class_none == a.deadline_class_none + n);
+    CHECK(b.deadline_class_future == a.deadline_class_future);
+    CHECK(b.deadline_class_due == a.deadline_class_due);
+    /* no deadline fired, so the existing counter stays flat while the scan
+     * scales -- the exact gap this slice exists to make visible */
+    CHECK(b.deadline_sweeps == a.deadline_sweeps);
+    CHECK(b.service_passes == a.service_passes);
+
+    /* the population survives repeated steps until the test tears it down */
+    CHECK(moq_msq_test_lane_step(r.lane[0]) == MOQ_MSQ_TEST_STEP_IDLE);
+    moq_msquic_lane_stats_t c;
+    CHECK(stats_of(r.lane[0], &c) == MOQ_OK);
+    CHECK(c.deadline_queries == b.deadline_queries + n);
+    CHECK(moq_msq_test_lane_snapshot(r.lane[0], &row, kids, 4) == n);
+    CHECK(row.conn_count == n);
+    CHECK(c.deadline_sweeps == a.deadline_sweeps);
+    /* still live and idle after repeated steps */
+    for (unsigned i = 0; i < n; i++) {
+        CHECK(!kids[i].shutdown_complete);
+        CHECK(!kids[i].reapable);
+        CHECK(!kids[i].terminal_enqueued);
+        CHECK(!kids[i].bridge_fatal);
+        CHECK(kids[i].close_feed_commits == 0);
+    }
+    CHECK(!row.pump_pending);
+
+    rig_down(&r);
+    moq_msq_test_no_doorbell = false;
+    if (failures == before)
+        printf("PASS: no-work scan queries exactly %u of %u children\n", n, n);
+}
+
+static void t_deadline_scan_counts(void)
+{
+    scan_case(0);
+    scan_case(1);
+    scan_case(3);
+}
+
+/* Sessions that DO have a deadline, still in the future: the queries must all
+ * classify as `future`, which is what distinguishes the class rule from a
+ * bare count. */
+static void t_deadline_scan_future_class(void)
+{
+    int before = failures;
+    struct rig r;
+    moq_msquic_lane_stats_t a, b;
+    const unsigned n = 3;
+
+    set_now(9700000);
+    moq_msq_test_no_doorbell = true;
+    /* a session idle timeout gives every child a real, later deadline */
+    CHECK(rig_up(&r, 1, 1000000, NULL, NULL,
+                 sizeof(moq_msquic_managed_cfg_t)));
+    if (r.m == NULL) {
+        moq_msq_test_no_doorbell = false;
+        return;
+    }
+    for (unsigned i = 0; i < n; i++)
+        CHECK(moq_msq_test_lane_inject_idle_child(r.lane[0]));
+    CHECK(stats_of(r.lane[0], &a) == MOQ_OK);
+    CHECK(moq_msq_test_lane_step(r.lane[0]) == MOQ_MSQ_TEST_STEP_IDLE);
+    CHECK(stats_of(r.lane[0], &b) == MOQ_OK);
+
+    CHECK(b.deadline_queries == a.deadline_queries + n);
+    CHECK(b.deadline_class_future == a.deadline_class_future + n);
+    CHECK(b.deadline_class_none == a.deadline_class_none);
+    CHECK(b.deadline_class_due == a.deadline_class_due);
+    CHECK(b.deadline_sweeps == a.deadline_sweeps);
+
+    rig_down(&r);
+    moq_msq_test_no_doorbell = false;
+    if (failures == before)
+        printf("PASS: future deadlines classify as future, not none\n");
+}
+
+/* A due deadline visits the complete set: every child is serviced once. */
+static void t_deadline_scan_due(void)
+{
+    int before = failures;
+    struct rig r;
+    moq_msquic_lane_stats_t a, b;
+    const unsigned n = 3;
+
+    set_now(9500000);
+    moq_msq_test_no_doorbell = true;
+    atomic_store(&g_app_target, UINT64_MAX);
+    CHECK(rig_up(&r, 1, 0, app_deadline_cb, &g_app_target,
+                 sizeof(moq_msquic_managed_cfg_t)));
+    if (r.m == NULL) {
+        moq_msq_test_no_doorbell = false;
+        return;
+    }
+    for (unsigned i = 0; i < n; i++)
+        CHECK(moq_msq_test_lane_inject_idle_child(r.lane[0]));
+    CHECK(stats_of(r.lane[0], &a) == MOQ_OK);
+
+    /* an application deadline that is already due at the injected clock */
+    atomic_store(&g_app_target, 9500000);
+    CHECK(moq_msq_test_lane_step(r.lane[0]) == MOQ_MSQ_TEST_STEP_TICKED);
+    CHECK(stats_of(r.lane[0], &b) == MOQ_OK);
+
+    /* the scan still queried every child once ... */
+    CHECK(b.deadline_queries == a.deadline_queries + n);
+    /* ... one sweep fired, and every child was serviced exactly once */
+    CHECK(b.deadline_sweeps == a.deadline_sweeps + 1);
+    /* Two passes per child, and that is the production identity, not a
+     * tolerance: the due branch services every child once, then the pump
+     * sweep drains every child once so what the pump queued reaches the
+     * wire. Neither visit is allowed to skip a child. */
+    CHECK(b.service_passes == a.service_passes + 2u * n);
+    CHECK(b.pump_sweeps == a.pump_sweeps + 1);
+
+    atomic_store(&g_app_target, UINT64_MAX);
+    rig_down(&r);
+    moq_msq_test_no_doorbell = false;
+    if (failures == before)
+        printf("PASS: a due deadline services the complete set\n");
+}
+
+
+/* A real per-connection DUE class: sessions with an idle timeout, and virtual
+ * time advanced past it. The application-deadline case above proves a service
+ * identity, not this: there every per-connection query still returns
+ * UINT64_MAX and classifies `none`. */
+static void t_deadline_scan_due_class(void)
+{
+    int before = failures;
+    struct rig r;
+    moq_msquic_lane_stats_t a, b;
+    const unsigned n = 3;
+
+    set_now(9800000);
+    moq_msq_test_no_doorbell = true;
+    CHECK(rig_up(&r, 1, 1000000, NULL, NULL,
+                 sizeof(moq_msquic_managed_cfg_t)));
+    if (r.m == NULL) {
+        moq_msq_test_no_doorbell = false;
+        return;
+    }
+    for (unsigned i = 0; i < n; i++)
+        CHECK(moq_msq_test_lane_inject_idle_child(r.lane[0]));
+    CHECK(stats_of(r.lane[0], &a) == MOQ_OK);
+
+    /* past every child's session deadline */
+    set_now(9800000 + 2000000);
+    moq_msq_test_step_t st = moq_msq_test_lane_step(r.lane[0]);
+    CHECK(st == MOQ_MSQ_TEST_STEP_TICKED);
+    CHECK(stats_of(r.lane[0], &b) == MOQ_OK);
+
+    CHECK(b.deadline_queries == a.deadline_queries + n);
+    CHECK(b.deadline_class_due == a.deadline_class_due + n);
+    CHECK(b.deadline_class_none == a.deadline_class_none);
+    CHECK(b.deadline_class_future == a.deadline_class_future);
+    /* the partition still adds up */
+    CHECK((b.deadline_class_none - a.deadline_class_none) +
+              (b.deadline_class_future - a.deadline_class_future) +
+              (b.deadline_class_due - a.deadline_class_due) ==
+          b.deadline_queries - a.deadline_queries);
+    /* and a due minimum fires exactly one sweep */
+    CHECK(b.deadline_sweeps == a.deadline_sweeps + 1);
+
+    rig_down(&r);
+    moq_msq_test_no_doorbell = false;
+    if (failures == before)
+        printf("PASS: session deadlines past now classify as due\n");
+}
+
+/* The diagnostic must not add per-connection clock reads to the O(N) path:
+ * an idle step's clock-call count is constant as N grows. */
+static void t_scan_clock_calls_constant(void)
+{
+    int before = failures;
+    uint64_t per_n[3];
+    const unsigned ns[3] = { 0u, 1u, 3u };
+
+    for (unsigned k = 0; k < 3u; k++) {
+        struct rig r;
+
+        set_now(9900000);
+        moq_msq_test_no_doorbell = true;
+        CHECK(rig_up(&r, 1, 0, NULL, NULL,
+                     sizeof(moq_msquic_managed_cfg_t)));
+        if (r.m == NULL) {
+            moq_msq_test_no_doorbell = false;
+            return;
+        }
+        for (unsigned i = 0; i < ns[k]; i++)
+            CHECK(moq_msq_test_lane_inject_idle_child(r.lane[0]));
+        atomic_store(&g_now_calls, 0);
+        CHECK(moq_msq_test_lane_step(r.lane[0]) == MOQ_MSQ_TEST_STEP_IDLE);
+        per_n[k] = atomic_load(&g_now_calls);
+        rig_down(&r);
+        moq_msq_test_no_doorbell = false;
+    }
+    /* Constant, not merely sublinear: one classification instant per scan
+     * plus the scheduler's own reads, none of them per connection. */
+    CHECK(per_n[0] == per_n[1]);
+    CHECK(per_n[1] == per_n[2]);
+    if (failures != before)
+        printf("  [clock] calls per idle step: N=0 %llu  N=1 %llu  N=3 %llu\n",
+               (unsigned long long)per_n[0], (unsigned long long)per_n[1],
+               (unsigned long long)per_n[2]);
+    if (failures == before)
+        printf("PASS: idle-step clock reads are constant in N\n");
+}
+
+/* A v0-sized caller gets the frozen prefix and nothing else: the diagnostic
+ * fields must never be written into a buffer that does not declare room for
+ * them. The frozen boundary here is the literal measured v0 size, not
+ * MOQ_MSQUIC_LANE_STATS_V0_SIZE, so a layout shift cannot move the oracle
+ * along with the bug. */
+static void t_v0_sized_caller_untouched(void)
+{
+    int before = failures;
+    struct rig r;
+    enum { V0_BYTES = 112u, PAD = 128u };
+    unsigned char buf[V0_BYTES + PAD];
+
+    set_now(9700000);
+    moq_msq_test_no_doorbell = true;
+    CHECK(rig_up(&r, 1, 1000000, NULL, NULL,
+                 sizeof(moq_msquic_managed_cfg_t)));
+    if (r.m == NULL) {
+        moq_msq_test_no_doorbell = false;
+        return;
+    }
+    for (unsigned i = 0; i < 3u; i++)
+        CHECK(moq_msq_test_lane_inject_idle_child(r.lane[0]));
+    /* run the instrumented scan so the diagnostic fields are non-zero and a
+     * stray write would be visible rather than coincidentally zero */
+    set_now(9700000 + 2000000);
+    CHECK(moq_msq_test_lane_step(r.lane[0]) == MOQ_MSQ_TEST_STEP_TICKED);
+
+    memset(buf, 0xA5, sizeof(buf));
+    CHECK(moq_msquic_lane_get_stats(
+              r.lane[0], (moq_msquic_lane_stats_t *)(void *)buf, V0_BYTES) ==
+          MOQ_OK);
+
+    /* exactly V0_BYTES written, self-declared */
+    uint32_t stamped;
+    memcpy(&stamped, buf, sizeof(stamped));
+    CHECK(stamped == V0_BYTES);
+    /* every byte past the frozen prefix is still the poison */
+    bool clean = true;
+    for (unsigned i = V0_BYTES; i < sizeof(buf); i++)
+        if (buf[i] != 0xA5u)
+            clean = false;
+    CHECK(clean);
+    /* and the prefix really did carry the v0 payload */
+    uint64_t fb;
+    memcpy(&fb, buf + (V0_BYTES - sizeof(uint64_t)), sizeof(fb));
+    CHECK(fb != 0xA5A5A5A5A5A5A5A5ull);
+
+    rig_down(&r);
+    moq_msq_test_no_doorbell = false;
+    if (failures == before)
+        printf("PASS: a v0-sized caller receives only the frozen prefix\n");
+}
+
 int main(void)
 {
     moq_msq_test_now_us = test_now_us;
@@ -1193,6 +1555,12 @@ int main(void)
     t_session_deadline();
     t_flush_poll_and_reap();
     t_flush_survives_stop();
+    t_deadline_scan_counts();
+    t_deadline_scan_future_class();
+    t_deadline_scan_due_class();
+    t_scan_clock_calls_constant();
+    t_v0_sized_caller_untouched();
+    t_deadline_scan_due();
 
     gate_disable();
     moq_msq_test_prewait = NULL;

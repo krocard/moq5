@@ -36,6 +36,7 @@ int fetch_resolve_handle(moq_session_t *s, moq_fetch_t h)
 
 void fetch_free_entry(moq_session_t *s, int slot)
 {
+    fetch_occ_unlink(s, (size_t)slot);
     moq_fetch_entry_t *e = &s->fetches[slot];
     /* Free any buffered Joining-FETCH staged token values the entry still owns
      * (a PENDING_JOIN freed without release; the memset below only drops the
@@ -56,6 +57,8 @@ void fetch_free_entry(moq_session_t *s, int slot)
     memset(e, 0, sizeof(*e));
     e->state = MOQ_FETCH_FREE;
     e->generation = next_gen;
+    e->occ_next = -1;      /* the memset zeroed these; -1 is "unlinked" */
+    e->occ_prev = -1;
     e->req_recv_buf = recv_buf;
     e->req_recv_cap = recv_cap;
 }
@@ -89,6 +92,9 @@ bool fetch_cancel_tomb_contains(const moq_session_t *s, uint64_t request_id)
 bool fetch_cancel_tomb_consume(moq_session_t *s, uint64_t request_id)
 {
     for (size_t i = 0; i < s->fetch_cancel_tomb_count; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_tomb_probes++;
+#endif
         if (s->fetch_cancel_tombs[i] == request_id) {
             /* Preserve FIFO order of the remaining entries so drop-oldest stays
              * meaningful. */
@@ -247,6 +253,8 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
     moq_fetch_entry_t *e = &s->fetches[slot];
     uint32_t live_gen = e->generation | 1;
     e->generation = live_gen;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    fetch_occ_link(s, (size_t)slot);
     e->state = MOQ_FETCH_PENDING_JOIN;
     e->role = MOQ_FETCH_ROLE_PUBLISHER;
     e->handle = (moq_fetch_t){ moq_handle_pack(MOQ_HANDLE_POOL_FETCH,
@@ -324,7 +332,12 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
 {
     size_t n_event = 0, n_action = 0, n_drain = 0, send = 0, rel_scratch = 0;
     bool any_reject = false;
-    for (size_t i = 0; i < s->fetch_cap; i++) {
+    /* Only an allocated fetch can be a buffered join, and only allocated slots
+     * are linked, so the preflight walks the live fetches, not `fetch_cap`. */
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_join_resolve_probes++;
+#endif
         moq_fetch_entry_t *e = &s->fetches[i];
         if (e->state != MOQ_FETCH_PENDING_JOIN || e->join_request_id != sub_req_id)
             continue;
@@ -371,7 +384,10 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
 moq_result_t session_core_release_pending_joins(moq_session_t *s, int sub_slot)
 {
     moq_sub_entry_t *sub = &s->subs[sub_slot];
-    for (size_t i = 0; i < s->fetch_cap; i++) {
+    /* Same occupancy list as the preflight and the reject; the successor is
+     * captured before a release or reject can free the entry. */
+    for (int32_t i = s->fetch_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->fetches[i].occ_next;
         moq_fetch_entry_t *e = &s->fetches[i];
         if (e->state != MOQ_FETCH_PENDING_JOIN ||
             e->join_request_id != sub->request_id)
@@ -457,7 +473,12 @@ moq_result_t session_core_release_pending_joins(moq_session_t *s, int sub_slot)
 
 moq_result_t session_core_reject_pending_joins(moq_session_t *s, uint64_t sub_req_id)
 {
-    for (size_t i = 0; i < s->fetch_cap; i++) {
+    /* Same list; the successor is captured before the reject frees the entry. */
+    for (int32_t i = s->fetch_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->fetches[i].occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_join_reject_probes++;
+#endif
         if (s->fetches[i].state == MOQ_FETCH_PENDING_JOIN &&
             s->fetches[i].join_request_id == sub_req_id) {
             moq_result_t rc = fetch_reject_pending_join(s, (int)i,
@@ -470,10 +491,16 @@ moq_result_t session_core_reject_pending_joins(moq_session_t *s, uint64_t sub_re
 
 void session_core_discard_pending_joins(moq_session_t *s, uint64_t sub_req_id)
 {
-    for (size_t i = 0; i < s->fetch_cap; i++)
+    /* Same list; the successor is captured before the free that unlinks. */
+    for (int32_t i = s->fetch_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->fetches[i].occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_join_probes++;
+#endif
         if (s->fetches[i].state == MOQ_FETCH_PENDING_JOIN &&
             s->fetches[i].join_request_id == sub_req_id)
             fetch_free_entry(s, (int)i);   /* frees the entry-owned token storage */
+    }
 }
 
 moq_result_t session_core_on_fetch(moq_session_t *s,
@@ -740,6 +767,8 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
 
     /* Commit: now safe to mutate entry. */
     entry->generation = live_gen;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_PUBLISHER;
     entry->role = MOQ_FETCH_ROLE_PUBLISHER;
     entry->handle = handle;
@@ -1353,6 +1382,8 @@ moq_result_t moq_session_fetch(moq_session_t *s,
     /* Commit. */
     moq_fetch_entry_t *entry = &s->fetches[slot];
     entry->generation |= 1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_FETCHER;
     entry->role = MOQ_FETCH_ROLE_FETCHER;
     entry->request_id = req_ep.request_id;
