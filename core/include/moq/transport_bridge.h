@@ -37,13 +37,32 @@
  *
  * Caller supplies now_us. Bridge owns the ordering:
  *   1. Retry outbound pending (FIFO). Old blocked actions first.
- *   2. Drain new session actions (only if pending queue is empty).
+ *   2. Drain new session actions, up to a bounded number per pass.
  *   3. Retry inbound pending (reset/stop/FIN/control). If progress,
  *      loop back to step 1.
  *   4. Tick deadlines. If tick produced actions, loop back to step 1.
  *
- * Invariant: new session actions are never polled while the outbound
- * pending queue is non-empty.
+ * Invariant: an action never passes older pending work for the SAME
+ * transport stream. Ordering is per stream, not per connection: an
+ * action for one stream is not held up by blocked work on another.
+ *
+ * Polling is DESTRUCTIVE -- poll_actions transfers ownership and there
+ * is no peek and no put-back -- so the bridge cannot decline to take an
+ * action it has looked at. A conflicting action is therefore RETAINED
+ * after being polled, on the same pending path an endpoint WOULD_BLOCK
+ * uses, and is retried in FIFO order like any other pending item.
+ *
+ * Connection-level work keeps connection-wide ordering: a retained
+ * control-stream write orders ahead of later ordinary work, and a
+ * pending transport close keeps top priority. Close and fatal intent is
+ * polled and acted on even while a stream's work is parked, so a clean
+ * shutdown never waits on stream credit that may not arrive.
+ *
+ * Retained work has a bounded capacity. When that storage is full the
+ * bridge stops polling new session actions and applies connection-wide
+ * backpressure until capacity returns, then resumes. Saturation is a
+ * normal flow-control state: it never drops queued work and never
+ * escalates to a connection error on its own.
  *
  * -- Buffer ownership (outbound) --
  *

@@ -1,0 +1,30 @@
+{
+  "listener": {
+    "host": "127.0.0.1",
+    "port": 4433,
+    "versions": [18, 16],
+    "lanes": 2,
+    "cert": "cert.pem",
+    "key": "key.pem"
+  },
+  "budgets": {
+    "max_tracks": 256,
+    "max_subs": 1024,
+    "max_bindings": 64,
+    "log": {
+      "max_groups": 8,
+      "max_bytes": 8388608,
+      "max_age_us": 0
+    },
+    "cross_shard": {
+      "demand_channel_entries": 64,
+      "demand_channel_bytes": 8388608
+    }
+  },
+  "telemetry": {
+    "trace_ring_records": 4096
+  },
+  "auth": {
+    "mode": "allow_all"
+  }
+}

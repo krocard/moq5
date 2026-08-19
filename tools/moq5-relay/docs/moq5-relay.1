@@ -1,0 +1,57 @@
+.TH MOQ5\-RELAY 1 "2026" "MOQ5 Relay" "User Commands"
+.SH NAME
+moq5\-relay \- deterministic Media over QUIC relay
+.SH SYNOPSIS
+.B moq5\-relay
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B moq5\-relay
+serves Media over QUIC draft\-16 and draft\-18 from a single listener. Terminal
+codes are carried by meaning across that boundary: a code is decoded in the
+draft that produced it and re\-encoded for the draft that will read it, and one
+with no reviewed meaning in the target falls back to that registry's generic
+value rather than borrowing a neighbour's.
+.SH COMMANDS
+.TP
+.B serve
+Run the relay.
+.TP
+.B capacity
+Validate the configuration and print the capacity ceiling, without starting a
+listener.
+.TP
+.B help \fR[\fICOMMAND\fR]
+Print help for the relay or for one command.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Relay configuration, JSON. Required by
+.B serve
+and
+.BR capacity .
+.TP
+.BR \-h ", " \-\-help
+Print help and exit 0. Answered from the command line alone: no configuration
+is read and no transport is started.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit 0.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including every help and version request.
+.TP
+.B 2
+The command line was malformed, or the configuration was refused.
+.SH EXAMPLES
+.nf
+moq5\-relay serve --config relay.json
+moq5\-relay capacity --config relay.json
+.fi
+.SH DIAGNOSTICS
+Human diagnostics are prefixed
+.BR "MOQ5 Relay:" .
+Structured rows such as
+.B RELAY_RUN_CONFIG_V1
+are the stable machine contract; the prose is not.

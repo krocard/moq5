@@ -13,6 +13,11 @@
 
 #define BRIDGE_DEFAULT_MAX_STREAMS    128
 #define BRIDGE_DEFAULT_MAX_PENDING     64
+/* Actions one service pass will drain. Replaces the bound that the old
+ * "stop draining once anything is pending" rule provided implicitly, so a
+ * pass is still hard-bounded now that per-stream ordering is enforced at
+ * dispatch instead. */
+#define BRIDGE_DRAIN_BUDGET           256
 #define BRIDGE_DEFAULT_MAX_TOMBSTONES  64
 
 #define BRIDGE_INBOUND_REF_BASE (1ULL << 63)
@@ -131,6 +136,19 @@ typedef struct {
     bool                  fin;
     bool                  owns_action;
     uint64_t              error_code;
+    /* Ordering identity, normalised once at the enqueue boundary so the
+     * conflict scan does only field comparisons. `dom` is the domain class
+     * (bridge_domain_t); canon_ref / canon_sid are the resolved names, with
+     * canon_have_sid false only while no mapping exists yet (a pre-open
+     * item). Internal to the bridge: no public field, no ABI. */
+    /* Whether stream_id names a real transport stream. Carried explicitly,
+     * because transport stream id 0 is LEGAL -- inferring knowledge from
+     * `stream_id != 0` would alias a legitimate id 0 with "unknown". */
+    bool                  has_stream_id;
+    uint8_t               dom;
+    bool                  canon_have_sid;
+    uint64_t              canon_ref;
+    uint64_t              canon_sid;
 } bridge_pending_item_t;
 
 /* -- Bridge --------------------------------------------------------- */

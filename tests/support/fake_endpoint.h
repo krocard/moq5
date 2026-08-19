@@ -66,6 +66,12 @@ typedef struct {
     uint64_t  next_bidi_id;
 
     bool      block_write;
+    /* Per-stream write block. `block_write` is connection-wide; this blocks
+     * exactly one stream, so a fixture can keep one stream's work retained
+     * while another stream's work is accepted -- the only way to reach a
+     * state where an ordering gate, rather than the endpoint itself, is what
+     * holds a later same-stream action back. UINT64_MAX disables it. */
+    uint64_t  block_write_stream;
     bool      block_open_uni;
     bool      block_open_bidi;
     bool      block_close;
@@ -77,15 +83,40 @@ typedef struct {
     bool      fail_write;         /* write -> ERROR                     */
     bool      drop_datagram;
     int       block_count;
+    /* Monotonic accepted-operation totals. The ops[] recorder is bounded at
+     * FAKE_EP_MAX_OPS and a fixture that needs an exact count past that must
+     * use these: clear_ops never touches them. */
+    uint64_t  write_calls;
+    uint64_t  open_uni_calls;
 
     moq_transport_endpoint_ops_t vtable;
 } fake_endpoint_t;
+
+/* True when this stream is individually blocked. */
+static inline bool fake_stream_blocked(const fake_endpoint_t *ep, uint64_t sid)
+{
+    return ep->block_write_stream != 0 &&
+           ep->block_write_stream != UINT64_MAX &&
+           ep->block_write_stream == sid + 1;
+}
+
+/* Fixtures set the blocked stream by id; +1 keeps 0 meaning "none". */
+static inline void fake_block_stream(fake_endpoint_t *ep, uint64_t sid)
+{
+    ep->block_write_stream = sid + 1;
+}
+
+static inline void fake_unblock_stream(fake_endpoint_t *ep)
+{
+    ep->block_write_stream = 0;
+}
 
 static moq_transport_result_t fake_open_uni(void *ctx, uint64_t *out)
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->block_open_uni) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     uint64_t id = ep->next_uni_id++;
+    ep->open_uni_calls++;
     *out = id;
     if (ep->count >= FAKE_EP_MAX_OPS) {
         ep->overflowed = true;
@@ -122,6 +153,11 @@ static moq_transport_result_t fake_write(void *ctx, uint64_t stream_id,
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->fail_write) return MOQ_TRANSPORT_ERROR;
     if (ep->block_write) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
+    if (fake_stream_blocked(ep, stream_id)) {
+        ep->block_count++;
+        return MOQ_TRANSPORT_WOULD_BLOCK;
+    }
+    ep->write_calls++;
     if (ep->count >= FAKE_EP_MAX_OPS) {
         ep->overflowed = true;
     } else {

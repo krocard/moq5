@@ -27,6 +27,7 @@ option(MOQ_BUILD_BENCHMARKS        "Build benchmarks"               OFF)
 option(MOQ_BUILD_EXAMPLES          "Build LibMoQ example programs"  ON)
 option(MOQ_BUILD_PQ_THREADED       "Build threaded picoquic helper" OFF)
 option(MOQ_BUILD_INTEROP_CLIENT    "Build interop test client"      OFF)
+option(MOQ_BUILD_RELAY             "Build moq-relay (deterministic relay core + tool)" OFF)
 option(MOQ_BUILD_ADAPTER_MVFST     "Build mvfst QUIC adapter"       OFF)
 option(MOQ_BUILD_ADAPTER_PROXYGEN  "Build proxygen WebTransport adapter" OFF)
 option(MOQ_BUILD_ADAPTER_PICO_WT   "Build picoquic WebTransport adapter" OFF)
@@ -277,6 +278,18 @@ if(MOQ_BUILD_INTEROP_CLIENT)
         set_tests_properties(interop_client_smoke PROPERTIES
             TIMEOUT 30
             LABELS "interop;smoke")
+    endif()
+endif()
+
+if(MOQ_BUILD_RELAY)
+    add_subdirectory(tools/moq5-relay)
+    if(MOQ_BUILD_TESTS)
+        add_test(NAME relay_boundary
+                 COMMAND ${CMAKE_COMMAND} -E env bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_relay_boundary.sh)
+        # a static source-layering check: deterministic, no physical surface — the
+        # "boundary" it checks is the code layering, not a transport
+        set_tests_properties(relay_boundary PROPERTIES LABELS "relay;sansio")
     endif()
 endif()
 

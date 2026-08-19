@@ -376,6 +376,10 @@ void bridge_pending_take_action(bridge_pending_item_t *item, moq_action_t *act)
     memset(act, 0, sizeof(*act));
 }
 
+/* One policy for every failed retention; defined with the queue below. */
+static moq_result_t bridge_retention_failed(moq_transport_bridge_t *b,
+                                            bridge_pending_item_t *p);
+
 void bridge_cleanup_pending_item(const moq_alloc_t *alloc,
                                   bridge_pending_item_t *item)
 {
@@ -399,6 +403,52 @@ void bridge_cleanup_all_pending(moq_transport_bridge_t *b)
 
 static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
                                     const bridge_pending_item_t *item);
+
+/* Record a KNOWN transport stream id on a pending item. Id 0 is legal, so the
+ * knowledge is a separate bit and never inferred from the value. */
+static inline void bridge_item_set_sid(bridge_pending_item_t *p, uint64_t sid)
+{
+    p->stream_id = sid;
+    p->has_stream_id = true;
+}
+
+/* Ordering-domain predicate; defined with the domain helpers below. */
+static bool bridge_domain_blocked(moq_transport_bridge_t *b,
+                                   moq_stream_ref_t ref, uint64_t sid,
+                                   bool have_sid);
+
+typedef enum {
+    BRIDGE_DOM_STREAM,
+    BRIDGE_DOM_CONN_CTRL,
+    BRIDGE_DOM_CONN_TERM,
+} bridge_domain_t;
+
+static bridge_domain_t bridge_pending_domain(const bridge_pending_item_t *p)
+{
+    switch (p->kind) {
+    case PENDING_OPEN_UNI_DATA:
+    case PENDING_HEADER_PAYLOAD:
+    case PENDING_PAYLOAD_ONLY:
+    case PENDING_OPEN_BIDI_DATA:
+    case PENDING_CLOSE_BIDI_FIN:
+    case PENDING_RESET_STREAM:
+    case PENDING_STOP_SENDING:
+    case PENDING_ABORT_STREAM:
+        return BRIDGE_DOM_STREAM;
+    case PENDING_COPIED_WRITE:
+        /* Data writes carry a ref; the control-channel write does not. */
+        return p->stream_ref._v != 0 ? BRIDGE_DOM_STREAM
+                                     : BRIDGE_DOM_CONN_CTRL;
+    case PENDING_CLOSE_TRANSPORT:
+        return BRIDGE_DOM_CONN_TERM;
+    case PENDING_OPEN_CONTROL:
+    case PENDING_OPEN_UNI_CONTROL:
+    case PENDING_COPIED_DATAGRAM:
+    default:
+        return BRIDGE_DOM_CONN_CTRL;
+    }
+}
+
 
 /* Queued output that a STOP_SENDING on this stream has made obsolete. Items
  * carrying the stream's ref are matched by ref; the control-channel writes
@@ -458,12 +508,10 @@ static moq_result_t bridge_stop_bidi_send_half(moq_transport_bridge_t *b,
     bridge_pending_item_t p;
     memset(&p, 0, sizeof(p));
     p.kind = PENDING_RESET_STREAM;
-    p.stream_id = e->transport_id;
+    bridge_item_set_sid(&p, e->transport_id);
     p.error_code = error_code;
-    if (!bridge_enqueue_pending(b, &p)) {
-        bridge_set_fatal(b, 0x1);
-        return MOQ_ERR_INTERNAL;
-    }
+    if (!bridge_enqueue_pending(b, &p))
+        return bridge_retention_failed(b, &p);
     return MOQ_OK;
 }
 
@@ -598,11 +646,89 @@ moq_stream_ref_t moq_transport_bridge_find_ref(
 
 /* -- Outbound: action dispatch -------------------------------------- */
 
+/*
+ * Retaining an item the bridge already owns cannot fail by capacity: a retry
+ * pass moves every survivor out of the queue before re-enqueuing at most the
+ * same number back into an array of the same size, and the drain never polls
+ * without a free slot. If it fails anyway, the queue's own accounting is
+ * wrong, and the item in hand is real work with nowhere to live.
+ *
+ * That is an invariant breach, not a recoverable condition, so it is never
+ * absorbed: ownership is released exactly once here, the bridge is marked
+ * fatal with its own code, and the caller stops and surfaces the error rather
+ * than continuing as though the work had been retained.
+ */
+static moq_result_t bridge_retention_failed(moq_transport_bridge_t *b,
+                                             bridge_pending_item_t *p)
+{
+    bridge_cleanup_pending_item(&b->alloc, p);
+    memset(p, 0, sizeof(*p));
+    bridge_set_fatal(b, 0x5);
+    return MOQ_ERR_INTERNAL;
+}
+
+#ifdef MOQ_BRIDGE_TEST_INJECT
+/*
+ * Lets a fixture reach the retention-failure branch, which capacity counting
+ * otherwise makes unreachable. Test builds only: no symbol, no storage in a
+ * default build.
+ */
+static unsigned g_retain_fail_after;
+static bool      g_retain_fail_armed;
+
+void moq_bridge_test_fail_retain_after(unsigned n)
+{
+    g_retain_fail_after = n;
+    g_retain_fail_armed = true;
+}
+
+#endif
+
 static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
                                     const bridge_pending_item_t *item)
 {
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    if (g_retain_fail_armed) {
+        if (g_retain_fail_after == 0) {
+            g_retain_fail_armed = false;
+            return false;
+        }
+        g_retain_fail_after--;
+    }
+#endif
     if (b->pending_count >= b->max_pending) return false;
-    b->pending[b->pending_count++] = *item;
+
+    /*
+     * Normalise the item's ordering identity here, at the only place items
+     * enter the queue, so the conflict scan never consults the stream map.
+     * Both names are kept whenever either resolves; a zero/unknown side
+     * survives only while no mapping exists (a pre-open item whose entry was
+     * deactivated before it was retained). A pair that contradicts the map is
+     * refused rather than silently resolved to one side.
+     */
+    bridge_pending_item_t norm = *item;
+    norm.dom = (uint8_t)bridge_pending_domain(&norm);
+    norm.canon_ref = norm.stream_ref._v;
+    norm.canon_sid = norm.stream_id;
+    norm.canon_have_sid = norm.has_stream_id;
+
+    if (norm.canon_ref != 0 && !norm.canon_have_sid) {
+        const bridge_stream_entry_t *e = bridge_find_by_ref(b, norm.stream_ref);
+        if (e != NULL && e->active) {
+            norm.canon_sid = e->transport_id;
+            norm.canon_have_sid = true;
+        }
+    } else if (norm.canon_ref == 0 && norm.canon_have_sid) {
+        const bridge_stream_entry_t *e = bridge_find_by_id(b, norm.canon_sid);
+        if (e != NULL && e->active)
+            norm.canon_ref = e->ref._v;
+    } else if (norm.canon_ref != 0 && norm.canon_have_sid) {
+        const bridge_stream_entry_t *e = bridge_find_by_ref(b, norm.stream_ref);
+        if (e != NULL && e->active && e->transport_id != norm.canon_sid)
+            return false;
+    }
+
+    b->pending[b->pending_count++] = norm;
     return true;
 }
 
@@ -625,11 +751,8 @@ static moq_result_t dispatch_send_control(moq_transport_bridge_t *b,
                 memcpy(p.data, sc->data, sc->len);
                 p.data_len = sc->len;
                 moq_action_cleanup(act);
-                if (!bridge_enqueue_pending(b, &p)) {
-                    b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-                    bridge_set_fatal(b, 0x1);
-                    return MOQ_ERR_INTERNAL;
-                }
+                if (!bridge_enqueue_pending(b, &p))
+                    return bridge_retention_failed(b, &p);
                 return MOQ_OK;
             }
             if (r == MOQ_TRANSPORT_ERROR) {
@@ -648,11 +771,8 @@ static moq_result_t dispatch_send_control(moq_transport_bridge_t *b,
                 memcpy(p.data, sc->data, sc->len);
                 p.data_len = sc->len;
                 moq_action_cleanup(act);
-                if (!bridge_enqueue_pending(b, &p)) {
-                    b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-                    bridge_set_fatal(b, 0x1);
-                    return MOQ_ERR_INTERNAL;
-                }
+                if (!bridge_enqueue_pending(b, &p))
+                    return bridge_retention_failed(b, &p);
                 return MOQ_OK;
             }
             b->control_stream_id = b->peer_control_stream_id;
@@ -668,17 +788,14 @@ static moq_result_t dispatch_send_control(moq_transport_bridge_t *b,
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_COPIED_WRITE;
-        p.stream_id = b->control_stream_id;
+        bridge_item_set_sid(&p, b->control_stream_id);
         p.data = bridge_alloc(&b->alloc, sc->len);
         if (!p.data) { bridge_set_fatal(b, 0x1); return MOQ_ERR_NOMEM; }
         memcpy(p.data, sc->data, sc->len);
         p.data_len = sc->len;
         moq_action_cleanup(act);
-        if (!bridge_enqueue_pending(b, &p)) {
-            b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
 
@@ -717,11 +834,8 @@ static moq_result_t dispatch_close_session(moq_transport_bridge_t *b,
             p.data_len = reason_len;
         }
         moq_action_cleanup(act);
-        if (!bridge_enqueue_pending(b, &p)) {
-            if (p.data) b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
 
@@ -762,16 +876,16 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
         size_t pay_len = sd->payload ? moq_rcbuf_len(sd->payload) : 0;
         bool fin_on_hdr = (pay_len == 0) && sd->fin;
 
-        moq_transport_result_t wr = sanitize_stream_result(
-            b->ops->write(b->endpoint_ctx, sid,
-                           sd->header, sd->header_len, fin_on_hdr));
+        moq_transport_result_t wr =
+            bridge_domain_blocked(b, p->stream_ref, sid, p->has_stream_id)
+                ? MOQ_TRANSPORT_WOULD_BLOCK
+                : sanitize_stream_result(
+                      b->ops->write(b->endpoint_ctx, sid,
+                                     sd->header, sd->header_len, fin_on_hdr));
 
         if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
-            if (!bridge_enqueue_pending(b, p)) {
-                bridge_cleanup_pending_item(&b->alloc, p);
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, p))
+                return bridge_retention_failed(b, p);
             memset(p, 0, sizeof(*p));
             return MOQ_OK;
         }
@@ -811,11 +925,8 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
         }
 
         if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
-            if (!bridge_enqueue_pending(b, p)) {
-                bridge_cleanup_pending_item(&b->alloc, p);
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, p))
+                return bridge_retention_failed(b, p);
             memset(p, 0, sizeof(*p));
             return MOQ_OK;
         }
@@ -830,11 +941,8 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
             b->ops->write(b->endpoint_ctx, sid, NULL, 0, true));
 
         if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
-            if (!bridge_enqueue_pending(b, p)) {
-                bridge_cleanup_pending_item(&b->alloc, p);
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, p))
+                return bridge_retention_failed(b, p);
             memset(p, 0, sizeof(*p));
             return MOQ_OK;
         }
@@ -853,6 +961,185 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
     bridge_cleanup_pending_item(&b->alloc, p);
     return MOQ_OK;
 }
+
+/* -- Ordering domains ------------------------------------------------
+ *
+ * poll_actions is destructive: the bridge owns an action the moment it
+ * polls one, so it cannot look at an action's ordering domain and then
+ * decline to take it. What it can do is RETAIN it. These helpers decide,
+ * after the poll and before any endpoint side effect, whether an action
+ * must be retained behind older pending work.
+ *
+ * A domain is a canonical transport stream. Items name it inconsistently:
+ * some carry a stream_ref, some only the transport stream id, some
+ * neither. `stream_ref._v == 0` is the established "no ref" sentinel (a
+ * ref of 0 is refused at the public entry points), so it must never be
+ * treated as a stream that other refless items share. Where one side
+ * names a ref and the other an id, the stream map supplies the missing
+ * half.
+ *
+ * Three classes:
+ *   STREAM     conflicts only with older work for the same stream;
+ *   CONN_CTRL  the control backlog -- connection-wide order, so it
+ *              blocks later ordinary work;
+ *   CONN_TERM  transport close -- keeps top priority and is never
+ *              displaced.
+ * Anything unrecognised is treated as connection-wide, so a new kind
+ * fails closed instead of silently bypassing.
+ */
+/*
+ * A candidate names a stream by ref, by transport id, or by both. Candidate
+ * identity is never completed from the stream map: pending identity is
+ * normalised exactly once, at the enqueue boundary, and that is the only
+ * place it happens. The shapes the dispatchers deliberately provide are a
+ * ref alone (a stream about to be opened), or a ref together with an
+ * explicit id.
+ *
+ * A candidate that names neither is unresolvable. Connection-level and
+ * terminal work reaches the classifier through its own explicit domain, not
+ * by having no identity, so an unresolvable stream candidate is a caller
+ * bug. Rather than let it compare equal to nothing and bypass every queued
+ * item, it fails closed: the bridge is marked fatal with its own code and
+ * the candidate is reported blocked.
+ */
+static bool bridge_candidate_unresolvable(moq_transport_bridge_t *b,
+                                           moq_stream_ref_t ref, bool have_sid)
+{
+    if (ref._v != 0 || have_sid)
+        return false;
+    bridge_set_fatal(b, 0x4);
+    return true;
+}
+
+/*
+ * Is a candidate action for this stream blocked by older pending work?
+ *
+ * Scans the pending FIFO, which is structurally bounded by max_pending
+ * (BRIDGE_DEFAULT_MAX_PENDING, 64) because bridge_enqueue_pending refuses
+ * past it -- so this is O(max_pending) and independent of the number of
+ * connections or subscribers. Retry passes see only the survivors already
+ * re-enqueued ahead of the item being retried, so the same predicate
+ * serves both drain and retry without special-casing.
+ */
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+/* Test-only operation counters for the conflict scan. Not present in any
+ * default build: no symbol, no storage, nothing to export. */
+unsigned long long moq_bridge_scan_items;
+unsigned long long moq_bridge_scan_lookups;
+/* Largest number of pending slots a single drained action has ever consumed.
+ * The capacity guard's one-slot margin is only sound while this is 1. */
+uint32_t moq_bridge_max_retain_delta;
+#define MOQ_SCAN_TICK(x) ((x)++)
+#else
+#define MOQ_SCAN_TICK(x) ((void)0)
+#endif
+
+static bool bridge_domain_blocked(moq_transport_bridge_t *b,
+                                  moq_stream_ref_t ref, uint64_t sid,
+                                  bool have_sid)
+{
+    uint64_t cref = ref._v;
+    uint64_t csid = sid;
+    bool chave = have_sid;
+
+    MOQ_SCAN_TICK(moq_bridge_scan_lookups);
+    /* Fail closed on a shape no dispatcher produces. */
+    if (bridge_candidate_unresolvable(b, ref, have_sid))
+        return true;
+
+    for (uint32_t i = 0; i < b->pending_count; i++) {
+        const bridge_pending_item_t *p = &b->pending[i];
+
+        /* Counted, and deliberately NOT paired with a lookup tick: the whole
+         * point of normalising at enqueue is that no map lookup happens in
+         * here, and the counters are what prove it. */
+        MOQ_SCAN_TICK(moq_bridge_scan_items);
+
+        /* Connection-wide backlog and a pending transport close both order
+         * ahead of ordinary stream work. */
+        if ((bridge_domain_t)p->dom != BRIDGE_DOM_STREAM)
+            return true;
+
+        /* Field comparisons only. A zero ref names nothing, so two refless
+         * items are not thereby the same stream. */
+        if (cref != 0 && p->canon_ref != 0 && cref == p->canon_ref)
+            return true;
+        if (chave && p->canon_have_sid && csid == p->canon_sid)
+            return true;
+    }
+    return false;
+}
+
+#ifdef MOQ_BRIDGE_TEST_INJECT
+/*
+ * Test-only seams. Absent from every default build: no symbol, no storage.
+ * They exist so a fixture can build valid pending depths and ask the real
+ * classifier its decision, rather than inferring it from side effects.
+ *
+ * inject goes through bridge_enqueue_pending, so the item is normalised by the
+ * production canonicalisation boundary and the structural maximum applies --
+ * an injected depth is a real depth.
+ */
+bool moq_bridge_test_inject_pending_ex(moq_transport_bridge_t *b, int kind,
+                                       uint64_t ref, uint64_t sid,
+                                       bool have_sid)
+{
+    bridge_pending_item_t p;
+
+    if (b == NULL) return false;
+    memset(&p, 0, sizeof(p));
+    p.kind = (bridge_pending_kind_t)kind;
+    p.stream_ref = moq_stream_ref_from_u64(ref);
+    if (have_sid)
+        bridge_item_set_sid(&p, sid);
+    return bridge_enqueue_pending(b, &p);
+}
+
+bool moq_bridge_test_inject_pending(moq_transport_bridge_t *b, int kind,
+                                    uint64_t ref, uint64_t sid)
+{
+    /* Legacy shape: an id of 0 means "no id" only for callers that pass it
+     * that way. Explicit callers use the _ex form. */
+    return moq_bridge_test_inject_pending_ex(b, kind, ref, sid, sid != 0);
+}
+
+bool moq_bridge_test_domain_blocked(moq_transport_bridge_t *b, uint64_t ref,
+                                    uint64_t sid, bool have_sid)
+{
+    return bridge_domain_blocked(b, moq_stream_ref_from_u64(ref), sid,
+                                  have_sid);
+}
+
+/* The ref the map currently gives this transport id, or 0 if none. Lets a
+ * fixture name a live stream the way a dispatcher would. */
+uint64_t moq_bridge_test_ref_for_id(moq_transport_bridge_t *b, uint64_t sid)
+{
+    const bridge_stream_entry_t *e = b ? bridge_find_by_id(b, sid) : NULL;
+    return (e != NULL && e->active) ? e->ref._v : 0u;
+}
+
+uint32_t moq_bridge_test_pending_depth(const moq_transport_bridge_t *b)
+{
+    return b != NULL ? b->pending_count : 0u;
+}
+
+int moq_bridge_test_pending_domain(const moq_transport_bridge_t *b,
+                                   uint32_t idx)
+{
+    if (b == NULL || idx >= b->pending_count) return -1;
+    return (int)b->pending[idx].dom;
+}
+
+void moq_bridge_test_pending_identity(const moq_transport_bridge_t *b,
+                                      uint32_t idx, uint64_t *out_ref,
+                                      uint64_t *out_sid, bool *out_have_sid)
+{
+    if (b == NULL || idx >= b->pending_count) return;
+    if (out_ref) *out_ref = b->pending[idx].canon_ref;
+    if (out_sid) *out_sid = b->pending[idx].canon_sid;
+    if (out_have_sid) *out_have_sid = b->pending[idx].canon_have_sid;
+}
+#endif /* MOQ_BRIDGE_TEST_INJECT */
 
 /* -- SEND_DATA dispatch --------------------------------------------- */
 
@@ -882,8 +1169,11 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
         }
 
         uint64_t uni_id = 0;
-        moq_transport_result_t r = sanitize_stream_result(
-            b->ops->open_uni(b->endpoint_ctx, &uni_id));
+        moq_transport_result_t r =
+            bridge_domain_blocked(b, ref, 0, false)
+                ? MOQ_TRANSPORT_WOULD_BLOCK
+                : sanitize_stream_result(
+                      b->ops->open_uni(b->endpoint_ctx, &uni_id));
 
         if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
             bridge_deactivate_stream(e);
@@ -892,11 +1182,8 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
             p.kind = PENDING_OPEN_UNI_DATA;
             p.stream_ref = ref;
             bridge_pending_take_action(&p, act);
-            if (!bridge_enqueue_pending(b, &p)) {
-                bridge_cleanup_pending_item(&b->alloc, &p);
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (r == MOQ_TRANSPORT_ERROR) {
@@ -917,7 +1204,7 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
     memset(&p, 0, sizeof(p));
     p.kind = PENDING_HEADER_PAYLOAD;
     p.stream_ref = ref;
-    p.stream_id = e->transport_id;
+    bridge_item_set_sid(&p, e->transport_id);
     bridge_pending_take_action(&p, act);
 
     moq_result_t rc = bridge_try_send_data(b, &p);
@@ -963,24 +1250,26 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
     if (!is_bidi)
         bridge_deactivate_stream(e);
 
-    moq_transport_result_t r = sanitize_stream_result(
-        b->ops->reset_stream(b->endpoint_ctx, sid, error_code));
+    moq_transport_result_t r =
+        /* sid came from the live entry above, so it is known */
+        bridge_domain_blocked(b, ref, sid, true)
+            ? MOQ_TRANSPORT_WOULD_BLOCK
+            : sanitize_stream_result(
+                  b->ops->reset_stream(b->endpoint_ctx, sid, error_code));
 
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_RESET_STREAM;
-        p.stream_id = sid;
+        bridge_item_set_sid(&p, sid);
         p.error_code = error_code;
         /* Defer the bidi local-close/retire decision until the endpoint has
          * actually accepted the reset -- never before. Carry the ref so the
          * retry applies it exactly once against the still-live mapping. A uni
          * reset already retired, so it carries no ref. */
         if (is_bidi) p.stream_ref = ref;
-        if (!bridge_enqueue_pending(b, &p)) {
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
     if (r == MOQ_TRANSPORT_ERROR) {
@@ -1009,19 +1298,21 @@ static moq_result_t dispatch_stop_data(moq_transport_bridge_t *b,
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     if (!e) return MOQ_OK;
 
-    moq_transport_result_t r = sanitize_stream_result(
-        b->ops->stop_sending(b->endpoint_ctx, e->transport_id, error_code));
+    moq_transport_result_t r =
+        bridge_domain_blocked(b, e->ref, e->transport_id, true)
+            ? MOQ_TRANSPORT_WOULD_BLOCK
+            : sanitize_stream_result(
+                  b->ops->stop_sending(b->endpoint_ctx, e->transport_id,
+                                        error_code));
 
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_STOP_SENDING;
-        p.stream_id = e->transport_id;
+        bridge_item_set_sid(&p, e->transport_id);
         p.error_code = error_code;
-        if (!bridge_enqueue_pending(b, &p)) {
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
     if (r == MOQ_TRANSPORT_ERROR) {
@@ -1080,12 +1371,10 @@ static moq_result_t bridge_abort_apply(moq_transport_bridge_t *b,
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_ABORT_STREAM;
-            p.stream_id = sid;
+            bridge_item_set_sid(&p, sid);
             p.error_code = error_code;
-            if (!bridge_enqueue_pending(b, &p)) {
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (r == MOQ_TRANSPORT_ERROR) {
@@ -1103,12 +1392,10 @@ static moq_result_t bridge_abort_apply(moq_transport_bridge_t *b,
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_ABORT_STREAM; /* nothing applied yet */
-            p.stream_id = sid;
+            bridge_item_set_sid(&p, sid);
             p.error_code = error_code;
-            if (!bridge_enqueue_pending(b, &p)) {
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (r == MOQ_TRANSPORT_ERROR) {
@@ -1124,12 +1411,10 @@ static moq_result_t bridge_abort_apply(moq_transport_bridge_t *b,
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_STOP_SENDING;
-            p.stream_id = sid;
+            bridge_item_set_sid(&p, sid);
             p.error_code = error_code;
-            if (!bridge_enqueue_pending(b, &p)) {
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (r == MOQ_TRANSPORT_ERROR) {
@@ -1160,8 +1445,11 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
     }
 
     uint64_t bidi_id = 0;
-    moq_transport_result_t r = sanitize_stream_result(
-        b->ops->open_bidi(b->endpoint_ctx, &bidi_id));
+    moq_transport_result_t r =
+        bridge_domain_blocked(b, ref, 0, false)
+            ? MOQ_TRANSPORT_WOULD_BLOCK
+            : sanitize_stream_result(
+                  b->ops->open_bidi(b->endpoint_ctx, &bidi_id));
 
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
         bridge_deactivate_stream(e);
@@ -1181,11 +1469,8 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
             p.data_len = len;
         }
         moq_action_cleanup(act);
-        if (!bridge_enqueue_pending(b, &p)) {
-            if (p.data) b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
     if (r == MOQ_TRANSPORT_ERROR) {
@@ -1207,7 +1492,7 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_COPIED_WRITE;
-            p.stream_id = bidi_id;
+            bridge_item_set_sid(&p, bidi_id);
             p.stream_ref = ref;
             p.fin = fin;
             p.data = bridge_alloc(&b->alloc, len);
@@ -1219,11 +1504,8 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
             memcpy(p.data, data, len);
             p.data_len = len;
             moq_action_cleanup(act);
-            if (!bridge_enqueue_pending(b, &p)) {
-                b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (wr == MOQ_TRANSPORT_ERROR) {
@@ -1244,13 +1526,11 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_CLOSE_BIDI_FIN;
-            p.stream_id = bidi_id;
+            bridge_item_set_sid(&p, bidi_id);
             p.stream_ref = ref;
             moq_action_cleanup(act);
-            if (!bridge_enqueue_pending(b, &p)) {
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (wr == MOQ_TRANSPORT_ERROR) {
@@ -1295,7 +1575,7 @@ static moq_result_t dispatch_send_bidi(moq_transport_bridge_t *b,
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_COPIED_WRITE;
-        p.stream_id = e->transport_id;
+        bridge_item_set_sid(&p, e->transport_id);
         p.stream_ref = ref;
         p.fin = fin;
         if (data && len > 0) {
@@ -1309,11 +1589,8 @@ static moq_result_t dispatch_send_bidi(moq_transport_bridge_t *b,
             p.data_len = len;
         }
         moq_action_cleanup(act);
-        if (!bridge_enqueue_pending(b, &p)) {
-            if (p.data) b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
 
@@ -1351,11 +1628,9 @@ static moq_result_t dispatch_close_bidi(moq_transport_bridge_t *b,
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_CLOSE_BIDI_FIN;
         p.stream_ref = ref;
-        p.stream_id = sid;
-        if (!bridge_enqueue_pending(b, &p)) {
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        bridge_item_set_sid(&p, sid);
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
 
@@ -1416,11 +1691,8 @@ static moq_result_t dispatch_open_uni_control(moq_transport_bridge_t *b,
             p.data_len = len;
         }
         moq_action_cleanup(act);
-        if (!bridge_enqueue_pending(b, &p)) {
-            if (p.data) b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
     if (r == MOQ_TRANSPORT_ERROR) {
@@ -1450,7 +1722,7 @@ static moq_result_t dispatch_open_uni_control(moq_transport_bridge_t *b,
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_COPIED_WRITE;
-            p.stream_id = uni_id;
+            bridge_item_set_sid(&p, uni_id);
             p.stream_ref = ref;
             p.data = bridge_alloc(&b->alloc, len);
             if (!p.data) {
@@ -1461,11 +1733,8 @@ static moq_result_t dispatch_open_uni_control(moq_transport_bridge_t *b,
             memcpy(p.data, data, len);
             p.data_len = len;
             moq_action_cleanup(act);
-            if (!bridge_enqueue_pending(b, &p)) {
-                b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-                bridge_set_fatal(b, 0x1);
-                return MOQ_ERR_INTERNAL;
-            }
+            if (!bridge_enqueue_pending(b, &p))
+                return bridge_retention_failed(b, &p);
             return MOQ_OK;
         }
         if (wr == MOQ_TRANSPORT_ERROR) {
@@ -1501,7 +1770,7 @@ static moq_result_t dispatch_send_uni_control(moq_transport_bridge_t *b,
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_COPIED_WRITE;
-        p.stream_id = e->transport_id;
+        bridge_item_set_sid(&p, e->transport_id);
         p.stream_ref = ref;
         p.fin = fin;
         if (data && len > 0) {
@@ -1515,11 +1784,8 @@ static moq_result_t dispatch_send_uni_control(moq_transport_bridge_t *b,
             p.data_len = len;
         }
         moq_action_cleanup(act);
-        if (!bridge_enqueue_pending(b, &p)) {
-            if (p.data) b->alloc.free(p.data, p.data_len, b->alloc.ctx);
-            bridge_set_fatal(b, 0x1);
-            return MOQ_ERR_INTERNAL;
-        }
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
         return MOQ_OK;
     }
 
@@ -1612,13 +1878,57 @@ static moq_result_t bridge_process_action(moq_transport_bridge_t *b,
     }
 }
 
+/*
+ * Drain new session actions.
+ *
+ * Ordering is enforced per stream by bridge_domain_blocked, consulted inside
+ * each dispatcher after the (destructive) poll and before any endpoint call:
+ * an action whose stream already has older pending work is retained behind it
+ * on that dispatcher's ordinary WOULD_BLOCK path. This loop therefore no
+ * longer stops merely because something is pending.
+ *
+ * The blanket "stop once anything is pending" used to bound the pass. That
+ * bound is now explicit: at most BRIDGE_DRAIN_BUDGET actions per pass, so a
+ * session producing work as fast as it is drained cannot hold the pass open.
+ */
 static moq_result_t bridge_drain_actions(moq_transport_bridge_t *b)
 {
     moq_action_t act;
-    while (moq_session_poll_actions(b->session, &act, 1) > 0) {
+    uint32_t drained = 0;
+
+    /*
+     * Never poll work that cannot be retained.
+     *
+     * Polling is destructive, and a conflicting action must be retained -- so
+     * an action polled with no free retention slot has nowhere to go, and
+     * every enqueue-failure branch in this file takes the connection fatal.
+     * One polled action needs at most one slot (asserted by the enrolled
+     * one-slot property), so requiring a free slot before each poll makes a
+     * drain-side enqueue failure structurally unreachable.
+     *
+     * This is NOT the old "stop while anything is pending" rule: unrelated
+     * streams keep progressing right up to the point where retention capacity
+     * is genuinely exhausted. At saturation the bridge applies CONNECTION-WIDE
+     * backpressure -- it stops polling entirely, which is honest: there is no
+     * per-stream progress left to offer once nothing more can be retained.
+     * Queued session work is untouched and drains after the block lifts.
+     */
+    while (drained < BRIDGE_DRAIN_BUDGET &&
+           b->pending_count < b->max_pending &&
+           moq_session_poll_actions(b->session, &act, 1) > 0) {
+        uint32_t before = b->pending_count;
         moq_result_t rc = bridge_process_action(b, &act);
         if (rc < 0) return rc;
-        if (b->pending_count > 0) break;
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+        if (b->pending_count > before) {
+            uint32_t delta = b->pending_count - before;
+            if (delta > moq_bridge_max_retain_delta)
+                moq_bridge_max_retain_delta = delta;
+        }
+#else
+        (void)before;
+#endif
+        drained++;
         if (b->fatal || b->closed) break;
     }
     return MOQ_OK;
@@ -1839,7 +2149,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
             e->kind = BRIDGE_STREAM_UNI;
             e->origin = BRIDGE_ORIGIN_LOCAL;
             p->kind = PENDING_HEADER_PAYLOAD;
-            p->stream_id = uni_id;
+            bridge_item_set_sid(p, uni_id);
         }
         /* fall through - reuse this item to send header+payload */
 
@@ -1896,7 +2206,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                                    p->data, p->data_len, false));
                 if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
                     p->kind = PENDING_COPIED_WRITE;
-                    p->stream_id = uni_id;
+                    bridge_item_set_sid(p, uni_id);
                     goto stop;
                 }
                 if (wr == MOQ_TRANSPORT_ERROR) {
@@ -1939,7 +2249,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                                    p->data, p->data_len, p->fin));
                 if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
                     p->kind = PENDING_COPIED_WRITE;
-                    p->stream_id = bidi_id;
+                    bridge_item_set_sid(p, bidi_id);
                     goto stop;
                 }
                 if (wr == MOQ_TRANSPORT_ERROR) {
@@ -1956,7 +2266,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                     b->ops->write(b->endpoint_ctx, bidi_id, NULL, 0, true));
                 if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
                     p->kind = PENDING_CLOSE_BIDI_FIN;
-                    p->stream_id = bidi_id;
+                    bridge_item_set_sid(p, bidi_id);
                     goto stop;
                 }
                 if (wr == MOQ_TRANSPORT_ERROR) {
@@ -2000,9 +2310,25 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
     goto done;
 
 stop:
+    /*
+     * The two queue-full policies, stated because they differ on purpose.
+     *
+     * DRAIN side: unreachable. The drain never polls unless a slot is free and
+     * one action consumes at most one slot, so a drain-side enqueue cannot
+     * fail; the dispatchers' fatal branches remain as assertions of that.
+     *
+     * RETRY side: cannot overflow by counting. This pass moved every survivor
+     * out of `b->pending` (count reset to 0) and re-enqueues at most the same
+     * old_count items into an array of the same max_pending, so the queue can
+     * only return to a depth it already held. If it fails regardless, the
+     * accounting is wrong: the pass stops and surfaces an invariant breach
+     * instead of dropping an owned item and reporting success.
+     */
     for (; i < old_count; i++) {
         if (!bridge_enqueue_pending(b, &old[i])) {
-            bridge_cleanup_pending_item(&b->alloc, &old[i]);
+            rc = bridge_retention_failed(b, &old[i]);
+            i++;
+            goto cleanup;
         }
         memset(&old[i], 0, sizeof(old[i]));
     }
@@ -2211,12 +2537,14 @@ static moq_result_t bridge_service_pass(
         if (b->pending_count > 0) {
             moq_result_t rc = bridge_retry_outbound_pending(b);
             if (rc < 0) return rc;
-            if (b->pending_count > 0)
-                break;  /* still blocked — do not tick or drain */
+            /* Old pending work is retried first, every pass. It no longer
+             * ends the pass: an action for an unrelated stream may still be
+             * drained, and a same-stream action is retained by the domain
+             * gate rather than by stopping here. */
         }
 
-        /* Step 2: drain new actions (only if pending queue empty) */
-        if (b->pending_count == 0 && !b->fatal && !b->closed) {
+        /* Step 2: drain new actions. Per-stream ordering is the gate's job. */
+        if (!b->fatal && !b->closed) {
             moq_result_t rc = bridge_drain_actions(b);
             if (rc < 0) return rc;
         }

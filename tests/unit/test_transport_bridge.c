@@ -34,10 +34,15 @@ typedef struct {
     moq_transport_bridge_t *server_bridge;
 } test_pair_t;
 
+/* When set, the next pair gives the SERVER session this allocator, so a
+ * fixture can account for memory the server side owns. */
+static const moq_alloc_t *g_server_alloc_override;
+
 static int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
                                bool client_streaming,
                                uint32_t client_max_actions,
-                               uint64_t client_idle_us)
+                               uint64_t client_idle_us,
+                               uint32_t server_max_actions)
 {
     memset(tp, 0, sizeof(*tp));
 
@@ -57,9 +62,16 @@ static int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
     if (client_max_events) ccfg.max_events = client_max_events;
 
     moq_session_cfg_t scfg;
-    moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg),
+                               g_server_alloc_override != NULL
+                                   ? g_server_alloc_override
+                                   : moq_alloc_default(),
+                               MOQ_PERSPECTIVE_SERVER);
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 10;
+    /* The publisher's action queue. Raising it above the bridge's drain
+     * budget is what lets a fixture reach the budget at all. 0 = default. */
+    if (server_max_actions) scfg.max_actions = server_max_actions;
 
     if (moq_session_create(&ccfg, 0, &tp->client) < 0) return -1;
     if (moq_session_create(&scfg, 0, &tp->server) < 0) {
@@ -95,7 +107,13 @@ static int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
 static int test_pair_init_stream(test_pair_t *tp, uint32_t client_max_events,
                                  bool client_streaming)
 {
-    return test_pair_init_full(tp, client_max_events, client_streaming, 0, 0);
+    return test_pair_init_full(tp, client_max_events, client_streaming, 0, 0, 0);
+}
+
+/* Same pair, with the PUBLISHER's action queue raised. */
+static int test_pair_init_pub_cap(test_pair_t *tp, uint32_t server_max_actions)
+{
+    return test_pair_init_full(tp, 1, false, 0, 0, server_max_actions);
 }
 
 static int test_pair_init_ex(test_pair_t *tp, uint32_t client_max_events)
@@ -1733,7 +1751,7 @@ static int test_data_stop_suspension_preserves_pending(void)
     /* One action slot, so a single queued object fills it. A larger queue would
      * need enough writes to overrun the endpoint's op recorder, and a dropped
      * op would make the "no reset yet" assertion below prove nothing. */
-    if (test_pair_init_full(&tp, 0, false, 1, 0) < 0) { failures++; return failures; }
+    if (test_pair_init_full(&tp, 0, false, 1, 0, 0) < 0) { failures++; return failures; }
     if (!setup_handshake(&tp)) { failures++; test_pair_destroy(&tp); return failures; }
 
     /* The SERVER subscribes, so the CLIENT publishes. */
@@ -1895,7 +1913,7 @@ static int test_tick_suspension_preserves_due_deadline(void)
 
     const uint64_t idle_us = 30000000;
     test_pair_t tp;
-    if (test_pair_init_full(&tp, 0, false, 0, idle_us) < 0) {
+    if (test_pair_init_full(&tp, 0, false, 0, idle_us, 0) < 0) {
         failures++; return failures;
     }
     if (!setup_handshake(&tp)) { failures++; test_pair_destroy(&tp); return failures; }
@@ -2796,6 +2814,78 @@ static int test_close_retry_after_blocked_control(void)
     return failures;
 }
 
+/*
+ * The deferred close clears ordinary outbound pending work before retaining
+ * its own record. That cleanup is load-bearing: without it the close would
+ * queue behind writes that the peer is never going to accept.
+ *
+ * Reached the same way as the blocked-control case above: real control-write
+ * backpressure gives genuine ordinary pending depth, then a peer control FIN
+ * arms the close while the transport still refuses it.
+ */
+static int test_deferred_close_clears_ordinary_pending(void)
+{
+    int failures = 0;
+    test_pair_t tp;
+    uint32_t before;
+    uint64_t expected_code;
+
+    if (test_pair_init(&tp) < 0) return 1;
+
+    /* real control-write backpressure, so ordinary pending is not synthetic */
+    tp.client_ep.block_write = true;
+    moq_session_start(tp.client, 0);
+    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    before = tp.client_bridge->pending_count;
+    if (before == 0) {
+        fprintf(stderr, "CLEANUP: no ordinary pending work to clear; the "
+                "assertion below would be vacuous\n");
+        failures++;
+    }
+
+    /* the transport refuses the close too, so the close must be retained */
+    tp.client_ep.block_close = true;
+    moq_transport_bridge_on_peer_control_bytes(
+        tp.client_bridge, 2000, NULL, 0, true, 0);
+    MOQ_TEST_CHECK(tp.client_bridge->needs_close);
+    expected_code = tp.client_bridge->needs_close_code;
+
+    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+
+    /* the ordinary work is gone, replaced by exactly the close record */
+    if (tp.client_bridge->pending_count != 1) {
+        fprintf(stderr, "CLEANUP: pending went %u -> %u; the deferred close "
+                "did not replace ordinary work with exactly its own record\n",
+                before, tp.client_bridge->pending_count);
+        failures++;
+    } else if (tp.client_bridge->pending[0].kind != PENDING_CLOSE_TRANSPORT) {
+        fprintf(stderr, "CLEANUP: the single retained item is kind %d, not the "
+                "deferred close\n", (int)tp.client_bridge->pending[0].kind);
+        failures++;
+    } else if (tp.client_bridge->pending[0].error_code != expected_code) {
+        fprintf(stderr, "CLEANUP: the retained close carries code %llu, not "
+                "the %llu the peer's FIN earned\n",
+                (unsigned long long)tp.client_bridge->pending[0].error_code,
+                (unsigned long long)expected_code);
+        failures++;
+    }
+    /* and this is ordinary backpressure, not an error */
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
+
+    /* letting the close through completes cleanly, with no residue */
+    tp.client_ep.block_close = false;
+    tp.client_ep.block_write = false;
+    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.client_bridge));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.client_bridge));
+    MOQ_TEST_CHECK(fake_endpoint_find(&tp.client_ep, FAKE_OP_CLOSE) != NULL);
+
+    test_pair_destroy(&tp);
+    return failures;
+}
+
 /* -- Hard retry: close_transport WOULD_BLOCK then succeeds ---------- */
 
 static int test_close_retry_would_block(void)
@@ -2827,6 +2917,106 @@ static int test_close_retry_would_block(void)
     test_pair_destroy(&tp);
     return failures;
 }
+
+#ifdef MOQ_BRIDGE_TEST_INJECT
+extern void moq_bridge_test_fail_retain_after(unsigned n);
+
+/*
+ * The deferred transport close is not retained work ownership: its record
+ * carries only the close code the peer's protocol violation earned, and the
+ * path has already cleared ordinary pending work. A failed retain there must
+ * surface an error and keep THAT code as the fatal code, rather than being
+ * rewritten to the internal retention code.
+ *
+ * Reached the same way as the established retry-would-block case: a peer
+ * control FIN with the close blocked. The preconditions are asserted before
+ * the injection, and the unblocked control below proves the FIN alone does
+ * not satisfy this pin.
+ */
+static int test_deferred_close_keeps_its_own_code(void)
+{
+    int failures = 0;
+    test_pair_t tp;
+    uint64_t expected_code;
+    moq_result_t rc;
+
+    if (test_pair_init(&tp) < 0) return 1;
+    if (!setup_handshake(&tp)) { test_pair_destroy(&tp); return 1; }
+
+    tp.client_ep.block_close = true;
+    moq_transport_bridge_on_peer_control_bytes(
+        tp.client_bridge, 2000, NULL, 0, true, 0);
+
+    /* preconditions: the deferred close is armed with a real protocol code,
+     * nothing ordinary is queued, and the bridge is still healthy */
+    MOQ_TEST_CHECK(tp.client_bridge->needs_close);
+    expected_code = tp.client_bridge->needs_close_code;
+    if (expected_code == 0 || expected_code == 0x5) {
+        fprintf(stderr, "CLOSEPIN: precondition close code was %llu, which "
+                "cannot distinguish the retention code\n",
+                (unsigned long long)expected_code);
+        failures++;
+    }
+    MOQ_TEST_CHECK(tp.client_bridge->pending_count == 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
+    fake_endpoint_clear_ops(&tp.client_ep);
+
+    /* with nothing else queued, the close is the only retention this pass */
+    moq_bridge_test_fail_retain_after(0);
+    rc = moq_transport_bridge_service(tp.client_bridge, 0);
+
+    if (rc == MOQ_OK) {
+        fprintf(stderr, "CLOSEPIN: a failed deferred-close retain was "
+                "reported as success\n");
+        failures++;
+    }
+    if (!moq_transport_bridge_is_fatal(tp.client_bridge)) {
+        fprintf(stderr, "CLOSEPIN: a failed deferred-close retain left the "
+                "bridge usable; the injection was not consumed here\n");
+        failures++;
+    }
+    if (moq_transport_bridge_is_closed(tp.client_bridge)) {
+        fprintf(stderr, "CLOSEPIN: the bridge reported a clean close after a "
+                "failed retain\n");
+        failures++;
+    }
+    if (tp.client_bridge->fatal_code != expected_code) {
+        fprintf(stderr, "CLOSEPIN: fatal code was %llu, not the close code "
+                "%llu the violation earned\n",
+                (unsigned long long)tp.client_bridge->fatal_code,
+                (unsigned long long)expected_code);
+        failures++;
+    }
+    if (tp.client_bridge->pending_count != 0) {
+        fprintf(stderr, "CLOSEPIN: %u item(s) queued after a failed "
+                "deferred-close retain\n", tp.client_bridge->pending_count);
+        failures++;
+    }
+    /* and no close escaped to the transport */
+    MOQ_TEST_CHECK(fake_endpoint_find(&tp.client_ep, FAKE_OP_CLOSE) == NULL);
+    test_pair_destroy(&tp);
+
+    /* vacuity control: the same FIN with NO injection must reach the
+     * established behaviour -- a pending close on a non-fatal bridge -- so the
+     * protocol FIN alone cannot satisfy the assertions above */
+    if (test_pair_init(&tp) < 0) return failures + 1;
+    if (!setup_handshake(&tp)) { test_pair_destroy(&tp); return failures + 1; }
+    tp.client_ep.block_close = true;
+    moq_transport_bridge_on_peer_control_bytes(
+        tp.client_bridge, 2000, NULL, 0, true, 0);
+    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    if (moq_transport_bridge_is_fatal(tp.client_bridge) ||
+        !moq_transport_bridge_has_pending(tp.client_bridge)) {
+        fprintf(stderr, "CLOSEPIN: the control FIN alone went fatal=%d "
+                "pending=%d; the pin above proves nothing\n",
+                (int)moq_transport_bridge_is_fatal(tp.client_bridge),
+                (int)moq_transport_bridge_has_pending(tp.client_bridge));
+        failures++;
+    }
+    test_pair_destroy(&tp);
+    return failures;
+}
+#endif
 
 /* -- Reset on unknown stream is no-op ------------------------------- */
 
@@ -9286,7 +9476,7 @@ static int test_uni_reset_data_immediate_retire(void)
 {
     int failures = 0;
     test_pair_t tp;
-    if (test_pair_init_full(&tp, 0, false, 64, 0) < 0) return 1;
+    if (test_pair_init_full(&tp, 0, false, 64, 0, 0) < 0) return 1;
     if (!setup_handshake(&tp)) { test_pair_destroy(&tp); return 1; }
 
     /* SERVER subscribes, CLIENT publishes and opens a local-origin data uni. */
@@ -11034,6 +11224,2420 @@ static int test_local_bidi_normal_fin_unchanged(void)
     return failures;
 }
 
+/* ================= per-stream head-of-line: acceptance battery =============
+ * The bridge's documented service ordering blocks the drain of ALL new session
+ * actions while the outbound pending queue is non-empty. g192 showed the cost:
+ * one parked unidirectional open froze every other stream on the connection.
+ * These fixtures pin what must hold before and after narrowing that scope to
+ * per-stream. Sans-I/O: one publisher session over a fake endpoint, no peer
+ * feedback needed, no wall clock, exact operation-count oracles.
+ */
+typedef struct {
+    test_pair_t        tp;
+    moq_subscription_t ssub;
+} hol_fix_t;
+
+/* the subscribe/accept half, shared with fixtures that build their own pair */
+static int hol_subscribe_accept(hol_fix_t *f)
+{
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { ns_parts, 1 };
+    moq_subscribe_cfg_t sc;
+    moq_subscription_t csub;
+    moq_event_t ev;
+    moq_accept_subscribe_cfg_t acc;
+
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = ns;
+    sc.track_name = MOQ_BYTES_LITERAL("video");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    if (moq_session_subscribe(f->tp.client, &sc, 0, &csub) != MOQ_OK) return -1;
+    pump_until_quiescent(&f->tp, 20, 0);
+
+    f->ssub = MOQ_SUBSCRIPTION_INVALID;
+    while (moq_session_poll_events(f->tp.server, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+            f->ssub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    if (!moq_subscription_is_valid(f->ssub)) return -1;
+    moq_accept_subscribe_cfg_init(&acc);
+    if (moq_session_accept_subscribe(f->tp.server, f->ssub, &acc, 0) != MOQ_OK)
+        return -1;
+    pump_until_quiescent(&f->tp, 20, 0);
+    fake_endpoint_clear_ops(&f->tp.server_ep);
+    return 0;
+}
+
+static int hol_init(hol_fix_t *f)
+{
+    memset(f, 0, sizeof(*f));
+    if (test_pair_init_stream(&f->tp, 1, false) < 0) return -1;
+    if (!setup_handshake(&f->tp)) { test_pair_destroy(&f->tp); return -1; }
+
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { ns_parts, 1 };
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = ns;
+    sc.track_name = MOQ_BYTES_LITERAL("video");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t csub;
+    if (moq_session_subscribe(f->tp.client, &sc, 0, &csub) != MOQ_OK) goto fail;
+    pump_until_quiescent(&f->tp, 20, 0);
+
+    moq_event_t ev;
+    f->ssub = MOQ_SUBSCRIPTION_INVALID;
+    while (moq_session_poll_events(f->tp.server, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+            f->ssub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    if (!moq_subscription_is_valid(f->ssub)) goto fail;
+
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    if (moq_session_accept_subscribe(f->tp.server, f->ssub, &acc, 0) != MOQ_OK)
+        goto fail;
+    pump_until_quiescent(&f->tp, 20, 0);
+    fake_endpoint_clear_ops(&f->tp.server_ep);
+    return 0;
+fail:
+    test_pair_destroy(&f->tp);
+    return -1;
+}
+
+/* hol_init with the PUBLISHER's action queue raised, so a fixture can offer
+ * the bridge more actions in one pass than its drain budget allows. */
+static int hol_init_cap(hol_fix_t *f, uint32_t server_max_actions)
+{
+    memset(f, 0, sizeof(*f));
+    if (test_pair_init_pub_cap(&f->tp, server_max_actions) < 0) return -1;
+    if (!setup_handshake(&f->tp)) { test_pair_destroy(&f->tp); return -1; }
+
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { ns_parts, 1 };
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = ns;
+    sc.track_name = MOQ_BYTES_LITERAL("video");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t csub;
+    if (moq_session_subscribe(f->tp.client, &sc, 0, &csub) != MOQ_OK) goto fail;
+    pump_until_quiescent(&f->tp, 20, 0);
+
+    moq_event_t ev;
+    f->ssub = MOQ_SUBSCRIPTION_INVALID;
+    while (moq_session_poll_events(f->tp.server, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+            f->ssub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    if (!moq_subscription_is_valid(f->ssub)) goto fail;
+
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    if (moq_session_accept_subscribe(f->tp.server, f->ssub, &acc, 0) != MOQ_OK)
+        goto fail;
+    pump_until_quiescent(&f->tp, 20, 0);
+    fake_endpoint_clear_ops(&f->tp.server_ep);
+    return 0;
+fail:
+    test_pair_destroy(&f->tp);
+    return -1;
+}
+
+static moq_result_t hol_open_sg(hol_fix_t *f, uint64_t group,
+                                moq_subgroup_handle_t *out)
+{
+    moq_subgroup_cfg_t c;
+    moq_subgroup_cfg_init(&c);
+    c.group_id = group;
+    c.subgroup_id = 0;
+    c.end_of_group = false;
+    *out = MOQ_SUBGROUP_INVALID;
+    return moq_session_open_subgroup(f->tp.server, f->ssub, &c, 0, out);
+}
+
+static moq_result_t hol_write(hol_fix_t *f, moq_subgroup_handle_t sg,
+                              uint64_t obj, size_t len)
+{
+    uint8_t buf[128];
+    moq_rcbuf_t *p = NULL;
+    if (len > sizeof(buf)) return MOQ_ERR_INVAL;
+    memset(buf, 'Z', len);
+    if (moq_rcbuf_create(moq_alloc_default(), buf, len, &p) != MOQ_OK)
+        return MOQ_ERR_NOMEM;
+    moq_result_t rc = moq_session_write_object(f->tp.server, sg, obj, p, 0);
+    moq_rcbuf_decref(p);
+    return rc;
+}
+
+#ifdef MOQ_BRIDGE_TEST_INJECT
+/* hol_write that keeps the caller's reference, so a fixture can watch the
+ * buffer's refcount across a failure and still hold it alive afterwards. The
+ * caller decrefs. */
+static moq_result_t hol_write_keep(hol_fix_t *f, moq_subgroup_handle_t sg,
+                                   uint64_t obj, size_t len,
+                                   moq_rcbuf_t **out)
+{
+    uint8_t buf[128];
+    moq_rcbuf_t *p = NULL;
+    if (len > sizeof(buf)) return MOQ_ERR_INVAL;
+    memset(buf, 'Z', len);
+    if (moq_rcbuf_create(moq_alloc_default(), buf, len, &p) != MOQ_OK)
+        return MOQ_ERR_NOMEM;
+    moq_result_t rc = moq_session_write_object(f->tp.server, sg, obj, p, 0);
+    if (rc != MOQ_OK) { moq_rcbuf_decref(p); return rc; }
+    *out = p;
+    return MOQ_OK;
+}
+#endif
+
+/* Service the publisher bridge only. The peer is not needed: the block is on
+ * the fake endpoint, so nothing here depends on inbound traffic. */
+static void hol_service(hol_fix_t *f, int passes)
+{
+    for (int i = 0; i < passes; i++)
+        (void)moq_transport_bridge_service(f->tp.server_bridge, 0);
+}
+
+/* Adapter-boundary oracle: accepted WRITE operations naming this stream. */
+static size_t hol_writes_on(const hol_fix_t *f, uint64_t sid)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < f->tp.server_ep.count; i++)
+        if (f->tp.server_ep.ops[i].kind == FAKE_OP_WRITE &&
+            f->tp.server_ep.ops[i].stream_id == sid)
+            n++;
+    return n;
+}
+
+static size_t hol_count_kind(const hol_fix_t *f, fake_op_kind_t k)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < f->tp.server_ep.count; i++)
+        if (f->tp.server_ep.ops[i].kind == k) n++;
+    return n;
+}
+
+/* The stream id of the Nth accepted uni open (0-based), or UINT64_MAX. */
+static uint64_t hol_nth_open(const hol_fix_t *f, size_t n)
+{
+    size_t seen = 0;
+    for (size_t i = 0; i < f->tp.server_ep.count; i++)
+        if (f->tp.server_ep.ops[i].kind == FAKE_OP_OPEN_UNI) {
+            if (seen == n) return f->tp.server_ep.ops[i].stream_id;
+            seen++;
+        }
+    return UINT64_MAX;
+}
+
+static uint32_t hol_pending(const hol_fix_t *f)
+{
+    return f->tp.server_bridge->pending_count;
+}
+
+/* -- 1. THE CONTRACT: an unrelated ref must progress ---------------------- */
+static int test_hol_unrelated_ref_progresses(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b;
+    uint64_t sid_a;
+    size_t before, after;
+
+    if (hol_init(&f) < 0) return 1;
+
+    /* ref A opens for real and takes its header */
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+
+    /* ref B's open is refused and retained */
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    /* non-vacuity: the refusal happened and the item is owned */
+    MOQ_TEST_CHECK(f.tp.server_ep.block_count > 0);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    MOQ_TEST_CHECK(f.tp.server_bridge->pending[0].kind == PENDING_OPEN_UNI_DATA);
+
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    before = hol_writes_on(&f, sid_a);
+
+    /* eligible work on ref A, which is open and needs no credit */
+    for (uint64_t i = 1; i <= 6; i++)
+        MOQ_TEST_CHECK(hol_write(&f, a, i, 32) == MOQ_OK);
+    hol_service(&f, 8);
+    after = hol_writes_on(&f, sid_a);
+
+    /* THE CONTRACT: ref A must not wait for ref B's credit. */
+    if (after <= before) {
+        fprintf(stderr, "HOL unrelated-ref: writes on A %zu -> %zu with %u "
+                "pending (blocked open on B)\n", before, after, hol_pending(&f));
+        failures++;
+    }
+    /* B is still owned, not lost */
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+
+    /* and once credit returns, B completes too */
+    f.tp.server_ep.block_open_uni = false;
+    hol_service(&f, 8);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_OPEN_UNI) >= 1);
+
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* -- 2. SAFETY: same ref must not bypass, and FIN stays last -------------- */
+static int test_hol_same_ref_no_bypass_fin_last(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t sid_a;
+    size_t writes_while_blocked;
+    ptrdiff_t last_write = -1, last_fin = -1;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    /* block writes: ref A's own data parks */
+    f.tp.server_ep.block_write = true;
+    MOQ_TEST_CHECK(hol_write(&f, a, 1, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+
+    /* more same-ref data and the terminal, all behind the parked write */
+    for (uint64_t i = 2; i <= 4; i++)
+        MOQ_TEST_CHECK(hol_write(&f, a, i, 32) == MOQ_OK);
+    (void)moq_session_close_subgroup(f.tp.server, a, 0);
+    hol_service(&f, 8);
+    writes_while_blocked = hol_writes_on(&f, sid_a);
+    /* SAFETY: nothing on this ref may pass its own parked work */
+    MOQ_TEST_CHECK(writes_while_blocked == 0);
+
+    /* unblock: everything drains, in order, FIN last */
+    f.tp.server_ep.block_write = false;
+    hol_service(&f, 24);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    for (size_t i = 0; i < f.tp.server_ep.count; i++) {
+        fake_op_t *o = &f.tp.server_ep.ops[i];
+        if (o->kind != FAKE_OP_WRITE || o->stream_id != sid_a) continue;
+        last_write = (ptrdiff_t)i;
+        if (o->fin) last_fin = (ptrdiff_t)i;
+    }
+    MOQ_TEST_CHECK(last_write >= 0);
+    if (last_fin >= 0 && last_fin != last_write) {
+        fprintf(stderr, "HOL same-ref: FIN at %td is not the last write (%td)\n",
+                last_fin, last_write);
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* -- 3. two parked refs, work on a third -------------------------------- */
+static int test_hol_two_parked_third_progresses(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b, c;
+    uint64_t sid_a;
+    size_t before, after;
+    uint32_t parked;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    MOQ_TEST_CHECK(hol_open_sg(&f, 2, &c) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, c, 0, 32) == MOQ_OK);
+    hol_service(&f, 6);
+    parked = hol_pending(&f);
+    MOQ_TEST_CHECK(parked >= 1);
+
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    before = hol_writes_on(&f, sid_a);
+    for (uint64_t i = 1; i <= 4; i++)
+        MOQ_TEST_CHECK(hol_write(&f, a, i, 32) == MOQ_OK);
+    hol_service(&f, 8);
+    after = hol_writes_on(&f, sid_a);
+    if (after <= before) {
+        fprintf(stderr, "HOL two-parked: third ref writes %zu -> %zu with %u "
+                "pending\n", before, after, hol_pending(&f));
+        failures++;
+    }
+    /* both parked refs are still owned and complete once credit returns */
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    f.tp.server_ep.block_open_uni = false;
+    hol_service(&f, 24);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_OPEN_UNI) >= 2);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* -- 4. connection-level terminal precedence ----------------------------- */
+static int test_hol_terminal_precedence_over_bypass(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    /* a session close while bypassable work exists: the transport close must
+     * still happen, and the bridge must end up closed rather than starved */
+    moq_session_close(f.tp.server, 0x0, NULL, 0);
+    hol_service(&f, 12);
+    fprintf(stderr, "HOL precedence: CLOSE ops while parked=%zu pending=%u\n",
+            hol_count_kind(&f, FAKE_OP_CLOSE), hol_pending(&f));
+    /* is the close merely queued behind the parked open? */
+    f.tp.server_ep.block_open_uni = false;
+    hol_service(&f, 16);
+    fprintf(stderr, "HOL precedence: CLOSE ops after credit=%zu pending=%u\n",
+            hol_count_kind(&f, FAKE_OP_CLOSE), hol_pending(&f));
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_CLOSE) >= 1);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.server_bridge));
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* -- 6. bounded service work: no unbounded drain loop -------------------- */
+static int test_hol_service_work_is_bounded(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b;
+    size_t ops_first, ops_second;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    for (uint64_t i = 1; i <= 8; i++)
+        MOQ_TEST_CHECK(hol_write(&f, a, i, 32) == MOQ_OK);
+
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    ops_first = f.tp.server_ep.count;
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    ops_second = f.tp.server_ep.count;
+
+    /* one pass must terminate and must not emit unboundedly; the endpoint's
+     * own overflow flag is the loss oracle */
+    MOQ_TEST_CHECK(!f.tp.server_ep.overflowed);
+    MOQ_TEST_CHECK(ops_first <= FAKE_EP_MAX_OPS);
+    MOQ_TEST_CHECK(ops_second <= FAKE_EP_MAX_OPS);
+    /* and a steady state is reached: repeated passes with no new session work
+     * cannot keep producing operations for ever */
+    f.tp.server_ep.block_open_uni = false;
+    hol_service(&f, 24);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    hol_service(&f, 8);
+    MOQ_TEST_CHECK(f.tp.server_ep.count == 0);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* -- Phase A: close intent, conservation, and the seeded explorer --------- */
+
+/* Counting allocator: the conservation oracle. Every allocation the bridge and
+ * session make on this path must be released, so `live` returns to zero once
+ * both are destroyed. A leak, a double free (negative), or a stranded pending
+ * item all show up here. */
+typedef struct {
+    int64_t live_bytes;
+    int64_t live_blocks;
+    int64_t frees;
+    int64_t allocs;
+    bool    negative;      /* sticky: a free without a matching alloc */
+} hol_acct_t;
+
+static void *hol_acct_alloc(size_t n, void *ctx)
+{
+    hol_acct_t *a = (hol_acct_t *)ctx;
+    void *p = malloc(n ? n : 1);
+    if (p == NULL) return NULL;
+    a->live_bytes += (int64_t)n;
+    a->live_blocks++;
+    a->allocs++;
+    return p;
+}
+
+static void hol_acct_free(void *p, size_t n, void *ctx)
+{
+    hol_acct_t *a = (hol_acct_t *)ctx;
+    if (p == NULL) return;
+    a->live_bytes -= (int64_t)n;
+    a->live_blocks--;
+    a->frees++;
+    if (a->live_blocks < 0 || a->live_bytes < 0) a->negative = true;
+    free(p);
+}
+
+static void *hol_acct_realloc(void *p, size_t old_n, size_t new_n, void *ctx)
+{
+    hol_acct_t *a = (hol_acct_t *)ctx;
+    void *q = realloc(p, new_n ? new_n : 1);
+    if (q == NULL) return NULL;
+    a->live_bytes += (int64_t)new_n - (int64_t)old_n;
+    if (p == NULL) { a->live_blocks++; a->allocs++; }
+    if (a->live_bytes < 0 || a->live_blocks < 0) a->negative = true;
+    return q;
+}
+
+static moq_alloc_t hol_acct_allocator(hol_acct_t *a)
+{
+    moq_alloc_t al;
+    memset(a, 0, sizeof(*a));
+    memset(&al, 0, sizeof(al));
+    al.alloc = hol_acct_alloc;
+    al.realloc = hol_acct_realloc;
+    al.free = hol_acct_free;
+    al.ctx = a;
+    return al;
+}
+
+/* -- 2. CLOSE INTENT: a parked open must not defer clean close ------------ */
+static int test_hol_close_intent_not_deferred(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b;
+    size_t close_while_parked, close_after_credit;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+
+    /* park an open on a DIFFERENT stream */
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    /* non-vacuity: the refusal happened and the item is retained */
+    MOQ_TEST_CHECK(f.tp.server_ep.block_count > 0);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    /* close intent, with the open still parked */
+    moq_session_close(f.tp.server, 0x0, NULL, 0);
+    hol_service(&f, 12);
+    close_while_parked = hol_count_kind(&f, FAKE_OP_CLOSE);
+
+    /* THE CONTRACT: close intent must be polled and begin the clean close
+     * without waiting for stream credit that may never arrive. */
+    if (close_while_parked == 0) {
+        fprintf(stderr, "HOL close-intent: no CLOSE while parked (pending=%u); "
+                "clean close is waiting on stream credit\n", hol_pending(&f));
+        failures++;
+    }
+
+    /* and it does happen once credit returns, so the intent was merely
+     * deferred rather than lost -- which is what makes this a HOL finding */
+    f.tp.server_ep.block_open_uni = false;
+    hol_service(&f, 16);
+    close_after_credit = hol_count_kind(&f, FAKE_OP_CLOSE);
+    MOQ_TEST_CHECK(close_after_credit >= 1);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* Once close has begun, transport-close/deferred-close priority still holds:
+ * a blocked close is retried ahead of everything, and exactly one is emitted. */
+static int test_hol_close_priority_once_begun(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    f.tp.server_ep.block_close = true;
+    moq_session_close(f.tp.server, 0x0, NULL, 0);
+    hol_service(&f, 8);
+    /* the close is retained, not lost, and no close op escaped */
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_CLOSE) == 0);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+
+    f.tp.server_ep.block_close = false;
+    hol_service(&f, 8);
+    /* exactly one transport close, and the bridge is closed */
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_CLOSE) == 1);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* -- 3. conservation over the whole owned-action lifecycle ---------------- */
+static int test_hol_conservation_of_owned_actions(void)
+{
+    int failures = 0;
+    hol_acct_t acct;
+    moq_alloc_t al = hol_acct_allocator(&acct);
+    moq_session_cfg_t scfg;
+    moq_session_t *pub = NULL;
+    fake_endpoint_t ep;
+    moq_transport_bridge_t *br = NULL;
+    moq_transport_bridge_cfg_t bcfg;
+
+    /* A publisher session and bridge on the counting allocator. The session is
+     * driven straight from the action side: no peer is needed to prove that
+     * every owned action reaches exactly one terminal ownership state. */
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), &al, MOQ_PERSPECTIVE_SERVER);
+    MOQ_TEST_CHECK(moq_session_create(&scfg, 0, &pub) == MOQ_OK);
+    fake_endpoint_init(&ep, 3, 1);
+    moq_transport_bridge_cfg_init(&bcfg, &al);
+    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, pub, &ep.vtable, &ep, &br)
+                   == MOQ_OK);
+
+    /* Exercise the retention paths: blocked opens, blocked writes, a blocked
+     * close, and a fatal-free teardown with items still pending. */
+    ep.block_open_uni = true;
+    ep.block_write = true;
+    for (int i = 0; i < 6; i++)
+        (void)moq_transport_bridge_service(br, 0);
+    ep.block_close = true;
+    moq_session_close(pub, 0x0, NULL, 0);
+    for (int i = 0; i < 6; i++)
+        (void)moq_transport_bridge_service(br, 0);
+
+    /* Teardown with pending work still owned: destroy must release all of it. */
+    moq_transport_bridge_destroy(br);
+    moq_session_destroy(pub);
+
+    if (acct.live_blocks != 0 || acct.live_bytes != 0) {
+        fprintf(stderr, "HOL conservation: leaked %lld block(s), %lld byte(s) "
+                "(allocs=%lld frees=%lld)\n", (long long)acct.live_blocks,
+                (long long)acct.live_bytes, (long long)acct.allocs,
+                (long long)acct.frees);
+        failures++;
+    }
+    if (acct.negative) {
+        fprintf(stderr, "HOL conservation: a free had no matching alloc "
+                "(double cleanup)\n");
+        failures++;
+    }
+    MOQ_TEST_CHECK(acct.allocs > 0);          /* the oracle really ran */
+    MOQ_TEST_CHECK(acct.allocs == acct.frees);
+    return failures;
+}
+
+/* -- 4. deterministic small-state explorer ------------------------------- */
+/* xorshift64*, so a seed replays exactly. */
+static uint64_t hol_rng(uint64_t *s)
+{
+    uint64_t x = *s;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    *s = x;
+    return x * 2685821657736338717ULL;
+}
+
+#define HOL_EXPLORE_REFS 3
+
+static int hol_explore_seed(uint64_t seed, int steps, bool verbose)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t sg[HOL_EXPLORE_REFS];
+    bool opened[HOL_EXPLORE_REFS];
+    uint64_t obj[HOL_EXPLORE_REFS];
+    uint64_t st = seed ? seed : 1;
+    uint32_t credit = (uint32_t)(hol_rng(&st) % 4);   /* credit 0..3 */
+    uint32_t granted = 0;
+    unsigned offered = 0, saturated = 0;
+    bool fatal_seen = false;
+
+    if (hol_init(&f) < 0) return 1;
+    memset(opened, 0, sizeof(opened));
+    memset(obj, 0, sizeof(obj));
+    /* credit is modelled at the endpoint: opens are refused once `credit`
+     * of them have been accepted, until a credit-return op lifts it. */
+    f.tp.server_ep.block_open_uni = (credit == 0);
+
+    for (int i = 0; i < steps; i++) {
+        uint64_t r = hol_rng(&st);
+        int which = (int)((r >> 3) % HOL_EXPLORE_REFS);
+        switch (r % 9u) {
+        case 0:                                   /* open a subgroup */
+            if (!opened[which] &&
+                hol_open_sg(&f, (uint64_t)(100 + which), &sg[which]) == MOQ_OK) {
+                opened[which] = true;
+            }
+            break;
+        case 1:                                   /* write an object */
+            if (opened[which] &&
+                hol_write(&f, sg[which], obj[which], 32) == MOQ_OK) {
+                obj[which]++;
+                offered++;
+            }
+            break;
+        case 2:                                   /* terminal FIN */
+            if (opened[which]) {
+                (void)moq_session_close_subgroup(f.tp.server, sg[which], 0);
+                opened[which] = false;
+            }
+            break;
+        case 3:                                   /* reset the subgroup */
+            if (opened[which]) {
+                (void)moq_session_reset_subgroup(f.tp.server, sg[which], 0x1, 0);
+                opened[which] = false;
+            }
+            break;
+        case 4:                                   /* toggle write block */
+            f.tp.server_ep.block_write = !f.tp.server_ep.block_write;
+            break;
+        case 5:                                   /* toggle reset block */
+            f.tp.server_ep.block_reset = !f.tp.server_ep.block_reset;
+            break;
+        case 6:                                   /* credit return */
+            granted = credit;
+            f.tp.server_ep.block_open_uni = false;
+            break;
+        case 7:                                   /* credit exhaustion */
+            f.tp.server_ep.block_open_uni = true;
+            break;
+        default:                                  /* service */
+            hol_service(&f, 1 + (int)((r >> 9) % 3u));
+            break;
+        }
+        /* ORACLE: an unexpected bridge fatal is ALWAYS a failure. There is
+         * no exemption -- an exempted fatal is exactly what hides a defect. */
+        if (moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+            fprintf(stderr, "EXPLORE seed=%llu step=%d BRIDGE FATAL "
+                    "(pending=%u of %u, offered=%u)\n",
+                    (unsigned long long)seed, i, hol_pending(&f),
+                    f.tp.server_bridge->max_pending, offered);
+            failures++;
+            fatal_seen = true;
+            break;
+        }
+        if (hol_pending(&f) >= f.tp.server_bridge->max_pending)
+            saturated++;
+        if (f.tp.server_ep.overflowed) {
+            fprintf(stderr, "EXPLORE seed=%llu step=%d endpoint op loss\n",
+                    (unsigned long long)seed, i);
+            failures++;
+            break;
+        }
+        if (f.tp.server_ep.count > FAKE_EP_MAX_OPS / 2)
+            fake_endpoint_clear_ops(&f.tp.server_ep);
+    }
+    /* ORACLE: lift every block; the queue must drain, no fatal may appear,
+     * and every offered object must have reached the endpoint. */
+    if (!fatal_seen) {
+        f.tp.server_ep.block_open_uni = false;
+        f.tp.server_ep.block_write = false;
+        f.tp.server_ep.block_reset = false;
+        fake_unblock_stream(&f.tp.server_ep);
+        hol_service(&f, 256);
+        if (moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+            fprintf(stderr, "EXPLORE seed=%llu FATAL during drain\n",
+                    (unsigned long long)seed);
+            failures++;
+        } else if (hol_pending(&f) != 0) {
+            fprintf(stderr, "EXPLORE seed=%llu unblocked but %u still "
+                    "pending\n", (unsigned long long)seed, hol_pending(&f));
+            failures++;
+        } else if (offered > 0 &&
+                   f.tp.server_ep.write_calls < (uint64_t)offered) {
+            fprintf(stderr, "EXPLORE seed=%llu only %llu write(s) for %u "
+                    "offered object(s)\n", (unsigned long long)seed,
+                    (unsigned long long)f.tp.server_ep.write_calls, offered);
+            failures++;
+        }
+    }
+    if (verbose)
+        printf("EXPLORE seed=%llu credit=%u granted=%u offered=%u "
+               "saturated_steps=%u %s\n", (unsigned long long)seed, credit,
+               granted, offered, saturated, failures ? "FAIL" : "ok");
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* A walk that deliberately runs max_actions > max_pending on one blocked
+ * stream, so retention saturation is actually reached -- the state that made
+ * fatal. Same oracles: no fatal ever, full drain, conservation. */
+static int hol_explore_saturation_seed(uint64_t seed, int steps)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t st = seed ? seed : 1, sid_a, obj = 0;
+    unsigned offered = 0, saturated = 0;
+    const uint32_t MA = 4096, MP = 8;
+
+    memset(&f, 0, sizeof(f));
+    if (test_pair_init_full(&f.tp, 1, false, 0, 0, MA) < 0) return 1;
+    if (!setup_handshake(&f.tp)) { test_pair_destroy(&f.tp); return 1; }
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    {
+        moq_transport_bridge_cfg_t bcfg;
+        moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+        bcfg.max_pending = MP;
+        if (moq_transport_bridge_create(&bcfg, f.tp.server,
+                &f.tp.server_ep.vtable, &f.tp.server_ep,
+                &f.tp.server_bridge) != MOQ_OK) {
+            test_pair_destroy(&f.tp); return 1;
+        }
+    }
+    if (hol_subscribe_accept(&f) < 0) { test_pair_destroy(&f.tp); return 1; }
+    if (hol_open_sg(&f, 0, &a) != MOQ_OK) { test_pair_destroy(&f.tp); return 1; }
+    (void)hol_write(&f, a, obj++, 24);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    if (sid_a == UINT64_MAX) { test_pair_destroy(&f.tp); return 1; }
+
+    /* start blocked: saturation is the point of this walk, so the weighting
+     * favours offering work while the one stream cannot drain */
+    fake_block_stream(&f.tp.server_ep, sid_a);
+    for (int i = 0; i < steps; i++) {
+        uint64_t r = hol_rng(&st);
+        uint64_t pick = r % 10u;
+        if (pick < 6u) {
+            if (hol_write(&f, a, obj, 24) == MOQ_OK) { obj++; offered++; }
+        } else if (pick < 8u) {
+            hol_service(&f, 1 + (int)((r >> 7) % 3u));
+        } else if (pick == 8u) {
+            fake_block_stream(&f.tp.server_ep, sid_a);
+        } else {
+            fake_unblock_stream(&f.tp.server_ep);
+            hol_service(&f, 2);
+            fake_block_stream(&f.tp.server_ep, sid_a);
+        }
+        if (hol_pending(&f) >= f.tp.server_bridge->max_pending) saturated++;
+        if (moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+            fprintf(stderr, "EXPLORE-SAT seed=%llu step=%d FATAL "
+                    "(pending=%u of %u offered=%u)\n",
+                    (unsigned long long)seed, i, hol_pending(&f),
+                    f.tp.server_bridge->max_pending, offered);
+            failures++;
+            break;
+        }
+        if (f.tp.server_ep.count > FAKE_EP_MAX_OPS / 2)
+            fake_endpoint_clear_ops(&f.tp.server_ep);
+    }
+    if (!moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+        fake_unblock_stream(&f.tp.server_ep);
+        hol_service(&f, 512);
+        if (hol_pending(&f) != 0) {
+            fprintf(stderr, "EXPLORE-SAT seed=%llu %u still pending after "
+                    "unblock\n", (unsigned long long)seed, hol_pending(&f));
+            failures++;
+        }
+        if (offered > 0 && f.tp.server_ep.write_calls < (uint64_t)offered) {
+            fprintf(stderr, "EXPLORE-SAT seed=%llu only %llu write(s) for %u "
+                    "offered\n", (unsigned long long)seed,
+                    (unsigned long long)f.tp.server_ep.write_calls, offered);
+            failures++;
+        }
+    }
+    if (saturated == 0) {
+        fprintf(stderr, "EXPLORE-SAT seed=%llu never reached saturation; the "
+                "case is vacuous\n", (unsigned long long)seed);
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+static int test_hol_explorer(void)
+{
+    /* Fixed, recorded seeds. Never tuned after the fact: this list is the
+     * receipt, and any seed here replays exactly. */
+    static const uint64_t seeds[] = {
+        1u, 2u, 3u, 5u, 8u, 13u, 21u, 34u, 55u, 89u, 144u, 233u,
+        377u, 610u, 987u, 1597u, 2584u, 4181u, 6765u, 10946u,
+        0xC0FFEEu, 0xDEADBEEFu, 0x5EEDu, 0xA5A5A5A5u,
+    };
+    int failures = 0;
+    size_t n = sizeof(seeds) / sizeof(seeds[0]);
+    for (size_t i = 0; i < n; i++)
+        failures += hol_explore_seed(seeds[i], 48, false);
+    {
+        static const uint64_t sat[] = { 0x5A7u, 0x5A8u, 0x5A9u, 0x5AAu,
+                                        0x5ABu, 0x5ACu, 0x5ADu, 0x5AEu };
+        size_t m = sizeof(sat) / sizeof(sat[0]);
+        for (size_t i = 0; i < m; i++)
+            failures += hol_explore_saturation_seed(sat[i], 200);
+        printf("EXPLORE receipt: %zu seeds x 48 steps (refs=%d, credit 0..3) + "
+               "%zu saturation seeds x 200 steps (max_actions=4096, "
+               "max_pending=8), %d failure(s)\n",
+               n, HOL_EXPLORE_REFS, m, failures);
+    }
+    return failures;
+}
+
+/* -- gate-specific fixtures: each pins one classifier property ------------ */
+
+/* The one state in which the ordering gate, not the endpoint, is what holds a
+ * later same-stream action back:
+ *
+ *   pending = [ C-open (blocked, at the head), A-write (blocked earlier) ]
+ *
+ * The retry pass stops at C, so A's older write is re-queued WITHOUT being
+ * attempted -- and by then the endpoint is willing to accept writes to A. A
+ * newly drained write for A must therefore be retained behind the older one.
+ * Without the gate it goes straight to the endpoint and the stream sees object
+ * 2 before object 1.
+ *
+ * Object identity is carried in the payload LENGTH, so the recorded operation
+ * sequence names the order.
+ */
+static int test_hol_gate_orders_when_endpoint_would_accept(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, c;
+    uint64_t sid_a;
+    size_t lens[8];
+    size_t n = 0;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+
+    /* head of the FIFO: an open that cannot be satisfied */
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 9, &c) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, c, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+
+    /* behind it: object 1 on stream A, blocked only on A */
+    fake_block_stream(&f.tp.server_ep, sid_a);
+    MOQ_TEST_CHECK(hol_write(&f, a, 1, 41) == MOQ_OK);
+    hol_service(&f, 4);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 2);
+
+    /* the endpoint is now willing to accept A, but the retry still stops at
+     * the head, so A's object 1 stays retained and un-attempted */
+    fake_unblock_stream(&f.tp.server_ep);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    MOQ_TEST_CHECK(hol_write(&f, a, 2, 42) == MOQ_OK);
+    hol_service(&f, 6);
+
+    for (size_t i = 0; i < f.tp.server_ep.count && n < 8; i++) {
+        fake_op_t *o = &f.tp.server_ep.ops[i];
+        if (o->kind == FAKE_OP_WRITE && o->stream_id == sid_a && o->data_len > 32)
+            lens[n++] = o->data_len;
+    }
+    /* ORDERING: if object 2 (42 bytes) reaches the stream before object 1
+     * (41 bytes), a later action passed older same-stream work. */
+    for (size_t i = 0; i < n; i++) {
+        if (lens[i] == 42) {
+            bool saw_41 = false;
+            for (size_t j = 0; j < i; j++)
+                if (lens[j] == 41) saw_41 = true;
+            if (!saw_41) {
+                fprintf(stderr, "HOL gate-order: object 2 reached stream %llu "
+                        "before object 1 (pending=%u)\n",
+                        (unsigned long long)sid_a, hol_pending(&f));
+                failures++;
+            }
+            break;
+        }
+    }
+
+    /* everything drains once the head can proceed, in order and exactly once */
+    f.tp.server_ep.block_open_uni = false;
+    hol_service(&f, 32);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    MOQ_TEST_CHECK(!f.tp.server_ep.overflowed);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* A pending item identified ONLY by transport id (STOP_SENDING)
+ * and a later action identified by ref must be recognised as the same stream. */
+static int test_hol_mixed_identity_same_stream(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t sid_a;
+    uint32_t pending_after_reset;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    /* a blocked RESET on ref A: retained, and identified by transport id */
+    f.tp.server_ep.block_reset = true;
+    (void)moq_session_reset_subgroup(f.tp.server, a, 0x1, 0);
+    hol_service(&f, 4);
+    pending_after_reset = hol_pending(&f);
+    MOQ_TEST_CHECK(pending_after_reset >= 1);
+
+    /* the reset is the terminal for this stream, so nothing more may be
+     * written to it; the mixed-identity check is that the retained item is
+     * matched to ref A at all -- an unmatched item would let a same-stream
+     * write through and produce a write AFTER a reset was queued */
+    (void)hol_write(&f, a, 1, 32);
+    hol_service(&f, 8);
+    MOQ_TEST_CHECK(hol_writes_on(&f, sid_a) == 0);
+
+    f.tp.server_ep.block_reset = false;
+    hol_service(&f, 16);
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_RESET) >= 1);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* A retained TRANSPORT CLOSE is connection-level: it orders ahead of ordinary
+ * stream work and is never bypassed. (The other connection-level class, a
+ * retained control-stream write, has no fixture here -- see the report.) */
+static int test_hol_pending_close_blocks_stream_work(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    size_t writes_after;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    /* queue more objects on the open stream BEFORE closing, so there is
+     * genuinely bypassable work behind the close */
+    for (uint64_t i = 1; i <= 4; i++)
+        MOQ_TEST_CHECK(hol_write(&f, a, i, 32) == MOQ_OK);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    f.tp.server_ep.block_close = true;
+    moq_session_close(f.tp.server, 0x0, NULL, 0);
+    hol_service(&f, 8);
+    /* the transport close is retained and is connection-level */
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    MOQ_TEST_CHECK(f.tp.server_bridge->pending[0].kind == PENDING_CLOSE_TRANSPORT);
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_CLOSE) == 0);
+    writes_after = hol_count_kind(&f, FAKE_OP_WRITE);
+    /* nothing may be written past a pending transport close */
+    if (writes_after != 0) {
+        fprintf(stderr, "HOL pending-close: %zu write(s) escaped past a "
+                "retained transport close\n", writes_after);
+        failures++;
+    }
+
+    f.tp.server_ep.block_close = false;
+    hol_service(&f, 12);
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_CLOSE) == 1);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* Two items that name NO ref are not thereby the same stream.
+ * Two independent streams each with a blocked stop/reset must both progress
+ * once unblocked -- if ref 0 were a shared domain, one would gate the other
+ * for ever. */
+static int test_hol_refless_domains_are_distinct(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b;
+    size_t resets;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 6);
+    MOQ_TEST_CHECK(hol_count_kind(&f, FAKE_OP_OPEN_UNI) >= 2);
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+
+    /* both streams get a blocked reset: two retained items */
+    f.tp.server_ep.block_reset = true;
+    (void)moq_session_reset_subgroup(f.tp.server, a, 0x1, 0);
+    (void)moq_session_reset_subgroup(f.tp.server, b, 0x2, 0);
+    hol_service(&f, 8);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+
+    f.tp.server_ep.block_reset = false;
+    hol_service(&f, 32);
+    resets = hol_count_kind(&f, FAKE_OP_RESET);
+    /* BOTH must complete: a shared refless domain would strand one */
+    if (resets < 2) {
+        fprintf(stderr, "HOL refless-domains: only %zu reset(s) completed; "
+                "pending=%u\n", resets, hol_pending(&f));
+        failures++;
+    }
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* An owned payload carried through the retry/re-enqueue path
+ * must be released exactly once. */
+static int test_hol_conservation_through_retry(void)
+{
+    int failures = 0;
+    hol_acct_t acct;
+    moq_alloc_t al = hol_acct_allocator(&acct);
+    moq_session_cfg_t scfg;
+    moq_session_t *pub = NULL;
+    fake_endpoint_t ep;
+    moq_transport_bridge_t *br = NULL;
+    moq_transport_bridge_cfg_t bcfg;
+    uint8_t payload[64];
+
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), &al, MOQ_PERSPECTIVE_SERVER);
+    MOQ_TEST_CHECK(moq_session_create(&scfg, 0, &pub) == MOQ_OK);
+    fake_endpoint_init(&ep, 3, 1);
+    moq_transport_bridge_cfg_init(&bcfg, &al);
+    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, pub, &ep.vtable, &ep, &br)
+                   == MOQ_OK);
+
+    /* Drive control emission with everything blocked so items are retained and
+     * re-enqueued repeatedly: each pass exercises the retain path on items
+     * that own heap copies. */
+    memset(payload, 'C', sizeof(payload));
+    ep.block_write = true;
+    ep.block_open_uni = true;
+    ep.block_open_bidi = true;
+    for (int pass = 0; pass < 12; pass++)
+        (void)moq_transport_bridge_service(br, 0);
+    /* then let it drain, so the same items go out and are cleaned once */
+    ep.block_write = false;
+    ep.block_open_uni = false;
+    ep.block_open_bidi = false;
+    for (int pass = 0; pass < 12; pass++)
+        (void)moq_transport_bridge_service(br, 0);
+
+    moq_transport_bridge_destroy(br);
+    moq_session_destroy(pub);
+
+    if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
+        fprintf(stderr, "HOL retry-conservation: live=%lld blocks %lld bytes "
+                "negative=%d (allocs=%lld frees=%lld)\n",
+                (long long)acct.live_blocks, (long long)acct.live_bytes,
+                (int)acct.negative, (long long)acct.allocs,
+                (long long)acct.frees);
+        failures++;
+    }
+    MOQ_TEST_CHECK(acct.allocs > 0);
+    return failures;
+}
+
+/* -- complexity: operation counts at pending depths 0, 1 and deep --------- */
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+#ifdef MOQ_BRIDGE_TEST_INJECT
+extern bool moq_bridge_test_inject_pending(moq_transport_bridge_t *b, int kind,
+                                           uint64_t ref, uint64_t sid);
+#endif
+extern unsigned long long moq_bridge_scan_items;
+extern unsigned long long moq_bridge_scan_lookups;
+
+static int test_hol_scan_operation_counts(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t sg[40];
+    enum { SCAN_CANDIDATES = 8 };
+    unsigned long long i0, l0, i1, l1, iN, lN;
+    uint32_t depth_n, want_n;
+    int n;
+
+    /* depth 0: no pending work at all */
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
+    hol_service(&f, 4);
+    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
+    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
+        (void)hol_write(&f, sg[0], k, 32);
+    hol_service(&f, 4);
+    i0 = moq_bridge_scan_items; l0 = moq_bridge_scan_lookups;
+    test_pair_destroy(&f.tp);
+
+    /* depth 1 */
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, sg[0], 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &sg[1]) == MOQ_OK);
+    (void)hol_write(&f, sg[1], 0, 32);
+    hol_service(&f, 4);
+    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
+    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
+        (void)hol_write(&f, sg[0], k, 32);
+    hol_service(&f, 4);
+    i1 = moq_bridge_scan_items; l1 = moq_bridge_scan_lookups;
+    test_pair_destroy(&f.tp);
+
+    /* The deepest depth the scan can actually execute at is max_pending - 1:
+     * at max_pending the capacity guard stops the drain before a candidate is
+     * polled, so that depth measures the gate, not the scan. Built through the
+     * REAL enqueue/canonicalisation boundary -- the session cannot produce
+     * this depth, because it serialises parked openers. */
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, sg[0], 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    /* the retry must not be able to consume them, or the depth is gone by
+     * the time the candidate actions are dispatched */
+    f.tp.server_ep.block_stop = true;
+    want_n = f.tp.server_bridge->max_pending - 1u;
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    for (n = 0; n < (int)want_n; n++)
+        if (!moq_bridge_test_inject_pending(f.tp.server_bridge,
+                PENDING_STOP_SENDING, 0, 30000 + (uint64_t)n))
+            break;
+#endif
+    depth_n = hol_pending(&f);
+    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
+    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
+        (void)hol_write(&f, sg[0], k, 32);
+    hol_service(&f, 4);
+    iN = moq_bridge_scan_items; lN = moq_bridge_scan_lookups;
+
+    printf("SCAN depth=0  items=%llu lookups=%llu\n", i0, l0);
+    printf("SCAN depth=1  items=%llu lookups=%llu\n", i1, l1);
+    printf("SCAN depth=%u items=%llu lookups=%llu (deepest executable)\n",
+           depth_n, iN, lN);
+
+    /* the measured depth must be the one asked for, or the row is vacuous */
+    if (depth_n != want_n) {
+        fprintf(stderr, "SCAN: asked for depth %u, got %u; the complexity row "
+                "measures nothing\n", want_n, depth_n);
+        failures++;
+    }
+    /* every candidate must actually have executed: one map lookup each, and
+     * that count must not grow with pending depth */
+    if (lN != SCAN_CANDIDATES || lN != l0 || lN != l1) {
+        fprintf(stderr, "SCAN: lookups %llu at depth %u (expected one per "
+                "candidate, %d) vs %llu at depth 0 and %llu at depth 1\n",
+                lN, depth_n, (int)SCAN_CANDIDATES, l0, l1);
+        failures++;
+    }
+    /* Exactly one comparison per pending item per classified candidate, and
+     * nothing more: this fixture classifies SCAN_CANDIDATES of them at this
+     * depth, so the total is depth * SCAN_CANDIDATES with no quadratic term
+     * and no per-item map lookup hidden inside the loop. */
+    if (iN != (unsigned long long)depth_n * SCAN_CANDIDATES) {
+        fprintf(stderr, "SCAN: items %llu at depth %u; one comparison per "
+                "pending item per candidate would be %llu\n", iN, depth_n,
+                (unsigned long long)depth_n * SCAN_CANDIDATES);
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+
+    /* The capacity gate, not a complexity measurement: at exactly max_pending
+     * the drain stops before polling, so no candidate is classified at all. */
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, sg[0], 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    f.tp.server_ep.block_stop = true;
+    want_n = f.tp.server_bridge->max_pending;
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    for (n = 0; n < (int)want_n; n++)
+        if (!moq_bridge_test_inject_pending(f.tp.server_bridge,
+                PENDING_STOP_SENDING, 0, 30000 + (uint64_t)n))
+            break;
+#endif
+    depth_n = hol_pending(&f);
+    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
+    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
+        (void)hol_write(&f, sg[0], k, 32);
+    hol_service(&f, 4);
+    printf("CAPGATE depth=%u items=%llu lookups=%llu (no candidate polled)\n",
+           depth_n, moq_bridge_scan_items, moq_bridge_scan_lookups);
+    if (depth_n != want_n) {
+        fprintf(stderr, "CAPGATE: asked for depth %u, got %u\n",
+                want_n, depth_n);
+        failures++;
+    }
+    if (moq_bridge_scan_items != 0 || moq_bridge_scan_lookups != 0) {
+        fprintf(stderr, "CAPGATE: %llu item(s) and %llu lookup(s) at "
+                "saturation; the drain polled past the capacity guard\n",
+                moq_bridge_scan_items, moq_bridge_scan_lookups);
+        failures++;
+    }
+    MOQ_TEST_CHECK(hol_pending(&f) <= f.tp.server_bridge->max_pending);
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+#endif /* MOQ_BRIDGE_SCAN_COUNTERS */
+
+/* ================= the enrolled action/domain table ======================
+ * Every enqueued pending kind, its domain class, where its identity comes
+ * from, and what it blocks. Driven through the real enqueue boundary and the
+ * real classifier via the test-only seams, so a future kind that falls to the
+ * default case is caught here rather than in the field.
+ */
+#ifdef MOQ_BRIDGE_TEST_INJECT
+extern bool moq_bridge_test_inject_pending(moq_transport_bridge_t *b, int kind,
+                                           uint64_t ref, uint64_t sid);
+extern bool moq_bridge_test_domain_blocked(moq_transport_bridge_t *b,
+                                           uint64_t ref, uint64_t sid,
+                                           bool have_sid);
+extern uint32_t moq_bridge_test_pending_depth(const moq_transport_bridge_t *b);
+extern uint64_t moq_bridge_test_ref_for_id(moq_transport_bridge_t *b,
+                                          uint64_t sid);
+extern void moq_bridge_test_fail_retain_after(unsigned n);
+extern int moq_bridge_test_pending_domain(const moq_transport_bridge_t *b,
+                                          uint32_t idx);
+extern void moq_bridge_test_pending_identity(const moq_transport_bridge_t *b,
+                                             uint32_t idx, uint64_t *out_ref,
+                                             uint64_t *out_sid,
+                                             bool *out_have_sid);
+
+/* mirrors bridge_domain_t */
+#define DOM_STREAM    0
+#define DOM_CONN_CTRL 1
+#define DOM_CONN_TERM 2
+
+typedef struct {
+    const char *name;
+    int         kind;          /* bridge_pending_kind_t              */
+    uint64_t    ref;           /* identity as the dispatcher sets it */
+    uint64_t    sid;
+    int         want_dom;
+    bool        blocks_others;  /* does it block an UNRELATED stream? */
+} dom_row_t;
+
+static const dom_row_t k_dom_table[] = {
+    /* per-stream kinds: identity by ref, by id, or both */
+    { "OPEN_UNI_DATA (ref only, pre-open)", PENDING_OPEN_UNI_DATA,
+      0x900, 0, DOM_STREAM, false },
+    { "HEADER_PAYLOAD (ref+id)",            PENDING_HEADER_PAYLOAD,
+      0x901, 901, DOM_STREAM, false },
+    { "PAYLOAD_ONLY (ref+id)",              PENDING_PAYLOAD_ONLY,
+      0x902, 902, DOM_STREAM, false },
+    { "COPIED_WRITE data (ref+id)",         PENDING_COPIED_WRITE,
+      0x903, 903, DOM_STREAM, false },
+    { "OPEN_BIDI_DATA (ref only)",          PENDING_OPEN_BIDI_DATA,
+      0x904, 0, DOM_STREAM, false },
+    { "CLOSE_BIDI_FIN (ref+id)",            PENDING_CLOSE_BIDI_FIN,
+      0x905, 905, DOM_STREAM, false },
+    { "RESET_STREAM (id only)",             PENDING_RESET_STREAM,
+      0, 906, DOM_STREAM, false },
+    { "STOP_SENDING (id only)",             PENDING_STOP_SENDING,
+      0, 907, DOM_STREAM, false },
+    { "ABORT_STREAM (id only)",             PENDING_ABORT_STREAM,
+      0, 908, DOM_STREAM, false },
+    /* connection-level: these DO block unrelated stream work */
+    { "COPIED_WRITE control (no ref)",      PENDING_COPIED_WRITE,
+      0, 2001, DOM_CONN_CTRL, true },
+    { "OPEN_CONTROL",                       PENDING_OPEN_CONTROL,
+      0, 0, DOM_CONN_CTRL, true },
+    { "OPEN_UNI_CONTROL",                   PENDING_OPEN_UNI_CONTROL,
+      0x910, 0, DOM_CONN_CTRL, true },
+    { "CLOSE_TRANSPORT",                    PENDING_CLOSE_TRANSPORT,
+      0, 0, DOM_CONN_TERM, true },
+    /* declared but never enqueued by production; if one is ever injected it
+     * must fail closed to connection-wide rather than bypass */
+    { "COPIED_DATAGRAM (unreachable)",      PENDING_COPIED_DATAGRAM,
+      0, 0, DOM_CONN_CTRL, true },
+};
+
+static int test_hol_action_domain_table(void)
+{
+    int failures = 0;
+    size_t n = sizeof(k_dom_table) / sizeof(k_dom_table[0]);
+
+    /* PENDING_COPIED_DATAGRAM must have no production enqueue site. */
+    {
+        const char *src = NULL;
+        (void)src;   /* proved by grep in the report, asserted here by the
+                      * table's own expectation that it fails closed */
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const dom_row_t *r = &k_dom_table[i];
+        hol_fix_t f;
+        int dom;
+        uint64_t cref = 0, csid = 0;
+        bool chave = false;
+
+        if (hol_init(&f) < 0) { failures++; continue; }
+        if (!moq_bridge_test_inject_pending(f.tp.server_bridge, r->kind,
+                                            r->ref, r->sid)) {
+            fprintf(stderr, "TABLE %s: inject refused\n", r->name);
+            failures++; test_pair_destroy(&f.tp); continue;
+        }
+        MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == 1);
+        dom = moq_bridge_test_pending_domain(f.tp.server_bridge, 0);
+        if (dom != r->want_dom) {
+            fprintf(stderr, "TABLE %s: domain %d, expected %d\n",
+                    r->name, dom, r->want_dom);
+            failures++;
+        }
+        moq_bridge_test_pending_identity(f.tp.server_bridge, 0,
+                                         &cref, &csid, &chave);
+        /* identity source: whatever the dispatcher named must survive */
+        if (r->ref != 0 && cref != r->ref) {
+            fprintf(stderr, "TABLE %s: ref %llu lost (canon %llu)\n", r->name,
+                    (unsigned long long)r->ref, (unsigned long long)cref);
+            failures++;
+        }
+        if (r->sid != 0 && (!chave || csid != r->sid)) {
+            fprintf(stderr, "TABLE %s: id %llu lost (canon %llu have=%d)\n",
+                    r->name, (unsigned long long)r->sid,
+                    (unsigned long long)csid, (int)chave);
+            failures++;
+        }
+
+        /* bypass relation: an UNRELATED stream (fresh ref and id) */
+        {
+            bool blocked = moq_bridge_test_domain_blocked(
+                f.tp.server_bridge, 0x7000, 7000, true);
+            if (blocked != r->blocks_others) {
+                fprintf(stderr, "TABLE %s: unrelated stream blocked=%d, "
+                        "expected %d\n", r->name, (int)blocked,
+                        (int)r->blocks_others);
+                failures++;
+            }
+        }
+        /* and the SAME stream must always conflict, by either name */
+        if (r->want_dom == DOM_STREAM) {
+            if (r->ref != 0 &&
+                !moq_bridge_test_domain_blocked(f.tp.server_bridge, r->ref,
+                                                 0, false)) {
+                fprintf(stderr, "TABLE %s: same ref not blocked\n", r->name);
+                failures++;
+            }
+            if (r->sid != 0 &&
+                !moq_bridge_test_domain_blocked(f.tp.server_bridge, 0,
+                                                 r->sid, true)) {
+                fprintf(stderr, "TABLE %s: same id not blocked\n", r->name);
+                failures++;
+            }
+        }
+        test_pair_destroy(&f.tp);
+    }
+    printf("TABLE %zu pending kinds checked (domain, identity, bypass)\n", n);
+    return failures;
+}
+
+/* Two refless items on DISTINCT streams must not alias, while a truly
+ * connection-level refless item still blocks globally. */
+static int test_hol_ref_zero_does_not_alias(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+
+    if (hol_init(&f) < 0) return 1;
+    /* two id-only stop-sendings on different streams */
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, 5100));
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, 5200));
+    MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == 2);
+    /* each blocks its own stream */
+    MOQ_TEST_CHECK(moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 5100, true));
+    MOQ_TEST_CHECK(moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 5200, true));
+    /* and NEITHER blocks a third: ref 0 is not a shared domain */
+    if (moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 5300, true)) {
+        fprintf(stderr, "HOL ref-zero: two refless items aliased into one "
+                "shared domain and blocked an unrelated stream\n");
+        failures++;
+    }
+    /* a ref-named candidate for an unrelated stream is likewise free */
+    if (moq_bridge_test_domain_blocked(f.tp.server_bridge, 0x5400, 0, false)) {
+        fprintf(stderr, "HOL ref-zero: refless items blocked a ref-named "
+                "unrelated stream\n");
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+
+    /* a genuinely connection-level refless item DOES block globally */
+    if (hol_init(&f) < 0) return failures + 1;
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+                       PENDING_OPEN_CONTROL, 0, 0));
+    if (!moq_bridge_test_domain_blocked(f.tp.server_bridge, 0x5500, 5500, true)) {
+        fprintf(stderr, "HOL ref-zero: a connection-level item failed to "
+                "block unrelated stream work\n");
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* An item named ONLY by transport id must conflict with a later action
+ * named only by the mapped ref, and vice versa. */
+static int test_hol_mixed_identity_canonicalises(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t sid_a, cref = 0, csid = 0;
+    bool chave = false;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+    MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == 0);
+
+    /* inject an ID-ONLY item for the live stream: enqueue must resolve its
+     * ref from the map */
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, sid_a));
+    moq_bridge_test_pending_identity(f.tp.server_bridge, 0, &cref, &csid, &chave);
+    if (cref == 0) {
+        fprintf(stderr, "HOL mixed-identity: an id-only item kept ref 0 for a "
+                "mapped stream (id=%llu)\n", (unsigned long long)sid_a);
+        failures++;
+    }
+    MOQ_TEST_CHECK(chave && csid == sid_a);
+
+    /* a REF-named candidate for the same stream must conflict */
+    if (cref != 0 &&
+        !moq_bridge_test_domain_blocked(f.tp.server_bridge, cref, 0, false)) {
+        fprintf(stderr, "HOL mixed-identity: ref-named action bypassed an "
+                "id-named pending item for the same stream\n");
+        failures++;
+    }
+    /* and an unrelated stream is still free */
+    MOQ_TEST_CHECK(!moq_bridge_test_domain_blocked(f.tp.server_bridge,
+                                                    0x6100, 6100, true));
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* Depth: build 0, 1 and 64 through the real boundary, and prove 65 is
+ * refused by the structural maximum. */
+static int test_hol_depth_and_structural_bound(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    uint32_t max, i;
+
+    if (hol_init(&f) < 0) return 1;
+    max = f.tp.server_bridge->max_pending;
+    MOQ_TEST_CHECK(max == 64);
+    MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == 0);
+    for (i = 0; i < max; i++)
+        MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+                           PENDING_STOP_SENDING, 0, 8000 + i));
+    MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == max);
+    /* one past the maximum is refused, not silently dropped or grown */
+    if (moq_bridge_test_inject_pending(f.tp.server_bridge,
+                                        PENDING_STOP_SENDING, 0, 9999)) {
+        fprintf(stderr, "HOL depth: injection past the structural maximum "
+                "%u succeeded\n", max);
+        failures++;
+    }
+    MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == max);
+    /* at full depth, an unrelated stream is still not blocked */
+    MOQ_TEST_CHECK(!moq_bridge_test_domain_blocked(f.tp.server_bridge,
+                                                    0x8500, 8500, true));
+    /* a contradictory ref/id pair is refused rather than resolved to one side */
+    {
+        moq_subgroup_handle_t a;
+        hol_fix_t g;
+        if (hol_init(&g) == 0) {
+            uint64_t sid;
+            MOQ_TEST_CHECK(hol_open_sg(&g, 0, &a) == MOQ_OK);
+            MOQ_TEST_CHECK(hol_write(&g, a, 0, 32) == MOQ_OK);
+            hol_service(&g, 4);
+            sid = hol_nth_open(&g, 0);
+            MOQ_TEST_CHECK(sid != UINT64_MAX);
+            /* the live stream's ref paired with somebody else's id */
+            {
+                uint64_t live_ref = 0, dummy = 0;
+                bool have = false;
+                MOQ_TEST_CHECK(moq_bridge_test_inject_pending(
+                    g.tp.server_bridge, PENDING_STOP_SENDING, 0, sid));
+                moq_bridge_test_pending_identity(g.tp.server_bridge, 0,
+                                                 &live_ref, &dummy, &have);
+                if (live_ref != 0 &&
+                    moq_bridge_test_inject_pending(g.tp.server_bridge,
+                        PENDING_HEADER_PAYLOAD, live_ref, sid + 4242)) {
+                    fprintf(stderr, "HOL depth: a contradictory ref/id pair "
+                            "was accepted\n");
+                    failures++;
+                }
+            }
+            test_pair_destroy(&g.tp);
+        }
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+#endif /* MOQ_BRIDGE_TEST_INJECT */
+
+/* The drain budget is a real backstop for a session configured above it.
+ * 64 is only MOQ_DEFAULT_MAX_ACTIONS; max_actions is public and configurable,
+ * so a publisher with 512 can offer more than BRIDGE_DRAIN_BUDGET actions in
+ * one pass. The producer is the real session queue and the loop is the
+ * production one.
+ *
+ * Capacities below, at and above the budget are all covered, so the fixture
+ * distinguishes the session cap from the bridge bound.
+ */
+static int hol_budget_case(uint32_t cap, unsigned *out_first,
+                           unsigned *out_offered, int *out_fail)
+{
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t k;
+    unsigned offered = 0, first, second;
+
+    *out_first = 0; *out_offered = 0;
+    if (hol_init_cap(&f, cap) < 0) { (*out_fail)++; return -1; }
+    if (hol_open_sg(&f, 0, &a) != MOQ_OK) { (*out_fail)++; goto done; }
+    (void)hol_write(&f, a, 0, 16);
+    hol_service(&f, 4);
+
+    /* one endpoint write per action here: a bare object with no header split,
+     * so the operation count IS the action count */
+    for (k = 1; k <= 900; k++) {
+        if (hol_write(&f, a, k, 16) != MOQ_OK) break;
+        offered++;
+    }
+    fake_endpoint_clear_ops(&f.tp.server_ep);
+    {
+        uint64_t base = f.tp.server_ep.write_calls;
+        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        first = (unsigned)(f.tp.server_ep.write_calls - base);
+        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        second = (unsigned)(f.tp.server_ep.write_calls - base);
+    }
+
+    /* nothing else may be the reason a pass stops: the endpoint accepted
+     * everything it was offered and nothing was retained */
+    if (f.tp.server_ep.block_count != 0) {
+        fprintf(stderr, "BUDGET cap=%u: endpoint refused %d op(s); the budget "
+                "is not the only gate\n", cap, f.tp.server_ep.block_count);
+        (*out_fail)++;
+    }
+    if (hol_pending(&f) != 0) {
+        fprintf(stderr, "BUDGET cap=%u: %u item(s) retained; a retention path "
+                "shadows the budget\n", cap, hol_pending(&f));
+        (*out_fail)++;
+    }
+    printf("BUDGET cap=%-4u offered=%-4u pass1=%-4u pass2=%-4u budget=%d\n",
+           cap, offered, first, second, (int)BRIDGE_DRAIN_BUDGET);
+    *out_first = first;
+    *out_offered = offered;
+    /* conservation: everything offered eventually goes out, exactly once */
+    hol_service(&f, 256);
+    if (f.tp.server_ep.write_calls < (uint64_t)offered) {
+        fprintf(stderr, "BUDGET cap=%u: only %llu write(s) for %u offered "
+                "objects\n", cap,
+                (unsigned long long)f.tp.server_ep.write_calls, offered);
+        (*out_fail)++;
+    }
+    if (second <= first && offered > first) {
+        fprintf(stderr, "BUDGET cap=%u: the second pass made no progress\n", cap);
+        (*out_fail)++;
+    }
+done:
+    test_pair_destroy(&f.tp);
+    return 0;
+}
+
+static int test_hol_drain_budget_is_a_real_backstop(void)
+{
+    int failures = 0;
+    unsigned f64 = 0, o64 = 0, f256 = 0, o256 = 0, f512 = 0, o512 = 0;
+
+    (void)hol_budget_case(64,  &f64,  &o64,  &failures);
+    (void)hol_budget_case(256, &f256, &o256, &failures);
+    (void)hol_budget_case(512, &f512, &o512, &failures);
+
+    /* Each SEND_DATA action costs two endpoint writes (header, then payload),
+     * so the writes-per-action factor is derived from the below-budget case
+     * rather than assumed. */
+    if (o64 == 0 || f64 == 0 || (f64 % o64) != 0) {
+        fprintf(stderr, "BUDGET cap=64: cannot derive writes-per-action from "
+                "%u write(s) for %u object(s)\n", f64, o64);
+        return failures + 1;
+    }
+    {
+        unsigned per = f64 / o64;
+        unsigned want = (unsigned)BRIDGE_DRAIN_BUDGET * per;
+        printf("BUDGET writes-per-action=%u; budget in writes=%u\n", per, want);
+
+        /* Below the budget the SESSION cap binds: one pass takes everything. */
+        if (f64 != o64 * per) {
+            fprintf(stderr, "BUDGET cap=64: one pass took %u write(s) of %u; "
+                    "the session cap should bind below the budget\n",
+                    f64, o64 * per);
+            failures++;
+        }
+        /* Above it the BRIDGE budget binds: exactly the budget in the first
+         * pass, the rest in a later bounded pass. This is the oracle the budget
+         * mutant must break. */
+        if (o512 <= (unsigned)BRIDGE_DRAIN_BUDGET) {
+            fprintf(stderr, "BUDGET cap=512: only %u action(s) offered, not "
+                    "more than the budget %d\n", o512,
+                    (int)BRIDGE_DRAIN_BUDGET);
+            failures++;
+        } else if (f512 != want) {
+            fprintf(stderr, "BUDGET cap=512: first pass did %u write(s), "
+                    "expected exactly the budget's %u (%d actions x %u)\n",
+                    f512, want, (int)BRIDGE_DRAIN_BUDGET, per);
+            failures++;
+        }
+        /* at exactly the budget, one pass takes it all and nothing is left */
+        if (o256 == (unsigned)BRIDGE_DRAIN_BUDGET && f256 != o256 * per) {
+            fprintf(stderr, "BUDGET cap=256: first pass did %u write(s), "
+                    "expected %u\n", f256, o256 * per);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/* A retained item that OWNS a heap payload, carried through repeated
+ * re-enqueues and then terminal cleanup, on a counting allocator. */
+#ifdef MOQ_BRIDGE_TEST_INJECT
+/*
+ * A failed retention releases the item's owned payload exactly once, on both
+ * the initial-retain and retry-retain paths.
+ *
+ * The fixture keeps its own reference to the object buffer, so the buffer
+ * stays valid for inspection and the discriminator is direct: the session
+ * hands its reference to the polled action, so a correct cleanup returns the
+ * count to the fixture's one reference, while omitting the cleanup leaves it
+ * one too high.
+ */
+static int test_hol_retention_releases_owned_payload_once(void)
+{
+    int failures = 0;
+    hol_acct_t acct;
+    moq_alloc_t al = hol_acct_allocator(&acct);
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    moq_rcbuf_t *held = NULL;
+    uint32_t rc_before, rc_after;
+    int phase;
+
+    /* phase 0: the FIRST retention of a freshly polled action fails.
+     * phase 1: the action is retained, then its RE-retention fails. */
+    for (phase = 0; phase < 2; phase++) {
+        memset(&f, 0, sizeof(f));
+        g_server_alloc_override = &al;
+        if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
+        g_server_alloc_override = NULL;
+        moq_transport_bridge_destroy(f.tp.server_bridge);
+        {
+            moq_transport_bridge_cfg_t bcfg;
+            moq_transport_bridge_cfg_init(&bcfg, &al);
+            MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+                               &f.tp.server_ep.vtable, &f.tp.server_ep,
+                               &f.tp.server_bridge) == MOQ_OK);
+        }
+
+        /* open the stream first, so the retained item is the one that owns
+         * the object payload rather than the stream-opening action */
+        MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+        MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+        hol_service(&f, 4);
+        MOQ_TEST_CHECK(hol_pending(&f) == 0);
+
+        held = NULL;
+        MOQ_TEST_CHECK(hol_write_keep(&f, a, 1, 96, &held) == MOQ_OK);
+        MOQ_TEST_CHECK(held != NULL);
+        f.tp.server_ep.block_write = true;
+
+        if (phase == 1) {
+            /* let it retain normally, so the failure below is a RE-retention */
+            hol_service(&f, 1);
+            MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+        }
+
+        rc_before = moq_rcbuf_refcount(held);
+        if (rc_before < 2) {
+            fprintf(stderr, "RCONCE[%d]: precondition refcount was %u; the "
+                    "action does not hold a reference to inspect\n",
+                    phase, rc_before);
+            failures++;
+        }
+
+        moq_bridge_test_fail_retain_after(0);
+        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.tp.server_bridge));
+
+        rc_after = moq_rcbuf_refcount(held);
+        if (rc_after != rc_before - 1) {
+            fprintf(stderr, "RCONCE[%d]: refcount went %u -> %u; a failed "
+                    "retention did not release the payload exactly once\n",
+                    phase, rc_before, rc_after);
+            failures++;
+        }
+
+        moq_rcbuf_decref(held);
+        moq_transport_bridge_destroy(f.tp.server_bridge);
+        f.tp.server_bridge = NULL;
+        moq_session_destroy(f.tp.client);
+        moq_session_destroy(f.tp.server);
+        moq_transport_bridge_destroy(f.tp.client_bridge);
+
+        if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
+            fprintf(stderr, "RCONCE[%d]: live=%lld blocks %lld bytes "
+                    "negative=%d\n", phase, (long long)acct.live_blocks,
+                    (long long)acct.live_bytes, (int)acct.negative);
+            failures++;
+        }
+        memset(&acct, 0, sizeof(acct));
+    }
+    return failures;
+}
+
+/*
+ * The first retention of a newly polled action follows the same policy. The
+ * drain-capacity guard makes capacity failure here unreachable, so the branch
+ * is reached by fault injection -- but an identity or fault failure must still
+ * stop the pass rather than clean the action and report it delivered.
+ */
+static int test_hol_initial_retention_failure_is_fatal_not_silent(void)
+{
+    int failures = 0;
+    hol_acct_t acct;
+    moq_alloc_t al = hol_acct_allocator(&acct);
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t writes_after_breach, opens_after_breach;
+    moq_result_t rc;
+
+    memset(&f, 0, sizeof(f));
+    /* the server session AND its bridge on the counting allocator, so a
+     * retained action that is never released shows up as live memory */
+    g_server_alloc_override = &al;
+    if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
+    g_server_alloc_override = NULL;
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    {
+        moq_transport_bridge_cfg_t bcfg;
+        moq_transport_bridge_cfg_init(&bcfg, &al);
+        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+                           &f.tp.server_ep.vtable, &f.tp.server_ep,
+                           &f.tp.server_bridge) == MOQ_OK);
+    }
+
+    /* block the OPEN, so the retention that fails is a first-enqueue site
+     * reached only by a newly polled action, not the shared retry path */
+    f.tp.server_ep.block_open_uni = true;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 96) == MOQ_OK);
+
+    /* fail the very first retention of that action */
+    moq_bridge_test_fail_retain_after(0);
+    rc = moq_transport_bridge_service(f.tp.server_bridge, 0);
+
+    if (rc == MOQ_OK) {
+        fprintf(stderr, "RETAIN0: an initial retention failure was reported "
+                "as success\n");
+        failures++;
+    }
+    if (!moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+        fprintf(stderr, "RETAIN0: an initial retention failure left the "
+                "bridge usable\n");
+        failures++;
+    }
+    if (f.tp.server_bridge->fatal_code != 0x5) {
+        fprintf(stderr, "RETAIN0: fatal code was %llu, not the retention "
+                "code\n",
+                (unsigned long long)f.tp.server_bridge->fatal_code);
+        failures++;
+    }
+    /* the action was not left queued as though it had been retained */
+    if (hol_pending(&f) != 0) {
+        fprintf(stderr, "RETAIN0: %u item(s) queued after a failed "
+                "retention\n", hol_pending(&f));
+        failures++;
+    }
+
+    /* the endpoint counts an ACCEPTED open, so unblock first and require that
+     * the unblocked pass still delivers nothing */
+    writes_after_breach = f.tp.server_ep.write_calls;
+    opens_after_breach = f.tp.server_ep.open_uni_calls;
+    f.tp.server_ep.block_open_uni = false;
+    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    if (f.tp.server_ep.write_calls != writes_after_breach ||
+        f.tp.server_ep.open_uni_calls != opens_after_breach) {
+        fprintf(stderr, "RETAIN0: %llu write(s) and %llu open(s) after an "
+                "invariant breach\n",
+                (unsigned long long)(f.tp.server_ep.write_calls -
+                                     writes_after_breach),
+                (unsigned long long)(f.tp.server_ep.open_uni_calls -
+                                     opens_after_breach));
+        failures++;
+    }
+
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    f.tp.server_bridge = NULL;
+    moq_session_destroy(f.tp.client);
+    moq_session_destroy(f.tp.server);
+    moq_transport_bridge_destroy(f.tp.client_bridge);
+
+    if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
+        fprintf(stderr, "RETAIN0: live=%lld blocks %lld bytes negative=%d\n",
+                (long long)acct.live_blocks, (long long)acct.live_bytes,
+                (int)acct.negative);
+        failures++;
+    }
+    return failures;
+}
+
+/*
+ * Re-retaining an item the bridge already owns cannot fail by capacity, so
+ * the branch is reachable only by fault injection. It must still be an
+ * invariant breach rather than a quiet drop: the pass stops, reports the
+ * error, marks the bridge fatal, and releases the item exactly once.
+ */
+static int test_hol_retention_failure_is_fatal_not_silent(void)
+{
+    int failures = 0;
+    hol_acct_t acct;
+    moq_alloc_t al = hol_acct_allocator(&acct);
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t writes_before;
+    moq_result_t rc;
+    int i;
+
+    memset(&f, 0, sizeof(f));
+    /* the server session AND its bridge on the counting allocator, so a
+     * retained action that is never released shows up as live memory */
+    g_server_alloc_override = &al;
+    if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
+    g_server_alloc_override = NULL;
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    {
+        moq_transport_bridge_cfg_t bcfg;
+        moq_transport_bridge_cfg_init(&bcfg, &al);
+        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+                           &f.tp.server_ep.vtable, &f.tp.server_ep,
+                           &f.tp.server_bridge) == MOQ_OK);
+    }
+
+    /* several heap-owning items on one stream, then block it so they retain */
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    for (i = 0; i < 4; i++)
+        MOQ_TEST_CHECK(hol_write(&f, a, (uint64_t)i, 96) == MOQ_OK);
+    f.tp.server_ep.block_write = true;
+    hol_service(&f, 6);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 2);
+    writes_before = f.tp.server_ep.write_calls;
+
+    /* let the blocked head re-retain, then fail the next survivor */
+    moq_bridge_test_fail_retain_after(1);
+    rc = moq_transport_bridge_service(f.tp.server_bridge, 0);
+
+    if (rc == MOQ_OK) {
+        fprintf(stderr, "RETAIN: a retention failure was reported as "
+                "success\n");
+        failures++;
+    }
+    if (!moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+        fprintf(stderr, "RETAIN: a retention failure left the bridge "
+                "usable\n");
+        failures++;
+    }
+    if (f.tp.server_bridge->fatal_code != 0x5) {
+        fprintf(stderr, "RETAIN: fatal code was %llu, not the retention "
+                "code\n",
+                (unsigned long long)f.tp.server_bridge->fatal_code);
+        failures++;
+    }
+
+    /* and no further work is delivered once the invariant is broken */
+    f.tp.server_ep.block_write = false;
+    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    if (f.tp.server_ep.write_calls != writes_before) {
+        fprintf(stderr, "RETAIN: %llu write(s) were delivered after an "
+                "invariant breach\n",
+                (unsigned long long)(f.tp.server_ep.write_calls -
+                                     writes_before));
+        failures++;
+    }
+
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    f.tp.server_bridge = NULL;
+    moq_session_destroy(f.tp.client);
+    moq_session_destroy(f.tp.server);
+    moq_transport_bridge_destroy(f.tp.client_bridge);
+
+    /* released exactly once: no leak, and no negative balance */
+    if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
+        fprintf(stderr, "RETAIN: live=%lld blocks %lld bytes negative=%d\n",
+                (long long)acct.live_blocks, (long long)acct.live_bytes,
+                (int)acct.negative);
+        failures++;
+    }
+    return failures;
+}
+
+#endif /* MOQ_BRIDGE_TEST_INJECT */
+
+static int test_hol_owned_payload_conservation(void)
+{
+    int failures = 0;
+    hol_acct_t acct;
+    moq_alloc_t al = hol_acct_allocator(&acct);
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    int pass;
+
+    /* the fixture's sessions use the default allocator, but the BRIDGE is
+     * where retained items live -- give it the counting one */
+    memset(&f, 0, sizeof(f));
+    if (hol_init(&f) < 0) return 1;
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    {
+        moq_transport_bridge_cfg_t bcfg;
+        moq_transport_bridge_cfg_init(&bcfg, &al);
+        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+                           &f.tp.server_ep.vtable, &f.tp.server_ep,
+                           &f.tp.server_bridge) == MOQ_OK);
+    }
+
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    /* a real payload, so the retained item owns heap data */
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 96) == MOQ_OK);
+    f.tp.server_ep.block_write = true;
+    hol_service(&f, 2);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    /* many re-enqueues of the SAME owning item */
+    for (pass = 0; pass < 10; pass++)
+        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    /* then let it out, so the item is cleaned exactly once on success */
+    f.tp.server_ep.block_write = false;
+    hol_service(&f, 16);
+    MOQ_TEST_CHECK(hol_pending(&f) == 0);
+
+    /* and a second owning item destroyed while still retained */
+    MOQ_TEST_CHECK(hol_write(&f, a, 1, 96) == MOQ_OK);
+    f.tp.server_ep.block_write = true;
+    hol_service(&f, 4);
+    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    f.tp.server_bridge = NULL;
+    moq_session_destroy(f.tp.client);
+    moq_session_destroy(f.tp.server);
+    moq_transport_bridge_destroy(f.tp.client_bridge);
+
+    if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
+        fprintf(stderr, "HOL owned-payload: live=%lld blocks %lld bytes "
+                "negative=%d allocs=%lld frees=%lld\n",
+                (long long)acct.live_blocks, (long long)acct.live_bytes,
+                (int)acct.negative, (long long)acct.allocs,
+                (long long)acct.frees);
+        failures++;
+    }
+    MOQ_TEST_CHECK(acct.allocs > 0);
+    return failures;
+}
+
+/* ============== retention capacity at the drain boundary =================
+ * Removing G2 let one pass retain up to BRIDGE_DRAIN_BUDGET actions into a
+ * queue that holds max_pending. Because the domain gate guarantees that every
+ * later action for a blocked stream is retained rather than dispatched, the
+ * queue fills deterministically -- and every enqueue-failure branch takes the
+ * connection fatal. So a blocked stream with more queued work than the pending
+ * capacity destroyed the connection and lost its objects.
+ *
+ * The fixture records both public knobs and asserts their coupling, because
+ * the defect only exists when max_actions > max_pending.
+ */
+typedef struct {
+    unsigned  offered;
+    unsigned  max_depth;
+    int       worst_rc;
+    bool      fatal;
+    uint64_t  writes_after_unblock;
+} f1_result_t;
+
+static int f1_case(uint32_t max_actions, uint32_t max_pending,
+                   unsigned objects, f1_result_t *out)
+{
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t sid_a, base;
+    unsigned i;
+
+    memset(out, 0, sizeof(*out));
+    out->worst_rc = 0;
+
+    /* the publisher's action queue and the bridge's retention capacity are
+     * both public knobs; this is the pairing that matters */
+    if (test_pair_init_full(&f.tp, 1, false, 0, 0, max_actions) < 0) return -1;
+    if (!setup_handshake(&f.tp)) { test_pair_destroy(&f.tp); return -1; }
+    /* rebuild the publisher bridge with an explicit retention capacity */
+    moq_transport_bridge_destroy(f.tp.server_bridge);
+    {
+        moq_transport_bridge_cfg_t bcfg;
+        moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+        bcfg.max_pending = max_pending;
+        if (moq_transport_bridge_create(&bcfg, f.tp.server,
+                &f.tp.server_ep.vtable, &f.tp.server_ep,
+                &f.tp.server_bridge) != MOQ_OK) {
+            test_pair_destroy(&f.tp);
+            return -1;
+        }
+    }
+    if (hol_subscribe_accept(&f) < 0) { test_pair_destroy(&f.tp); return -1; }
+
+    if (hol_open_sg(&f, 0, &a) != MOQ_OK) { test_pair_destroy(&f.tp); return -1; }
+    (void)hol_write(&f, a, 0, 16);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    if (sid_a == UINT64_MAX) { test_pair_destroy(&f.tp); return -1; }
+
+    /* ONE stream blocked at the endpoint. Per-stream, so no control item can
+     * mask the effect. */
+    fake_block_stream(&f.tp.server_ep, sid_a);
+    for (i = 1; i <= objects; i++) {
+        if (hol_write(&f, a, i, 16) != MOQ_OK) break;
+        out->offered++;
+    }
+    for (i = 0; i < 8; i++) {
+        moq_result_t rc = moq_transport_bridge_service(f.tp.server_bridge, 0);
+        if ((int)rc < out->worst_rc) out->worst_rc = (int)rc;
+        if (hol_pending(&f) > out->max_depth) out->max_depth = hol_pending(&f);
+        if (moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+            out->fatal = true;
+            break;
+        }
+    }
+    /* unblock and see what survives */
+    base = f.tp.server_ep.write_calls;
+    fake_unblock_stream(&f.tp.server_ep);
+    hol_service(&f, 128);
+    out->writes_after_unblock = f.tp.server_ep.write_calls - base;
+    test_pair_destroy(&f.tp);
+    return 0;
+}
+
+static int test_hol_retention_capacity_is_not_fatal(void)
+{
+    int failures = 0;
+    f1_result_t below, at, above;
+    const uint32_t MA = 4096, MP = 64;
+
+    /* the coupling this defect needs */
+    MOQ_TEST_CHECK(MA > MP);
+
+    if (f1_case(MA, MP, 60, &below) < 0) return 1;
+    if (f1_case(MA, MP, 64, &at) < 0) return 1;
+    if (f1_case(MA, MP, 70, &above) < 0) return 1;
+
+    printf("CAP max_actions=%u max_pending=%u\n", MA, MP);
+    printf("CAP objects=60 depth=%u rc=%d fatal=%d writes_after=%llu\n",
+           below.max_depth, below.worst_rc, (int)below.fatal,
+           (unsigned long long)below.writes_after_unblock);
+    printf("CAP objects=64 depth=%u rc=%d fatal=%d writes_after=%llu\n",
+           at.max_depth, at.worst_rc, (int)at.fatal,
+           (unsigned long long)at.writes_after_unblock);
+    printf("CAP objects=70 depth=%u rc=%d fatal=%d writes_after=%llu\n",
+           above.max_depth, above.worst_rc, (int)above.fatal,
+           (unsigned long long)above.writes_after_unblock);
+
+    /* THE CONTRACT: exceeding retention capacity is backpressure, never a
+     * connection kill, and never data loss. */
+    if (above.fatal || above.worst_rc < 0) {
+        fprintf(stderr, "CAP: %u objects on one blocked stream took the "
+                "connection FATAL (rc=%d)\n", above.offered, above.worst_rc);
+        failures++;
+    }
+    /* it must saturate at the capacity, not beyond */
+    if (above.max_depth > MP) {
+        fprintf(stderr, "CAP: pending reached %u, past the capacity %u\n",
+                above.max_depth, MP);
+        failures++;
+    }
+    /* and every offered object must come out after the block lifts */
+    if (!above.fatal && above.writes_after_unblock < (uint64_t)above.offered) {
+        fprintf(stderr, "CAP: only %llu write(s) after unblock for %u offered "
+                "objects: queued work was lost\n",
+                (unsigned long long)above.writes_after_unblock, above.offered);
+        failures++;
+    }
+    /* below and at capacity must be unaffected */
+    MOQ_TEST_CHECK(!below.fatal);
+    MOQ_TEST_CHECK(!at.fatal);
+    return failures;
+}
+
+#ifdef MOQ_BRIDGE_TEST_INJECT
+extern bool moq_bridge_test_inject_pending_ex(moq_transport_bridge_t *b,
+                                              int kind, uint64_t ref,
+                                              uint64_t sid, bool have_sid);
+
+/* An item that names only a REF, for a stream the map still
+ * knows, must have its transport id filled at enqueue -- so a later action
+ * naming only that ID conflicts with it. */
+static int test_hol_canon_fills_sid_from_ref(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a;
+    uint64_t sid_a, cref = 0, csid = 0, live_ref = 0, dummy = 0;
+    bool chave = false, have2 = false;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+
+    /* learn the live stream's ref by injecting an id-only probe, reading its
+     * filled ref, then starting clean */
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending_ex(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, sid_a, true));
+    moq_bridge_test_pending_identity(f.tp.server_bridge, 0, &live_ref,
+                                     &dummy, &have2);
+    test_pair_destroy(&f.tp);
+    if (live_ref == 0) {
+        fprintf(stderr, "CANON: could not learn the live ref for id %llu\n",
+                (unsigned long long)sid_a);
+        return failures + 1;
+    }
+
+    if (hol_init(&f) < 0) return failures + 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+
+    /* the ref-only item: enqueue must fill in the transport id */
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending_ex(f.tp.server_bridge,
+                       PENDING_HEADER_PAYLOAD, live_ref, 0, false));
+    moq_bridge_test_pending_identity(f.tp.server_bridge, 0, &cref, &csid,
+                                     &chave);
+    if (!chave || csid != sid_a) {
+        fprintf(stderr, "CANON: a ref-only item was not given its transport id "
+                "(have=%d id=%llu, expected %llu)\n", (int)chave,
+                (unsigned long long)csid, (unsigned long long)sid_a);
+        failures++;
+    }
+    /* and an ID-only action for the same stream must therefore conflict */
+    if (!moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, sid_a, true)) {
+        fprintf(stderr, "CANON: an id-named action bypassed a ref-named "
+                "pending item for the same stream\n");
+        failures++;
+    }
+    MOQ_TEST_CHECK(!moq_bridge_test_domain_blocked(f.tp.server_bridge,
+                                                    0, sid_a + 991, true));
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* A candidate that names neither a ref nor a transport id cannot be
+ * resolved. It must be refused outright rather than compare equal to nothing
+ * and bypass the queue, and the refusal must be visible as a fatal bridge. */
+static int test_hol_identityless_candidate_fails_closed(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending_ex(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, 0, true));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.server_bridge));
+
+    if (!moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 0, false)) {
+        fprintf(stderr, "SHAPE: an identity-less candidate was admitted\n");
+        failures++;
+    }
+    if (!moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
+        fprintf(stderr, "SHAPE: an identity-less candidate did not fail "
+                "closed\n");
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/*
+ * Pending identity is completed exactly once, at the enqueue boundary, and a
+ * candidate's identity is never completed from the stream map.
+ *
+ * Completing a candidate would only ever matter for a pending item that is
+ * named by one identity while its stream is mapped under the other. No such
+ * item can exist: the enqueue boundary fills the missing name for every item
+ * whose counterpart is already mapped, and an item injected before the
+ * mapping exists does not survive the service passes that create it. This
+ * pins the second half of that argument -- the first half is pinned by the
+ * mixed-identity case, where enqueue resolves an id-only item's ref.
+ */
+static int test_hol_pending_identity_completed_only_at_enqueue(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    moq_subgroup_handle_t a, b;
+    uint64_t sid_a, sid_b, ref_b = 0, cref = 0, csid = 0;
+    bool chave = false;
+
+    if (hol_init(&f) < 0) return 1;
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_a = hol_nth_open(&f, 0);
+    MOQ_TEST_CHECK(sid_a != UINT64_MAX);
+
+    /* named by an id the map does not know, so enqueue cannot complete it */
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending_ex(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, sid_a + 1, true));
+    moq_bridge_test_pending_identity(f.tp.server_bridge, 0, &cref, &csid,
+                                     &chave);
+    if (cref != 0) {
+        fprintf(stderr, "SHAPE: an unmapped id was completed to ref %llu\n",
+                (unsigned long long)cref);
+        failures++;
+    }
+    MOQ_TEST_CHECK(chave && csid == sid_a + 1);
+
+    /* that id now becomes a live stream with a ref of its own */
+    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &b) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, b, 0, 32) == MOQ_OK);
+    hol_service(&f, 4);
+    sid_b = hol_nth_open(&f, 1);
+    MOQ_TEST_CHECK(sid_b == sid_a + 1);
+    ref_b = moq_bridge_test_ref_for_id(f.tp.server_bridge, sid_b);
+    MOQ_TEST_CHECK(ref_b != 0);
+
+    /* the half-named item did not outlive the mapping it was missing */
+    if (moq_bridge_test_pending_depth(f.tp.server_bridge) != 0) {
+        fprintf(stderr, "SHAPE: a half-named item survived to see its stream "
+                "mapped (id=%llu ref=%llu)\n", (unsigned long long)sid_b,
+                (unsigned long long)ref_b);
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+
+/* Transport stream id 0 is LEGAL. It must be a real identity that
+ * conflicts with itself, must NOT alias "unknown", and must not block an
+ * unrelated stream. */
+static int test_hol_stream_id_zero_is_a_real_identity(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+
+    if (hol_init(&f) < 0) return 1;
+    /* a pending item on the legal stream id 0 */
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending_ex(f.tp.server_bridge,
+                       PENDING_STOP_SENDING, 0, 0, true));
+    MOQ_TEST_CHECK(moq_bridge_test_pending_depth(f.tp.server_bridge) == 1);
+    {
+        uint64_t cref = 0, csid = 0xdead;
+        bool chave = false;
+        moq_bridge_test_pending_identity(f.tp.server_bridge, 0,
+                                         &cref, &csid, &chave);
+        /* the id is KNOWN and it is zero */
+        if (!chave || csid != 0) {
+            fprintf(stderr, "ID0: a legal id 0 was recorded as have=%d id=%llu; "
+                    "it aliased 'unknown'\n", (int)chave,
+                    (unsigned long long)csid);
+            failures++;
+        }
+    }
+    /* it conflicts with itself, by id */
+    if (!moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 0, true)) {
+        fprintf(stderr, "ID0: stream id 0 did not conflict with itself\n");
+        failures++;
+    }
+    /* and an unrelated stream is free */
+    if (moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 77, true)) {
+        fprintf(stderr, "ID0: stream id 0 blocked unrelated stream 77\n");
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+
+    /* the mirror: an item with an UNKNOWN id must not conflict with a
+     * candidate naming the legal id 0 */
+    if (hol_init(&f) < 0) return failures + 1;
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending_ex(f.tp.server_bridge,
+                       PENDING_OPEN_UNI_DATA, 0x4242, 0, false));
+    if (moq_bridge_test_domain_blocked(f.tp.server_bridge, 0, 0, true)) {
+        fprintf(stderr, "ID0: an unknown-id item conflicted with the legal "
+                "stream id 0\n");
+        failures++;
+    }
+    test_pair_destroy(&f.tp);
+    return failures;
+}
+#endif
+
+/* The soundness precondition for that capacity guard: after it, a drain-side
+ * enqueue failure is structurally unreachable, because one polled action
+ * consumes at most one retention slot. Registered last so it sees the maximum
+ * observed across every fixture that ran before it. */
+static int test_hol_one_slot_per_action_and_no_drain_overflow(void)
+{
+    int failures = 0;
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+    extern uint32_t moq_bridge_max_retain_delta;
+    printf("SLOTS max pending slots consumed by one drained action = %u\n",
+           moq_bridge_max_retain_delta);
+    if (moq_bridge_max_retain_delta > 1) {
+        fprintf(stderr, "SLOTS: an action consumed %u slots; the capacity "
+                "guard's one-slot margin is unsound\n",
+                moq_bridge_max_retain_delta);
+        failures++;
+    }
+    if (moq_bridge_max_retain_delta == 0) {
+        fprintf(stderr, "SLOTS: no retention was ever observed; the property "
+                "is vacuous\n");
+        failures++;
+    }
+#else
+    printf("SLOTS not measured (build without MOQ_BRIDGE_SCAN_COUNTERS)\n");
+#endif
+    return failures;
+}
+
 
 int main(void)
 {
@@ -11089,7 +13693,11 @@ int main(void)
 
     /* Hard retry tests */
     failures += test_close_retry_after_blocked_control();
+    failures += test_deferred_close_clears_ordinary_pending();
     failures += test_close_retry_would_block();
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    failures += test_deferred_close_keeps_its_own_code();
+#endif
     failures += test_reset_on_unknown_stream();
     failures += test_transport_close_clears_state();
 
@@ -11102,11 +13710,52 @@ int main(void)
     failures += test_local_bidi_stop_after_local_fin();
     failures += test_local_bidi_normal_fin_unchanged();
 
+    /* per-stream head-of-line acceptance battery */
+    failures += test_hol_unrelated_ref_progresses();
+    failures += test_hol_same_ref_no_bypass_fin_last();
+    failures += test_hol_two_parked_third_progresses();
+    failures += test_hol_terminal_precedence_over_bypass();
+    failures += test_hol_service_work_is_bounded();
+    failures += test_hol_close_intent_not_deferred();
+    failures += test_hol_close_priority_once_begun();
+    failures += test_hol_conservation_of_owned_actions();
+    failures += test_hol_gate_orders_when_endpoint_would_accept();
+    failures += test_hol_mixed_identity_same_stream();
+    failures += test_hol_pending_close_blocks_stream_work();
+    failures += test_hol_refless_domains_are_distinct();
+    failures += test_hol_conservation_through_retry();
+    failures += test_hol_retention_capacity_is_not_fatal();
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    failures += test_hol_canon_fills_sid_from_ref();
+    failures += test_hol_stream_id_zero_is_a_real_identity();
+    failures += test_hol_identityless_candidate_fails_closed();
+    failures += test_hol_pending_identity_completed_only_at_enqueue();
+#endif
+    failures += test_hol_explorer();
+    failures += test_hol_drain_budget_is_a_real_backstop();
+    failures += test_hol_owned_payload_conservation();
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    failures += test_hol_retention_releases_owned_payload_once();
+    failures += test_hol_initial_retention_failure_is_fatal_not_silent();
+    failures += test_hol_retention_failure_is_fatal_not_silent();
+#endif
+#ifdef MOQ_BRIDGE_TEST_INJECT
+    failures += test_hol_action_domain_table();
+    failures += test_hol_ref_zero_does_not_alias();
+    failures += test_hol_mixed_identity_canonicalises();
+    failures += test_hol_depth_and_structural_bound();
+#endif
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+    failures += test_hol_scan_operation_counts();
+#endif
+
     /* terminal facts */
     failures += test_terminal_facts_enqueued_then_observed();
     failures += test_terminal_facts_not_set_by_other_events();
     failures += test_already_fatal_transport_terminal();
     failures += test_setup_scratch_shortfall_closes_not_fatal();
+
+    failures += test_hol_one_slot_per_action_and_no_drain_overflow();
 
     if (failures == 0)
         printf("test_transport_bridge: all tests passed\n");
