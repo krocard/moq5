@@ -425,6 +425,29 @@ MOQ_API moq_result_t moq_session_on_data_rcbuf(moq_session_t *s,
  * Releases internal parse state for stream_ref. Does not close the
  * session unless the reset violates an invariant.
  *
+ * A reset owes the application a visible closure: OBJECT_CHUNK with a
+ * RESET terminal when a streaming object was in flight, otherwise
+ * SUBGROUP_RESET for a bound subgroup whose id is resolved. When that
+ * output cannot be queued -- a full event queue, or a complete object
+ * still owed ahead of it -- this returns MOQ_ERR_WOULD_BLOCK and the
+ * obligation is RETAINED. The session is not closed and the stream is
+ * not released.
+ *
+ * To complete it: drain output (poll events, freeing a slot) and CALL
+ * THIS FUNCTION AGAIN with the SAME stream_ref and the SAME error_code,
+ * until it returns something other than MOQ_ERR_WOULD_BLOCK. Any later
+ * advancing drive on that stream -- including an empty
+ * moq_session_on_data_bytes(ref, NULL, 0, false) re-feed -- also
+ * completes the owed closure, but repeating this call is the recovery to
+ * write: it is the same operation with its own arguments, and it does
+ * not depend on which drive routes happen to service the obligation.
+ *
+ * MOQ_ERR_WOULD_BLOCK implies the reset was already RECORDED: the
+ * obligation and its cause are captured before anything that can block.
+ * So the FIRST error_code seen for a stream is the cause that is
+ * reported, and a retry passing a different code does not replace it --
+ * pass the original anyway, rather than relying on that.
+ *
  * Advancing call: invalidates borrows, takes now_us.
  */
 MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
