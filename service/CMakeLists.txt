@@ -492,6 +492,18 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_lifecycle
             COMMAND test_media_sender_lifecycle)
+        # Pacing attribution: one production sender_hook == one drain pass,
+        # driven against a real SimPair subscriber. Deterministic pump units.
+        add_executable(test_media_sender_pacing
+            tests/test_media_sender_pacing.c)
+        target_link_libraries(test_media_sender_pacing PRIVATE
+            moq-service-sender-test-internals moq::core moq::msf
+            moq::sim Threads::Threads)
+        target_include_directories(test_media_sender_pacing PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_pacing
+            COMMAND test_media_sender_pacing)
+
         add_executable(test_media_sender_reject
             tests/test_media_sender_reject.c)
         target_link_libraries(test_media_sender_reject PRIVATE
