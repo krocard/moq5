@@ -406,7 +406,7 @@ struct ReceiverTeardownTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Forgotten close(): dropping receiver AND endpoint still tears everything down")
-    func forgottenCloseBackstop() throws {
+    func forgottenCloseBackstop() async throws {
         let endpointBackend = ScriptedEndpointBackend()
         let receiverBackend = ScriptedReceiverBackend()
         var endpoint: MoQEndpoint? = MoQEndpoint(
@@ -423,8 +423,8 @@ struct ReceiverTeardownTests {
          * receiver -> endpoint -> engine) keeps them alive. */
         receiver = nil
         endpoint = nil
-        #expect(receiverBackend.awaitCondition { $0.detachCalls == 1 })
-        #expect(endpointBackend.awaitCondition { $0.destroyCount == 1 })
+        #expect(await receiverBackend.awaitCondition { $0.detachCalls == 1 })
+        #expect(await endpointBackend.awaitCondition { $0.destroyCount == 1 })
         #expect(receiverBackend.snapshot().violations.isEmpty)
         #expect(endpointBackend.snapshot().violations.isEmpty)
     }
