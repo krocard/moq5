@@ -1,4 +1,5 @@
 import CMoQCore
+import MoQTransportModel
 
 /// Sans-I/O MoQ session. Not thread-safe. Not Sendable.
 ///
@@ -37,6 +38,24 @@ public final class Session {
         case draining
         case closed
         case unknown(Int32)
+    }
+
+    // MARK: - Transport version
+
+    /// The MoQ transport draft this session speaks.
+    ///
+    /// Fixed when the session is created and immutable thereafter, so it is
+    /// safe to read at any time and cannot go stale. It is the AUTHORITY for
+    /// anything whose wire encoding depends on the draft -- notably the
+    /// integer codec of object-property Key-Value-Pairs, which media parsing
+    /// needs. `nil` means this build does not model the session's version,
+    /// which callers must treat as "cannot encode/parse", never as draft-16.
+    public var transportVersion: MoQTransportVersion? {
+        switch moq_session_version(raw) {
+        case MOQ_VERSION_DRAFT_16: return .draft16
+        case MOQ_VERSION_DRAFT_18: return .draft18
+        default: return nil
+        }
     }
 
     // MARK: - Storage

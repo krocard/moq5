@@ -3,6 +3,36 @@ import CMoQLOC
 import CMoQCore
 import Foundation
 import MoQ
+import MoQTransportModel
+
+// MARK: - Transport version
+
+/// The negotiated MoQ transport draft, media-facing spelling.
+///
+/// This is an alias for `MoQTransportModel.MoQTransportVersion` -- the very
+/// same nominal type `MoQServiceCore` publishes as `MoQVersion`, not a copy
+/// of it. A version obtained from an endpoint is therefore usable here
+/// directly, and `MoQMedia` does not depend on `MoQServiceCore` to say so.
+public typealias MediaTransportVersion = MoQTransportVersion
+
+/// Map the shared transport-version type onto its C spelling.
+///
+/// EXHAUSTIVE BY CONSTRUCTION: there is no `default` and no `else`. Adding a
+/// case to `MoQTransportVersion` must make this switch fail to compile, so a
+/// new draft cannot be silently reinterpreted as an older one -- which is the
+/// Swift-side half of the fail-closed contract that <moq/loc.h> states for C.
+/// A ternary or a defaulted switch here would map every future draft to
+/// draft-16 and lose exactly the fact the transport version exists to carry.
+///
+/// It lives in MoQMedia rather than in MoQTransportModel because it names C
+/// types; the model target stays dependency-free.
+@inlinable
+func cTransportVersion(_ v: MediaTransportVersion) -> moq_version_t {
+    switch v {
+    case .draft16: return MOQ_VERSION_DRAFT_16
+    case .draft18: return MOQ_VERSION_DRAFT_18
+    }
+}
 
 // MARK: - Media Types
 
@@ -23,10 +53,21 @@ public struct MediaTrackInfo: Sendable, Hashable {
     public var packaging: MediaPackaging
     public var timescale: UInt64
 
-    public init(mediaType: MediaType, packaging: MediaPackaging, timescale: UInt64 = 0) {
+    /// The draft whose integer encoding this track's LOC object properties
+    /// are written in. There is deliberately NO default: the value belongs
+    /// to the live session, and a hidden draft-16 default here would read
+    /// draft-18 bytes with the wrong codec and silently mis-time anything
+    /// at or above 64.
+    public var transportVersion: MediaTransportVersion
+
+    public init(mediaType: MediaType,
+                packaging: MediaPackaging,
+                timescale: UInt64 = 0,
+                transportVersion: MediaTransportVersion) {
         self.mediaType = mediaType
         self.packaging = packaging
         self.timescale = timescale
+        self.transportVersion = transportVersion
     }
 }
 
@@ -100,8 +141,15 @@ public struct MediaParsedObject {
 
 extension MSFTrack {
     /// Derive a MediaTrackInfo from MSF catalog fields.
+    ///
+    /// The negotiated transport version must be supplied by the caller: a
+    /// catalog describes the track, never the session that carries it, so
+    /// this cannot be derived here and must not be guessed.
+    ///
     /// Throws MediaTrackInfoError for missing/unsupported role or packaging.
-    public func mediaTrackInfo() throws -> MediaTrackInfo {
+    public func mediaTrackInfo(
+        transportVersion: MediaTransportVersion
+    ) throws -> MediaTrackInfo {
         let mt: MediaType
         switch role {
         case "video": mt = .video
@@ -120,7 +168,8 @@ extension MSFTrack {
         return MediaTrackInfo(
             mediaType: mt,
             packaging: pkg,
-            timescale: timescale ?? 0
+            timescale: timescale ?? 0,
+            transportVersion: transportVersion
         )
     }
 }
@@ -144,7 +193,12 @@ public enum MediaObjectParser {
         }
 
         var ti = moq_media_track_info_t()
-        moq_media_track_info_init(&ti)
+        // Sized init: transport_version is an appended tail field, so the
+        // pointer-only initializer would stamp the frozen v0 prefix and the
+        // parser would then take the legacy draft-16 contract regardless of
+        // what this track says.
+        moq_media_track_info_init_sized(&ti, MemoryLayout.size(ofValue: ti))
+        ti.transport_version = cTransportVersion(track.transportVersion)
         ti.media_type = track.mediaType == .video
             ? MOQ_MEDIA_TYPE_VIDEO : MOQ_MEDIA_TYPE_AUDIO
 

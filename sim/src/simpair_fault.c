@@ -12,7 +12,8 @@ void trace_input(moq_simpair_t *sp,
                  moq_perspective_t from,
                  moq_perspective_t to,
                  moq_bytes_t bytes,
-                 moq_result_t result)
+                 moq_result_t result,
+                 sim_input_detail_t detail)
 {
     moq_sim_trace_record_t r;
     memset(&r, 0, sizeof(r));
@@ -26,7 +27,94 @@ void trace_input(moq_simpair_t *sp,
     r.input_kind = input_kind;
     r.bytes = bytes;
     r.result = result;
+    /* appended detail: an INPUT never carries detail bytes */
+    r.stream_ref = detail.ref;
+    r.error_code = detail.error_code;
+    r.fin        = detail.fin;
     trace_record(sp, &r);
+}
+
+/*
+ * The ONE normalization policy for the appended action detail, shared by
+ * trace_action() and trace_fault_drop(). It writes only the four appended
+ * fields and never touches the frozen legacy prefix -- in particular it does
+ * not repair the pre-existing ACTION/FAULT_DROP legacy difference for
+ * CLOSE_SESSION, and it leaves SEND_DATA's legacy bytes as the header and
+ * legacy count as the payload length.
+ *
+ * detail_bytes is BORROWED and stays valid only until the trace callback
+ * returns; nothing here copies or retains it.
+ */
+static void trace_fill_action_detail(moq_sim_trace_record_t *r,
+                                     const moq_action_t *action)
+{
+    switch (action->kind) {
+    case MOQ_ACTION_SEND_DATA:
+        r->stream_ref = action->u.send_data.stream_ref;
+        if (action->u.send_data.payload) {
+            r->detail_bytes.data = moq_rcbuf_data(action->u.send_data.payload);
+            r->detail_bytes.len  = moq_rcbuf_len(action->u.send_data.payload);
+        }
+        r->fin = action->u.send_data.fin;
+        break;
+    case MOQ_ACTION_CLOSE_SESSION:
+        /* error_code deliberately duplicates the legacy code, from the same
+         * action member: the appended field is the one an ABI-aware consumer
+         * reads, and the legacy one is frozen. */
+        r->detail_bytes = action->u.close_session.reason;
+        r->error_code   = action->u.close_session.code;
+        break;
+    case MOQ_ACTION_OPEN_BIDI_STREAM:
+        r->stream_ref = action->u.open_bidi_stream.stream_ref;
+        r->detail_bytes.data = action->u.open_bidi_stream.data;
+        r->detail_bytes.len  = action->u.open_bidi_stream.len;
+        r->fin = action->u.open_bidi_stream.fin;
+        break;
+    case MOQ_ACTION_SEND_BIDI_STREAM:
+        r->stream_ref = action->u.send_bidi_stream.stream_ref;
+        r->detail_bytes.data = action->u.send_bidi_stream.data;
+        r->detail_bytes.len  = action->u.send_bidi_stream.len;
+        r->fin = action->u.send_bidi_stream.fin;
+        break;
+    case MOQ_ACTION_CLOSE_BIDI_STREAM:
+        r->stream_ref = action->u.close_bidi_stream.stream_ref;
+        break;
+    case MOQ_ACTION_OPEN_UNI_CONTROL:
+        r->stream_ref = action->u.open_uni_control.stream_ref;
+        r->detail_bytes.data = action->u.open_uni_control.data;
+        r->detail_bytes.len  = action->u.open_uni_control.len;
+        break;
+    case MOQ_ACTION_SEND_UNI_CONTROL:
+        r->stream_ref = action->u.send_uni_control.stream_ref;
+        r->detail_bytes.data = action->u.send_uni_control.data;
+        r->detail_bytes.len  = action->u.send_uni_control.len;
+        r->fin = action->u.send_uni_control.fin;
+        break;
+    case MOQ_ACTION_RESET_DATA:
+        r->stream_ref = action->u.reset_data.stream_ref;
+        r->error_code = action->u.reset_data.error_code;
+        break;
+    case MOQ_ACTION_STOP_DATA:
+        r->stream_ref = action->u.stop_data.stream_ref;
+        r->error_code = action->u.stop_data.error_code;
+        break;
+    case MOQ_ACTION_RESET_BIDI_STREAM:
+        r->stream_ref = action->u.reset_bidi_stream.stream_ref;
+        r->error_code = action->u.reset_bidi_stream.error_code;
+        break;
+    case MOQ_ACTION_STOP_BIDI_STREAM:
+        r->stream_ref = action->u.stop_bidi_stream.stream_ref;
+        r->error_code = action->u.stop_bidi_stream.error_code;
+        break;
+    case MOQ_ACTION_ABORT_BIDI_STREAM:
+        r->stream_ref = action->u.abort_bidi_stream.stream_ref;
+        r->error_code = action->u.abort_bidi_stream.error_code;
+        break;
+    default:
+        /* SEND_CONTROL and SEND_DATAGRAM carry no stream ref, no appended
+         * bytes, no code and no FIN. */
+        break;
+    }
 }
 
 void trace_action(moq_simpair_t *sp,
@@ -63,6 +151,7 @@ void trace_action(moq_simpair_t *sp,
     } else if (action->kind == MOQ_ACTION_STOP_DATA) {
         r.code = action->u.stop_data.error_code;
     }
+    trace_fill_action_detail(&r, action);
     trace_record(sp, &r);
 }
 
@@ -110,6 +199,7 @@ void trace_fault_drop(moq_simpair_t *sp,
     } else if (action->kind == MOQ_ACTION_STOP_DATA) {
         r.code = action->u.stop_data.error_code;
     }
+    trace_fill_action_detail(&r, action);
     trace_record(sp, &r);
 }
 

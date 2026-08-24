@@ -2493,6 +2493,13 @@ moq_perspective_t moq_session_perspective(const moq_session_t *s)
     return s ? s->perspective : (moq_perspective_t)0;
 }
 
+/* The profile is bound at create and never reassigned, so this is a pure
+ * read of the single authority -- no second copy to drift from it. */
+moq_version_t moq_session_version(const moq_session_t *s)
+{
+    return s ? s->profile->version : (moq_version_t)0;
+}
+
 moq_result_t moq_session_start(moq_session_t *s, uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;

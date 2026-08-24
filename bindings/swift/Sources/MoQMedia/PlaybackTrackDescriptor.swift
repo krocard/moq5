@@ -25,11 +25,17 @@ extension MSFTrack {
     /// and codec config. For LOC/RAW tracks, populates from catalog
     /// fields and uses initData as raw codec config.
     ///
+    /// The negotiated transport version is required and passed straight
+    /// through to the derived `MediaTrackInfo`: a catalog entry describes
+    /// the track, never the session carrying it.
+    ///
     /// Throws `MediaTrackInfoError` for missing/unsupported role or
     /// packaging. Throws `MSFError` or `CMAFParseError` for
     /// malformed initData.
-    public func playbackDescriptor() throws -> PlaybackTrackDescriptor {
-        let info = try mediaTrackInfo()
+    public func playbackDescriptor(
+        transportVersion: MediaTransportVersion
+    ) throws -> PlaybackTrackDescriptor {
+        let info = try mediaTrackInfo(transportVersion: transportVersion)
 
         var cfg = PlaybackTrackConfiguration(
             mediaType: info.mediaType,

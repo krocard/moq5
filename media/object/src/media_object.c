@@ -8,11 +8,62 @@
 
 /* -- Init functions -------------------------------------------------- */
 
+#define TRACK_INFO_MIN_SIZE MOQ_MEDIA_TRACK_INFO_V0_SIZE
+
+/* struct_size at or above this covers transport_version, so the caller
+ * owns that field and must have named a supported version. */
+#define TRACK_INFO_VERSION_SIZE \
+    (offsetof(moq_media_track_info_t, transport_version) + \
+     sizeof(((moq_media_track_info_t *)0)->transport_version))
+
+/*
+ * Which transport draft's integer codec this track's LOC properties are
+ * written in. An old caller -- struct_size exactly the frozen v0 prefix --
+ * cannot express one, and keeps the legacy standalone draft-16 contract.
+ * A caller whose struct_size COVERS the field owns it: 0 or any
+ * unsupported value is rejected rather than being read as draft-16.
+ */
+static bool track_transport_version(const moq_media_track_info_t *track,
+                                    moq_version_t *out)
+{
+    if (track->struct_size < TRACK_INFO_VERSION_SIZE) {
+        *out = MOQ_VERSION_DRAFT_16;
+        return true;
+    }
+    switch (track->transport_version) {
+    case MOQ_VERSION_DRAFT_16:
+    case MOQ_VERSION_DRAFT_18:
+        *out = track->transport_version;
+        return true;
+    default:
+        return false;
+    }
+}
+
+
 void moq_media_track_info_init(moq_media_track_info_t *info)
 {
     if (!info) return;
-    memset(info, 0, sizeof(*info));
-    info->struct_size = sizeof(*info);
+    /* Pointer-only: the caller's struct may be an OLD, SMALLER one, so
+     * only the frozen v0 prefix may be written. transport_version is
+     * deliberately left alone -- see the header. */
+    memset(info, 0, MOQ_MEDIA_TRACK_INFO_V0_SIZE);
+    info->struct_size = (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE;
+}
+
+void moq_media_track_info_init_sized(moq_media_track_info_t *info,
+                                     size_t info_size)
+{
+    if (!info) return;
+    if (info_size < MOQ_MEDIA_TRACK_INFO_V0_SIZE) return;
+
+    /* Never write past the caller's allocation, and never past the
+     * fields this build knows about. */
+    size_t n = info_size < sizeof(*info) ? info_size : sizeof(*info);
+    memset(info, 0, n);
+    info->struct_size = (uint32_t)n;
+    if (n >= TRACK_INFO_VERSION_SIZE)
+        info->transport_version = MOQ_VERSION_DRAFT_16;
 }
 
 void moq_media_object_input_init(moq_media_object_input_t *in)
@@ -72,10 +123,6 @@ static bool cmaf_sample_is_keyframe(uint32_t flags)
 
 /* -- Parse ----------------------------------------------------------- */
 
-#define TRACK_INFO_MIN_SIZE \
-    (offsetof(moq_media_track_info_t, timescale) + \
-     sizeof(((moq_media_track_info_t *)0)->timescale))
-
 #define OBJECT_INPUT_MIN_SIZE \
     (offsetof(moq_media_object_input_t, properties) + \
      sizeof(((moq_media_object_input_t *)0)->properties))
@@ -93,6 +140,13 @@ moq_result_t moq_media_object_parse(
 
     if (track->struct_size < TRACK_INFO_MIN_SIZE) return MOQ_ERR_INVAL;
     if (in->struct_size < OBJECT_INPUT_MIN_SIZE) return MOQ_ERR_INVAL;
+
+    /* Resolved before any packaging branch, so a CMAF object with no
+     * properties is refused an unsupported version too -- the check must
+     * not depend on whether a LOC block happens to be present. */
+    moq_version_t transport_version;
+    if (!track_transport_version(track, &transport_version))
+        return MOQ_ERR_INVAL;
 
     if (track->media_type != MOQ_MEDIA_TYPE_VIDEO &&
         track->media_type != MOQ_MEDIA_TYPE_AUDIO)
@@ -131,7 +185,8 @@ moq_result_t moq_media_object_parse(
         }
 
         if (props.len > 0 || track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
-            moq_result_t lr = moq_loc_parse(MOQ_LOC_PROFILE_01, props, &loc);
+            moq_result_t lr = moq_loc_parse(transport_version,
+                                            MOQ_LOC_PROFILE_01, props, &loc);
             if (lr == MOQ_ERR_PROTO) {
                 if (drop_reason) *drop_reason = MOQ_MEDIA_DROP_MALFORMED_LOC;
                 return MOQ_ERR_PROTO;

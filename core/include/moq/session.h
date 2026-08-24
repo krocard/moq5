@@ -280,6 +280,23 @@ MOQ_API bool moq_session_supports_zero_field_track_namespace(
     const moq_session_t *s);
 
 /*
+ * The wire profile this session was created for, fixed at creation and
+ * immutable for its lifetime -- reading it before start, mid-handshake, at
+ * ESTABLISHED and after close all yield the same value.
+ *
+ * This is NOT a negotiator. Transport version negotiation belongs to the
+ * layer that owns ALPN / the WebTransport protocol token; a service endpoint
+ * reports its outcome through moq_endpoint_negotiated_version() and creates
+ * the session with the version it selected. This accessor reports what the
+ * session is actually speaking, which is the same authority that validates
+ * the bytes on the wire.
+ *
+ * Returns (moq_version_t)0 if s is NULL. Observing (does not invalidate
+ * borrows, does not advance the session).
+ */
+MOQ_API moq_version_t moq_session_version(const moq_session_t *s);
+
+/*
  * Record that an Object at {group_id, object_id} has been published or
  * received on the given track, advancing that track's largest-location
  * history (see moq_session_cfg_t.max_track_history_records). The library

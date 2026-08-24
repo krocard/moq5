@@ -11,6 +11,8 @@
 
 #include <moq/moq.h>
 
+#include <stddef.h>   /* offsetof: MOQ_SIM_TRACE_RECORD_V0_SIZE */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -77,6 +79,90 @@ typedef enum moq_sim_trace_input_kind {
     MOQ_SIM_INPUT_BIDI_STOP     = 10,
 } moq_sim_trace_input_kind_t;
 
+/*
+ * Trace record.
+ *
+ * The fields through `result` are the FROZEN v0 PREFIX. Their values are
+ * exactly what the pre-append producer emitted, for every kind and subtype:
+ * a field that was zero/empty for a record class stays zero/empty, and one
+ * that carried a value keeps that value. Consumers that hash the prefix --
+ * the twin-run determinism suites do -- see byte-identical results across
+ * this addition. Nothing may newly populate `bytes`, `code`, `count` or
+ * `result`.
+ *
+ * The four fields after `result` are APPENDED detail, guarded by
+ * `struct_size`. A consumer must guard EACH FIELD INDEPENDENTLY with that
+ * field's own extent:
+ *
+ *     if (r->struct_size >= offsetof(moq_sim_trace_record_t, FIELD) +
+ *                           sizeof(r->FIELD))
+ *
+ * Adding a field extent to MOQ_SIM_TRACE_RECORD_V0_SIZE is NOT equivalent and
+ * is unsafe: alignment padding between appended fields makes that sum smaller
+ * than the field's true end, so it can admit an out-of-bounds read. The fields
+ * are ZERO/EMPTY unless the tables below declare a value.
+ *
+ * ACTION and FAULT_DROP produce IDENTICAL detail for the same action:
+ *
+ *   action                    stream_ref  detail_bytes   error_code   fin
+ *   ------------------------- ----------- -------------- ------------ ---------
+ *   SEND_DATA                 yes         rcbuf payload  0            action FIN
+ *   SEND_CONTROL              0           empty          0            false
+ *   SEND_DATAGRAM             0           empty          0            false
+ *   CLOSE_SESSION             0           reason         close code   false
+ *   OPEN_BIDI_STREAM          yes         data span      0            action FIN
+ *   SEND_BIDI_STREAM          yes         data span      0            action FIN
+ *   CLOSE_BIDI_STREAM         yes         empty          0            false
+ *   OPEN_UNI_CONTROL          yes         data span      0            false (*)
+ *   SEND_UNI_CONTROL          yes         data span      0            action FIN
+ *   RESET_DATA / STOP_DATA    yes         empty          error code   false
+ *   RESET_/STOP_/ABORT_BIDI   yes         empty          error code   false
+ *
+ *   (*) moq_open_uni_control_action_t has no FIN member.
+ *
+ * For SEND_DATA the legacy `bytes` remains the object/subgroup HEADER and the
+ * legacy `count` remains the payload LENGTH; `detail_bytes` is the payload
+ * itself. For CLOSE_SESSION, RESET_DATA and STOP_DATA the appended
+ * `error_code` deliberately DUPLICATES the already-correct legacy `code`:
+ * both are derived from the same action value, so a consumer can read a
+ * semantic terminal code from `error_code` for every applicable action
+ * instead of switching between old and new fields by subtype.
+ *
+ * INPUT:
+ *
+ *   input                                  stream_ref       error_code     fin
+ *   -------------------------------------- ---------------- -------------- ----
+ *   DATA_BYTES / BIDI_BYTES                target local ref 0              delivered FIN
+ *   DATA_RESET / BIDI_RESET / BIDI_STOP    target local ref delivered code false
+ *   DATA_STOP                              target local ref delivered code false
+ *                                          (= the SENDER's ref, see below)
+ *   CONTROL_BYTES / DATAGRAM / START / TICK 0               0              false
+ *
+ * `detail_bytes` is EMPTY for every INPUT record: the delivered span is
+ * already the legacy `bytes`.
+ *
+ * An INPUT `stream_ref` is the TARGET SESSION'S LOCAL MAPPED REF -- exactly
+ * the ref passed to the corresponding `moq_session_on_*` call for that
+ * delivery. Which endpoint that is depends on the input:
+ *
+ *   - DATA/BIDI bytes and DATA_RESET/BIDI_RESET/BIDI_STOP target the RECEIVING
+ *     endpoint, so the ref is that receiver's ref;
+ *   - DATA_STOP targets the ORIGINAL STREAM SENDER (a STOP travels back toward
+ *     the sender), so the ref is that target's own sender-side ref. "Receiver
+ *     side" is therefore NOT a universal synonym for this field.
+ *
+ * In every case SimPair remaps refs across the pair, so an INPUT `stream_ref`
+ * must NOT be assumed equal to the originating ACTION's ref, and the two must
+ * never be compared for equality.
+ *
+ * DELAY_ENQUEUE and DELAY_STALE are SCHEDULING records, not wire-delivery
+ * records: they keep their existing overloaded metadata in the legacy prefix
+ * and leave all four appended fields zero.
+ *
+ * LIFETIME: `bytes` and `detail_bytes` are BORROWED for the duration of the
+ * callback only. A consumer that needs them afterwards must deep-copy inside
+ * the callback.
+ */
 typedef struct moq_sim_trace_record {
     uint32_t                    struct_size;
     moq_sim_trace_kind_t        kind;
@@ -91,7 +177,24 @@ typedef struct moq_sim_trace_record {
     uint64_t                    code;
     size_t                      count;
     moq_result_t                result;
+    /* -- appended after v0; see the tables above -------------------- */
+    moq_stream_ref_t            stream_ref;
+    moq_bytes_t                 detail_bytes; /* borrowed until callback returns */
+    uint64_t                    error_code;
+    bool                        fin;
 } moq_sim_trace_record_t;
+
+/*
+ * v0 layout size: sizeof() the record AS FIRST PUBLISHED -- the frozen prefix
+ * through `result` PLUS that layout's trailing alignment padding, which is
+ * exactly where the first appended field begins. Using the end of `result`
+ * instead would understate it by the padding and mis-describe the boundary a
+ * v0 producer advertises.
+ *
+ * A producer that advertises exactly this size carries no appended detail.
+ */
+#define MOQ_SIM_TRACE_RECORD_V0_SIZE \
+    offsetof(moq_sim_trace_record_t, stream_ref)
 
 typedef void (*moq_sim_trace_fn)(void *ctx,
                                   const moq_sim_trace_record_t *record);

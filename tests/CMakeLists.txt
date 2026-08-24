@@ -236,6 +236,33 @@ if(TARGET moq::sim)
     target_link_libraries(test_simpair PRIVATE moq::sim)
     add_test(NAME simpair COMMAND test_simpair)
 
+    # SimPair trace record contract: the frozen v0 prefix and the appended
+    # detail fields. Uses sim internals (simpair_internal.h) directly; no
+    # exported test seam. Those internals are hidden in the shared build, so
+    # this target RECOMPILES the sim sources rather than linking the library.
+    add_executable(test_sim_trace_contract
+        unit/test_sim_trace_contract.c
+        ${CMAKE_SOURCE_DIR}/sim/src/simpair.c
+        ${CMAKE_SOURCE_DIR}/sim/src/simpair_fault.c
+        ${CMAKE_SOURCE_DIR}/sim/src/simpair_delay.c
+        ${CMAKE_SOURCE_DIR}/sim/src/simpair_pump.c)
+    target_link_libraries(test_sim_trace_contract PRIVATE moq::core)
+    # These translation units DEFINE the MOQ_SIM_API functions, so they must be
+    # compiled as the library is: without MOQ_SIM_BUILDING, export.h declares
+    # them __declspec(dllimport) on a shared Windows build and MSVC rejects a
+    # definition of an imported function.
+    target_compile_definitions(test_sim_trace_contract PRIVATE MOQ_SIM_BUILDING)
+    target_include_directories(test_sim_trace_contract PRIVATE
+        ${CMAKE_SOURCE_DIR}/sim/src
+        ${CMAKE_SOURCE_DIR}/sim/include)
+    add_test(NAME sim_trace_contract COMMAND test_sim_trace_contract)
+
+    # moq_session_version() over a REAL handshake: the value is the configured
+    # profile and is fixed across every phase, on both ends.
+    add_executable(test_session_version unit/test_session_version.c)
+    target_link_libraries(test_session_version PRIVATE moq::sim)
+    add_test(NAME session_version COMMAND test_session_version)
+
     # End-to-end allocation-failure lane over the public SimPair surface.
     add_executable(test_simpair_failpoints unit/test_simpair_failpoints.c)
     target_link_libraries(test_simpair_failpoints PRIVATE moq::sim)
@@ -542,3 +569,153 @@ if(BUILD_SHARED_LIBS)
             -DDYLIB=$<TARGET_FILE:moq-core>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_bridge_symbols.cmake)
 endif()
+
+# -- Negotiated-profile substrate (step 5) ---------------------------
+#
+# Four roles, kept apart on purpose (0659/0661): the PURE ORACLE re-derives the
+# draft encodings with libc only, the tables/corpus declare the topology, and
+# the future scripted builder / product adapter / closure runner are staged.
+# The oracle+tables+corpus objects are built ONCE here and reused by the C++
+# reader test, so the C parser is the single parser.
+# Role 1 gets its OWN object library: the policy check scans exactly this
+# object for moq_ symbols, so it must not be pooled with the table/corpus
+# translation units.
+add_library(np_oracle_obj OBJECT support/np/np_oracle.c)
+target_include_directories(np_oracle_obj PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/np)
+target_compile_features(np_oracle_obj PUBLIC c_std_11)
+
+add_library(np_substrate OBJECT
+    support/np/np_tables.c
+    support/np/np_corpus.c)
+target_include_directories(np_substrate PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/np)
+target_compile_features(np_substrate PUBLIC c_std_11)
+
+# Roles 2 and 4 now exist. Each gets its OWN object library for the same reason
+# role 1 does: the policy scans exactly one object per role, and pooling them
+# would make a forbidden symbol unattributable. Include paths are spelled as
+# source paths rather than taken from library targets, so these objects -- and
+# therefore the policy's object audit -- exist in every configuration, not only
+# the ones that build the sim and service libraries.
+add_library(np_builder_obj OBJECT support/np/np_wire_builder.c)
+target_include_directories(np_builder_obj PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/np)
+target_compile_features(np_builder_obj PUBLIC c_std_11)
+
+# Role 3, the product adapter: the ONLY substrate translation unit permitted
+# to call product LOC APIs. It gets its own object library for the same
+# per-role attribution reason as the others.
+add_library(np_adapter_obj OBJECT support/np/np_product_adapter.c)
+target_include_directories(np_adapter_obj PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/np
+    ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/media/loc/include)
+target_compile_features(np_adapter_obj PUBLIC c_std_11)
+
+add_library(np_runner_obj OBJECT support/np/np_closure_runner.c)
+target_include_directories(np_runner_obj PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/np
+    ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/sim/include
+    ${CMAKE_SOURCE_DIR}/service/include
+    ${CMAKE_SOURCE_DIR}/media/object/include
+    ${CMAKE_SOURCE_DIR}/media/msf/include
+    ${CMAKE_SOURCE_DIR}/media/cmaf/include)
+target_compile_features(np_runner_obj PUBLIC c_std_11)
+
+add_executable(test_negotiated_profile unit/test_negotiated_profile.c
+    $<TARGET_OBJECTS:np_oracle_obj> $<TARGET_OBJECTS:np_substrate>)
+target_link_libraries(test_negotiated_profile PRIVATE moq-core-test-internals)
+target_include_directories(test_negotiated_profile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/support/np
+    ${CMAKE_SOURCE_DIR}/core/src/session
+    ${CMAKE_SOURCE_DIR}/adapters/common)
+# The corpus is read from an ABSOLUTE SOURCE path fixed at configure time: no
+# working-directory dependency, and no checked-in copy anywhere.
+target_compile_definitions(test_negotiated_profile PRIVATE
+    NP_CORPUS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/vectors/negotiated_profile.vectors")
+add_test(NAME negotiated_profile COMMAND test_negotiated_profile)
+
+# The C++17 reader REUSES the C parser object; it does not reimplement the
+# grammar. The count and digest are pinned at configure time so all three
+# readers are compared against the same declared numbers.
+set(NP_CORPUS_FILE ${CMAKE_CURRENT_SOURCE_DIR}/vectors/negotiated_profile.vectors)
+set(NP_CORPUS_COUNT 79)
+set(NP_CORPUS_DIGEST 0xaf21b87308068ae6)
+# C++ DISCOVERY, before the conditional that needs it.
+#
+# The earlier spelling tested a nonexistent plural option and relied on
+# CMAKE_CXX_COMPILER already being set -- which it is in a cache that once had
+# CXX enabled, and is NOT in a fresh C-only configure, so the C++ reader
+# silently vanished from a clean tree. check_language() is CMake's own optional
+# language probe: it answers before enable_language() is called, so this block
+# cannot fail the configure by asking.
+#
+# HONEST SCOPE: this makes the READER's registration correct in a fresh
+# configure. It does NOT make the test suite C++-optional -- a tests-enabled
+# LibMoQ configure ALREADY requires a C++ compiler, because the existing C++
+# compatibility test below calls enable_language(CXX) unconditionally. The
+# not-found branch here is therefore a clean local fallback, not a claim that
+# the whole configuration proceeds with only C and Swift.
+include(CheckLanguage)
+set(_np_have_cxx OFF)
+if(CMAKE_CXX_COMPILER_LOADED)
+    # CXX is already an enabled language in this project (e.g. an adapter or
+    # the C++ binding turned it on ahead of us).
+    set(_np_have_cxx ON)
+else()
+    # Not enabled yet: ASK, then enable. check_language() is the only step that
+    # can answer without failing the configure when no C++ compiler exists.
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
+        set(_np_have_cxx ON)
+    endif()
+endif()
+if(_np_have_cxx)
+    enable_language(CXX)
+    add_executable(test_negotiated_profile_cxx unit/test_negotiated_profile_cxx.cpp
+        $<TARGET_OBJECTS:np_substrate>)
+    target_include_directories(test_negotiated_profile_cxx PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/np)
+    target_compile_features(test_negotiated_profile_cxx PRIVATE cxx_std_17)
+    target_compile_definitions(test_negotiated_profile_cxx PRIVATE
+        NP_CORPUS_PATH="${NP_CORPUS_FILE}"
+        NP_CORPUS_COUNT=${NP_CORPUS_COUNT}
+        NP_CORPUS_DIGEST=${NP_CORPUS_DIGEST})
+    add_test(NAME negotiated_profile_cxx COMMAND test_negotiated_profile_cxx)
+else()
+    # Reached only if a C++ compiler is genuinely absent. The suite's own
+    # mandatory enable_language(CXX) further down would then fail the
+    # configure anyway; this branch keeps THIS block from being the thing that
+    # fails, and says so rather than implying a C-only configuration works.
+    message(STATUS "np: no C++ compiler found; the C++ corpus reader is not "
+                   "registered (note: the wider test suite requires C++)")
+endif()
+
+# The four-role dependency policy, run as a test so it gates every lane. It
+# reads the compiled oracle object, so it depends on np_substrate being built.
+# Closure direction C: the codec alone, builder against product adapter, over
+# every record the corpus declares. Registered only when the LOC library is
+# built, since role 3 links against it.
+if(TARGET moq-loc)
+    add_executable(test_np_codec_closure unit/test_np_codec_closure.c
+        $<TARGET_OBJECTS:np_oracle_obj> $<TARGET_OBJECTS:np_substrate>
+        $<TARGET_OBJECTS:np_builder_obj> $<TARGET_OBJECTS:np_adapter_obj>)
+    target_include_directories(test_np_codec_closure PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/np)
+    target_link_libraries(test_np_codec_closure PRIVATE moq::loc moq::core)
+    target_compile_definitions(test_np_codec_closure PRIVATE
+        NP_CORPUS_PATH="${NP_CORPUS_FILE}")
+    add_test(NAME np_codec_closure COMMAND test_np_codec_closure)
+endif()
+
+add_test(NAME negotiated_profile_roles
+    COMMAND ${CMAKE_COMMAND}
+        -DNP_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/support/np
+        -DNP_ORACLE_OBJ=$<TARGET_OBJECTS:np_oracle_obj>
+        -DNP_BUILDER_OBJ=$<TARGET_OBJECTS:np_builder_obj>
+        -DNP_RUNNER_OBJ=$<TARGET_OBJECTS:np_runner_obj>
+        -DNP_ADAPTER_OBJ=$<TARGET_OBJECTS:np_adapter_obj>
+        -DNP_NM=${CMAKE_NM}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_np_roles.cmake)

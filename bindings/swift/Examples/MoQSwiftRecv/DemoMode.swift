@@ -5,9 +5,12 @@ import MoQRecvArgs
 
 enum RecvError: Error, CustomStringConvertible {
     case subscriptionFailed(String)
+    case noTransportVersion
     var description: String {
         switch self {
         case .subscriptionFailed(let t): return "Subscription to '\(t)' did not activate"
+        case .noTransportVersion:
+            return "Session negotiated no transport version this build knows"
         }
     }
 }
@@ -181,7 +184,12 @@ func runDemo(args: RecvArgs) throws {
     // Subscribe to discovered tracks and add to pipeline.
     var trackMap: [String: (sub: SubscribedTrack, pb: PlaybackTrack)] = [:]
     for msfTrack in recvCatalog.tracks {
-        let info = try msfTrack.mediaTrackInfo()
+        /* The negotiated draft comes from the live client session -- never a
+         * hardcoded default. */
+        guard let tv = client.transportVersion else {
+            throw RecvError.noTransportVersion
+        }
+        let info = try msfTrack.mediaTrackInfo(transportVersion: tv)
         var trackCfg = PlaybackTrackConfiguration(
             mediaType: info.mediaType, packaging: info.packaging,
             codec: msfTrack.codec, timescale: UInt32(info.timescale))

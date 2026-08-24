@@ -8,6 +8,15 @@
 
 namespace moq::loc {
 
+/*
+ * The negotiated transport draft selects the Key-Value-Pair integer codec
+ * the LOC properties are written in; see <moq/loc.h>. It is spelled with
+ * the C type deliberately -- a parallel C++ enum would be a second name
+ * for one wire fact and could drift from it. There is NO default: every
+ * call names its version, and an unsupported one is errc::inval.
+ */
+using transport_version = moq_version_t;
+
 enum class profile {
     loc01 = MOQ_LOC_PROFILE_01,
     loc02 = MOQ_LOC_PROFILE_02,
@@ -46,11 +55,12 @@ struct headers {
     bytes_view video_config{};
 };
 
-inline result<headers> parse(profile p, bytes_view properties)
+inline result<headers> parse(transport_version tv, profile p,
+                             bytes_view properties)
 {
     moq_loc_headers_t ch;
     moq_result_t rc = moq_loc_parse(
-        static_cast<moq_loc_profile_t>(p), properties.raw(), &ch);
+        tv, static_cast<moq_loc_profile_t>(p), properties.raw(), &ch);
     if (rc < 0)
         return errc_from_result(rc);
 
@@ -84,7 +94,7 @@ inline result<headers> parse(profile p, bytes_view properties)
     return h;
 }
 
-inline result<buffer> encode(profile p, const headers &h,
+inline result<buffer> encode(transport_version tv, profile p, const headers &h,
                               const moq_alloc_t *alloc = moq_alloc_default())
 {
     moq_loc_headers_t ch;
@@ -119,7 +129,7 @@ inline result<buffer> encode(profile p, const headers &h,
     }
 
     moq_rcbuf_t *raw = nullptr;
-    moq_result_t rc = moq_loc_encode(alloc,
+    moq_result_t rc = moq_loc_encode(alloc, tv,
         static_cast<moq_loc_profile_t>(p), &ch, &raw);
     if (rc < 0)
         return errc_from_result(rc);

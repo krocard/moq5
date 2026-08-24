@@ -2977,6 +2977,7 @@ static moq_request_error_t d18_semantic_request_error(uint64_t raw)
 }
 
 static const moq_profile_ops_t d18_ops = {
+    .version                 = MOQ_VERSION_DRAFT_18,
     .state_size              = sizeof(moq_d18_profile_state_t),
     .state_align             = _Alignof(moq_d18_profile_state_t),
     .init_in_place           = d18_init_in_place,

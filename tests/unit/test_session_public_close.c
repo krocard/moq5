@@ -46,6 +46,26 @@ int main(void)
     moq_event_cleanup(&event);
 
     moq_session_destroy(session);
+
+    /* Public consumer proof for moq_session_version(): CALLED and LINKED
+     * through <moq/session.h> against moq::core, on a non-default profile so
+     * a build that returned the config default would differ. This file is the
+     * public-only surface -- it never sees the test-internals archive. */
+    {
+        moq_session_cfg_t vcfg;
+        moq_session_cfg_init_sized(&vcfg, sizeof(vcfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        vcfg.version = MOQ_VERSION_DRAFT_18;
+        moq_session_t *vs = NULL;
+        CHECK(moq_session_create(&vcfg, 0, &vs) == MOQ_OK);
+        if (vs) {
+            CHECK(moq_session_version(vs) == MOQ_VERSION_DRAFT_18);
+            CHECK(moq_session_version(vs) != MOQ_VERSION_DRAFT_16);
+            moq_session_destroy(vs);
+        }
+        CHECK(moq_session_version(NULL) == (moq_version_t)0);
+    }
+
     if (failures == 0)
         printf("PASS: session_public_close\n");
     return failures ? 1 : 0;

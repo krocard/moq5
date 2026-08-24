@@ -143,7 +143,11 @@ func run() throws {
 
                         for candidate in catalog.selectTracks(matching: .h264Video) {
                             do {
-                                let desc = try candidate.playbackDescriptor()
+/* The negotiated draft is read from the LIVE SESSION; a hardcoded
+                                 * default here would decode draft-18 property bytes with
+                                 * the draft-16 codec. */
+                                guard let tv = sess.transportVersion else { return 0 }
+                                let desc = try candidate.playbackDescriptor(transportVersion: tv)
                                 state.formatDesc = try createH264FormatDescription(
                                     avccData: desc.codecConfig)
                                 let pbTrack = try pb.addTrack(desc.configuration)
@@ -163,7 +167,11 @@ func run() throws {
 
                         for candidate in catalog.selectTracks(matching: .aacAudio) {
                             do {
-                                let desc = try candidate.playbackDescriptor()
+/* The negotiated draft is read from the LIVE SESSION; a hardcoded
+                                 * default here would decode draft-18 property bytes with
+                                 * the draft-16 codec. */
+                                guard let tv = sess.transportVersion else { return 0 }
+                                let desc = try candidate.playbackDescriptor(transportVersion: tv)
                                 let pbTrack = try pb.addTrack(desc.configuration)
                                 let subTrack = try sub.subscribe(
                                     track: TrackName(namespace: ns, name: candidate.name))

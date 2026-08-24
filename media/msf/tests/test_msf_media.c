@@ -1,4 +1,6 @@
 #include <moq/msf_media.h>
+#include <moq/loc.h>
+#include <stddef.h>
 #include <moq/rcbuf.h>
 #include <stdio.h>
 #include <string.h>
@@ -903,6 +905,180 @@ int main(void)
         CHECK(oom.balance == 0);
 
         moq_rcbuf_decref(b64.buf);
+    }
+
+    /* -- The sized companion ------------------------------------------
+     *
+     * The legacy entry point cannot express a version, which means anything
+     * parsed with its output takes the legacy draft-16 contract. These cases
+     * pin the sized companion's contract: same mapping, a real version, and
+     * refusal rather than a silent downgrade. */
+    {
+        const moq_alloc_t *alloc = moq_alloc_default();
+
+        /* A minimal RAW/LOC track: the mapping is exercised elsewhere, so
+         * these cases hold it constant and vary only the ABI arguments. */
+        moq_msf_track_t t;
+        memset(&t, 0, sizeof(t));
+        t.name = lit("v0");
+        t.packaging = lit("loc");
+        t.has_role = true;
+        t.role = lit("video");
+        t.has_codec = true;
+        t.codec = lit("avc1.64001e");
+
+        /* -- both drafts stamp exactly, at the current size ------------ */
+        {
+            const moq_version_t vs[2] = { MOQ_VERSION_DRAFT_16,
+                                          MOQ_VERSION_DRAFT_18 };
+            for (size_t i = 0; i < 2; i++) {
+                moq_media_track_info_t info;
+                memset(&info, 0xAB, sizeof(info));
+                CHECK(moq_msf_track_to_media_info_sized(
+                          alloc, &t, &info, sizeof(info), vs[i], NULL, NULL)
+                      == MOQ_OK);
+                CHECK_EQ_U32(info.struct_size, (uint32_t)sizeof(info));
+                CHECK_EQ_INT(info.transport_version, vs[i]);
+                /* The catalog mapping is unchanged by the new entry point. */
+                CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
+                CHECK_EQ_INT(info.packaging, MOQ_MEDIA_PACKAGING_RAW);
+            }
+        }
+
+        /* -- the legacy entry point still behaves as before ------------- */
+        {
+            moq_media_track_info_t info;
+            memset(&info, 0xAB, sizeof(info));
+            CHECK(moq_msf_track_to_media_info(alloc, &t, &info, NULL, NULL)
+                  == MOQ_OK);
+            CHECK_EQ_U32(info.struct_size,
+                         (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE);
+            /* OLD-BUFFER CANARY: the sentinel past the frozen prefix is
+             * untouched, which is the actual out-of-bounds proof rather
+             * than merely the struct_size value. */
+            {
+                const unsigned char *raw = (const unsigned char *)&info;
+                for (size_t i = MOQ_MEDIA_TRACK_INFO_V0_SIZE;
+                     i < sizeof(info); i++)
+                    CHECK(raw[i] == 0xAB);
+            }
+        }
+
+        /* -- an undersized current request is REFUSED ------------------ */
+        {
+            /* Exactly the frozen prefix cannot hold a version. Answering
+             * this with a v0 output would reintroduce the silent draft-16
+             * trap, so it must be an error. */
+            moq_media_track_info_t info;
+            memset(&info, 0xAB, sizeof(info));
+            CHECK(moq_msf_track_to_media_info_sized(
+                      alloc, &t, &info, MOQ_MEDIA_TRACK_INFO_V0_SIZE,
+                      MOQ_VERSION_DRAFT_18, NULL, NULL) == MOQ_ERR_INVAL);
+            /* Nothing was written on the refusal path. */
+            {
+                const unsigned char *raw = (const unsigned char *)&info;
+                for (size_t i = 0; i < sizeof(info); i++)
+                    CHECK(raw[i] == 0xAB);
+            }
+
+            /* One byte short of covering the field is equally refused. */
+            memset(&info, 0xAB, sizeof(info));
+            CHECK(moq_msf_track_to_media_info_sized(
+                      alloc, &t, &info,
+                      offsetof(moq_media_track_info_t, transport_version)
+                          + sizeof(info.transport_version) - 1,
+                      MOQ_VERSION_DRAFT_16, NULL, NULL) == MOQ_ERR_INVAL);
+            CHECK(((const unsigned char *)&info)[0] == 0xAB);
+        }
+
+        /* -- zero and unsupported versions are REFUSED ----------------- */
+        {
+            static const moq_version_t bad[] = {
+                (moq_version_t)0,  (moq_version_t)1,  (moq_version_t)15,
+                (moq_version_t)17, (moq_version_t)19, (moq_version_t)0xffff,
+            };
+            for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+                moq_media_track_info_t info;
+                memset(&info, 0xAB, sizeof(info));
+                CHECK(moq_msf_track_to_media_info_sized(
+                          alloc, &t, &info, sizeof(info), bad[i], NULL, NULL)
+                      == MOQ_ERR_INVAL);
+                CHECK(((const unsigned char *)&info)[0] == 0xAB);
+            }
+        }
+
+        /* -- a larger-than-known size is clamped, not trusted ---------- */
+        {
+            moq_media_track_info_t info;
+            memset(&info, 0xAB, sizeof(info));
+            CHECK(moq_msf_track_to_media_info_sized(
+                      alloc, &t, &info, sizeof(info) + 64,
+                      MOQ_VERSION_DRAFT_18, NULL, NULL) == MOQ_OK);
+            CHECK_EQ_U32(info.struct_size, (uint32_t)sizeof(info));
+            CHECK_EQ_INT(info.transport_version, MOQ_VERSION_DRAFT_18);
+        }
+
+        /* -- the stamped output really drives the parser --------------- */
+        {
+            /* End to end: catalog -> sized helper -> moq_media_object_parse.
+             * A draft-18 property block must surface only through a
+             * draft-18-stamped descriptor. */
+            moq_loc_headers_t lh;
+            moq_loc_headers_init(&lh);
+            lh.has_timestamp = true;
+            lh.timestamp = 33333;
+
+            moq_rcbuf_t *props = NULL;
+            CHECK(moq_loc_encode(alloc, MOQ_VERSION_DRAFT_18,
+                                 MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+            moq_rcbuf_t *payload = NULL;
+            CHECK(moq_rcbuf_create(alloc, (const uint8_t *)"p", 1, &payload)
+                  == MOQ_OK);
+
+            if (props && payload) {
+                moq_media_object_input_t in;
+                moq_media_object_input_init(&in);
+                in.status = MOQ_OBJECT_NORMAL;
+                in.payload = payload;
+                in.properties = props;
+
+                moq_media_track_info_t d18;
+                CHECK(moq_msf_track_to_media_info_sized(
+                          alloc, &t, &d18, sizeof(d18),
+                          MOQ_VERSION_DRAFT_18, NULL, NULL) == MOQ_OK);
+                moq_media_parsed_object_t out;
+                CHECK(moq_media_object_parse(&d18, &in, NULL, 0, &out, NULL)
+                      == MOQ_OK);
+                CHECK(out.has_capture_time);
+                CHECK(out.capture_time_us == 33333u);
+
+                /* Through a draft-16-stamped descriptor the same bytes must
+                 * not reproduce the value. */
+                moq_media_track_info_t d16;
+                CHECK(moq_msf_track_to_media_info_sized(
+                          alloc, &t, &d16, sizeof(d16),
+                          MOQ_VERSION_DRAFT_16, NULL, NULL) == MOQ_OK);
+                moq_media_parsed_object_t other;
+                moq_media_drop_reason_t why = 0;
+                moq_result_t prc = moq_media_object_parse(
+                    &d16, &in, NULL, 0, &other, &why);
+                CHECK(!(prc == MOQ_OK && other.has_capture_time &&
+                        other.capture_time_us == 33333u));
+
+                /* And the LEGACY entry's output takes the draft-16 contract,
+                 * which is exactly why a current caller must not use it. */
+                moq_media_track_info_t legacy;
+                CHECK(moq_msf_track_to_media_info(alloc, &t, &legacy, NULL,
+                                                  NULL) == MOQ_OK);
+                moq_media_parsed_object_t leg;
+                moq_result_t lrc = moq_media_object_parse(
+                    &legacy, &in, NULL, 0, &leg, &why);
+                CHECK(!(lrc == MOQ_OK && leg.has_capture_time &&
+                        leg.capture_time_us == 33333u));
+            }
+            if (props) moq_rcbuf_decref(props);
+            if (payload) moq_rcbuf_decref(payload);
+        }
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

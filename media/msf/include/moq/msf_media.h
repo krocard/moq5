@@ -103,10 +103,65 @@ extern "C" {
  * Returns MOQ_ERR_PROTO if CMAF initData is malformed.
  * Returns MOQ_ERR_NOMEM if base64 decode allocation fails.
  */
+/*
+ * NARROWED OUTPUT, and why: this entry point takes only a pointer, so it
+ * cannot know how large the caller's moq_media_track_info_t is. It therefore
+ * initializes and fills ONLY THE FROZEN v0 PREFIX (through `timescale`) and
+ * leaves `struct_size` at MOQ_MEDIA_TRACK_INFO_V0_SIZE. That is what keeps it
+ * safe for a caller compiled against the pre-version ABI.
+ *
+ * The consequence for a CURRENT caller: the result expresses NO transport
+ * version, so moq_media_object_parse() applies the legacy standalone
+ * contract -- draft-16 -- to every object parsed with it. On a draft-18
+ * session that silently decodes draft-18 property bytes with the draft-16
+ * integer codec, which is wrong at any value at or above 64 and invisible
+ * below it.
+ *
+ * A current caller must therefore use moq_msf_track_to_media_info_sized()
+ * and pass the version its LIVE SESSION negotiated. Assigning `struct_size`
+ * and `transport_version` by hand after calling this function is NOT a
+ * supported integration pattern.
+ */
 MOQ_API moq_result_t moq_msf_track_to_media_info(
     const moq_alloc_t *alloc,
     const moq_msf_track_t *track,
     moq_media_track_info_t *out_info,
+    moq_cmaf_init_info_t *out_init,
+    moq_rcbuf_t **out_init_buf);
+
+/*
+ * Sized companion: the entry point for a caller that knows its own struct
+ * size and its session's negotiated transport draft.
+ *
+ * Identical catalog mapping to moq_msf_track_to_media_info() -- both are
+ * shells over one implementation -- but out_info is prepared for a CURRENT
+ * caller: at most `out_info_size` bytes are cleared and written, never more,
+ * `struct_size` records what was actually written, and `transport_version`
+ * is stamped with `transport_version`.
+ *
+ * `transport_version` is the draft the LIVE SESSION negotiated. It is the
+ * authority for the object-property integer codec; a catalog describes the
+ * track and never the session carrying it, so it cannot be derived here.
+ * Read it from the session (moq_session_version()), not from endpoint
+ * configuration or an offered preference.
+ *
+ * Refuses rather than downgrading:
+ *   - out_info_size too small to cover `transport_version` is MOQ_ERR_INVAL,
+ *     NOT a v0 result. A caller that asked for a version and cannot hold one
+ *     is a caller bug, and answering it with a silent draft-16 output is the
+ *     exact trap this function exists to remove;
+ *   - a transport_version of 0, or any version this build does not support,
+ *     is MOQ_ERR_INVAL.
+ *
+ * All other arguments, results and ownership rules are those of
+ * moq_msf_track_to_media_info() above.
+ */
+MOQ_API moq_result_t moq_msf_track_to_media_info_sized(
+    const moq_alloc_t *alloc,
+    const moq_msf_track_t *track,
+    moq_media_track_info_t *out_info,
+    size_t out_info_size,
+    moq_version_t transport_version,
     moq_cmaf_init_info_t *out_init,
     moq_rcbuf_t **out_init_buf);
 

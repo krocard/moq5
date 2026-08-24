@@ -8,14 +8,41 @@
  * bytes for the selected LOC profile. Each profile maps typed C
  * fields to the property IDs defined by that LOC draft version.
  *
- * Pure helper library: no sessions, no I/O, no threads.
+ * Pure helper library: no sessions, no I/O, no threads. A
+ * moq_version_t is taken by value to select the wire codec; no
+ * session is touched.
  * Link against moq::loc (depends only on moq::core).
  *
  * Unknown well-formed properties are silently ignored.
+ *
+ * -- Transport version and the KVP integer codec ----------------------
+ *
+ * LOC headers travel as MoQ object header properties, which are
+ * Key-Value-Pairs (draft-ietf-moq-loc-01 section 2.3). The LOC profile
+ * fixes the property IDs and their semantics; the NEGOTIATED TRANSPORT
+ * DRAFT fixes the integer encoding those pairs are written in, and the
+ * two drafts do not agree:
+ *
+ *   MOQ_VERSION_DRAFT_16  section 1.4/1.4.2 -- fields marked (i) use the
+ *     RFC 9000 QUIC variable-length integer (1/2/4/8 bytes, max 2^62-1);
+ *   MOQ_VERSION_DRAFT_18  section 1.4.1/1.4.3 -- fields marked (vi64) use
+ *     MOQT's own encoding (1..9 bytes, max 2^64-1).
+ *
+ * The Delta Type, the odd-type Length, and the even-type value are all
+ * encoded with that draft's integer. Values 0..63 encode identically in
+ * both, so a codec confusion is invisible below 64 and produces wrong
+ * bytes at or above it.
+ *
+ * Every parse/encode call therefore names the transport version
+ * explicitly. There is no default: an unsupported or unknown version --
+ * including 0 -- FAILS CLOSED with MOQ_ERR_INVAL rather than guessing a
+ * codec. A future draft becomes usable here only when its property codec
+ * is deliberately registered in the codec table.
  */
 
 #include <moq/types.h>
 #include <moq/rcbuf.h>
+#include <moq/session.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,12 +113,18 @@ MOQ_API void moq_loc_headers_init(moq_loc_headers_t *h);
  *
  * video_config.data is BORROWED from the input property bytes.
  *
+ * The Key-Value-Pair integer codec is selected by transport_version.
+ *
  * Returns MOQ_OK on success.
  * Returns MOQ_ERR_INVAL if out is NULL, data is NULL with len > 0,
- *   or profile is not a supported value.
+ *   profile is not a supported value, or transport_version is not a
+ *   supported value. The version is checked even for an EMPTY property
+ *   block: a caller that cannot name its codec is refused whether or
+ *   not there is anything to decode.
  * Returns MOQ_ERR_PROTO on malformed data.
  */
-MOQ_API moq_result_t moq_loc_parse(moq_loc_profile_t profile,
+MOQ_API moq_result_t moq_loc_parse(moq_version_t transport_version,
+                                    moq_loc_profile_t profile,
                                     moq_bytes_t properties,
                                     moq_loc_headers_t *out);
 
@@ -101,13 +134,22 @@ MOQ_API moq_result_t moq_loc_parse(moq_loc_profile_t profile,
  * Fields are emitted in ascending property ID order. Allocates one
  * rcbuf via alloc.
  *
+ * The Key-Value-Pair integer codec is selected by transport_version.
+ * A value the selected codec cannot represent -- a timestamp beyond
+ * what the draft-16 integer encoding reaches, say -- is MOQ_ERR_INVAL,
+ * not a truncation.
+ *
  * If no fields are set, returns MOQ_OK with *out_properties = NULL.
  * Returns MOQ_ERR_INVAL on invalid input (audio level > 127,
  *   temporal_id > 7, NULL alloc or out_properties, unsupported
- *   profile, or a field unsupported by the selected profile).
+ *   profile, unsupported transport_version, a value the selected
+ *   codec cannot represent, or a field unsupported by the selected
+ *   profile). The version is checked BEFORE the field set, so a
+ *   caller with nothing to encode is still refused an unknown codec.
  * Returns MOQ_ERR_NOMEM on allocation failure.
  */
 MOQ_API moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
+                                     moq_version_t transport_version,
                                      moq_loc_profile_t profile,
                                      const moq_loc_headers_t *headers,
                                      moq_rcbuf_t **out_properties);

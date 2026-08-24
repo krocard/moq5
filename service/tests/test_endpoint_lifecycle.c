@@ -11,10 +11,12 @@
 #include <moq/media_receiver.h>
 #include <moq/media_sender.h>
 #include <moq/picoquic_threaded.h>
+#include <moq/session.h>   /* moq_session_version: the endpoint/session agreement */
 #include "test_support.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -118,25 +120,175 @@ static void *wake_waiter_fn(void *arg)
 
 /* -- post() task plumbing --------------------------------------------- */
 
+/*
+ * LIFETIME, PUBLICATION AND EXACTLY-ONCE, all required by endpoint.h
+ * section 5.4.
+ *
+ * Lifetime: an accepted post() task runs EXACTLY ONCE, but not necessarily
+ * before the poster stops waiting -- on a timeout it runs later, during the
+ * stop()/destroy() terminal drain. A block-local context would then be written
+ * through after its scope ended. Every context below, and every object one
+ * points at, therefore has STATIC storage: it stays alive through stop(),
+ * destroy() and until process termination, so a late task can never write
+ * through a dangling pointer.
+ *
+ * Publication: the task writes its result fields FIRST and publishes
+ * completion LAST with a release RMW on `done`; a reader acquires `done`
+ * before observing any result.
+ *
+ * Exactly-once: the results are ATOMIC, not plain. The test observes them
+ * while the endpoint is still live, so if the contract under test is BROKEN
+ * and the task runs a second time, that invocation writes concurrently with
+ * the reader. Plain fields would make this fixture race under the very defect
+ * it exists to diagnose; atomic fields make the violation defined and
+ * diagnosable instead. The counts are additionally reasserted after
+ * moq_endpoint_stop() has drained all accepted work, so a duplicate that
+ * happens LATER in the endpoint's lifetime cannot slip past a check taken at
+ * the first completion.
+ *
+ * Because the statics are reused across cases, each is reset before use.
+ */
 typedef struct {
-    atomic_int   *ran;          /* incremented per invocation */
-    atomic_int   *order_ctr;    /* shared FIFO counter */
-    int           order_seen;   /* this task's draw from order_ctr */
-    int           id;
-    atomic_int   *null_session; /* set if invoked with session == NULL */
-    atomic_int   *live_session; /* set if invoked with session != NULL */
+    /* inputs */
+    atomic_int *order_ctr;      /* shared FIFO counter (static storage) */
+    int         id;
+
+    /* results -- atomic; written before `done` is published */
+    atomic_int  order_seen;     /* this task's draw from order_ctr; -1 = none */
+    atomic_int  saw_null_session;
+    atomic_int  saw_live_session;
+
+    /* completion -- published LAST, with release */
+    atomic_int  done;           /* invocation count */
 } task_ctx_t;
+
+/* Static storage: see the LIFETIME note above. */
+static atomic_int  g_task_order;
+static task_ctx_t  g_task_a, g_task_b, g_task_after_stop, g_task_wt;
+
+static void task_ctx_reset(task_ctx_t *t, atomic_int *order_ctr, int id)
+{
+    t->order_ctr = order_ctr;
+    t->id = id;
+    atomic_init(&t->order_seen, -1);
+    atomic_init(&t->saw_null_session, 0);
+    atomic_init(&t->saw_live_session, 0);
+    atomic_init(&t->done, 0);
+}
+
+/* Acquire completion; returns the invocation count. A caller observes the
+ * result fields only after this returns >= 1. */
+static int task_ctx_done(const task_ctx_t *t)
+{
+    return atomic_load_explicit(&((task_ctx_t *)t)->done, memory_order_acquire);
+}
+
+static int task_ctx_get(const atomic_int *f)
+{
+    return atomic_load_explicit((atomic_int *)f, memory_order_relaxed);
+}
 
 static moq_result_t task_fn(moq_endpoint_t *ep, moq_session_t *session,
                             uint64_t now_us, void *ctx)
 {
     (void)ep; (void)now_us;
     task_ctx_t *t = (task_ctx_t *)ctx;
-    atomic_fetch_add(t->ran, 1);
+
+    /* results first ... */
     if (t->order_ctr)
-        t->order_seen = atomic_fetch_add(t->order_ctr, 1);
-    if (session) { if (t->live_session) atomic_store(t->live_session, 1); }
-    else         { if (t->null_session) atomic_store(t->null_session, 1); }
+        atomic_store_explicit(&t->order_seen,
+                              atomic_fetch_add(t->order_ctr, 1),
+                              memory_order_relaxed);
+    if (session)
+        atomic_store_explicit(&t->saw_live_session, 1, memory_order_relaxed);
+    else
+        atomic_store_explicit(&t->saw_null_session, 1, memory_order_relaxed);
+
+    /* ... completion last: release, so an acquiring reader sees the above */
+    atomic_fetch_add_explicit(&t->done, 1, memory_order_release);
+    return MOQ_OK;
+}
+
+/* The full FIFO postcondition, asserted both at first completion and again
+ * after the terminal drain. `expect_a`/`expect_b` pin the order draws so a
+ * late duplicate that redraws the shared counter is caught, not just a
+ * duplicate that bumps the count. */
+static void check_fifo_post(const char *when, int expect_a, int expect_b)
+{
+    int da = task_ctx_done(&g_task_a);
+    int db = task_ctx_done(&g_task_b);
+
+    if (da != 1 || db != 1)
+        fprintf(stderr, "FAIL[fifo.%s]: done a=%d b=%d (want 1,1)\n",
+                when, da, db);
+    MOQ_TEST_CHECK_EQ_INT(da, 1);              /* exactly once */
+    MOQ_TEST_CHECK_EQ_INT(db, 1);
+    if (da >= 1 && db >= 1) {
+        int oa = task_ctx_get(&g_task_a.order_seen);
+        int ob = task_ctx_get(&g_task_b.order_seen);
+        MOQ_TEST_CHECK(oa < ob);                        /* FIFO */
+        if (expect_a >= 0) MOQ_TEST_CHECK_EQ_INT(oa, expect_a);   /* stable */
+        if (expect_b >= 0) MOQ_TEST_CHECK_EQ_INT(ob, expect_b);
+        MOQ_TEST_CHECK_EQ_INT(task_ctx_get(&g_task_a.saw_live_session), 1);
+        MOQ_TEST_CHECK_EQ_INT(task_ctx_get(&g_task_b.saw_live_session), 1);
+        MOQ_TEST_CHECK_EQ_INT(task_ctx_get(&g_task_a.saw_null_session), 0);
+        MOQ_TEST_CHECK_EQ_INT(task_ctx_get(&g_task_b.saw_null_session), 0);
+    }
+}
+
+/* -- endpoint/session version agreement -------------------------------- *
+ * The one point where both facts are legitimately observable at once: a
+ * post() task runs on the managed execution context and is handed BOTH the
+ * endpoint and its live session (endpoint.h section 5.4), so it can read the
+ * transport's negotiated version and the session's own wire profile without
+ * any test-only accessor or internal header. The task may legitimately run
+ * with session == NULL during terminal drain; that is recorded, never
+ * dereferenced.
+ *
+ * LIFETIME: an accepted post() task is guaranteed to run EXACTLY ONCE, but
+ * not necessarily before the poster stops waiting -- on the timeout path it
+ * runs later, during the terminal drain. Block-local context would then be
+ * written through after its scope ended, turning a test FAILURE into a
+ * delayed stack use-after-return. The context therefore has STATIC storage:
+ * it stays alive through the endpoint, stop(), destroy() and until process
+ * termination, so the task can never write through a dangling pointer no
+ * matter when it runs. Synchronization is unchanged -- the reader acquires on `ran`, which
+ * the task releases after publishing both versions -- and nothing sleeps. */
+typedef struct {
+    /* Result fields are ATOMIC, not plain: on the timeout path the reader
+     * leaves the bounded wait with ran == 0, records the failure, and the
+     * accepted task may still be writing. Atomic storage makes that read
+     * defined (it reports the stale zero the failing assertion wants to show)
+     * instead of a data race. Publication order is still results-then-`ran`
+     * with release, so a successful reader sees a coherent pair. */
+    atomic_int ran;
+    atomic_int saw_null_session;
+    atomic_int ep_version;
+    atomic_int session_version;
+} version_probe_t;
+
+/* Static storage duration: see the LIFETIME note above. */
+static version_probe_t g_version_probe;
+
+static moq_result_t version_probe_fn(moq_endpoint_t *ep,
+                                     moq_session_t *session,
+                                     uint64_t now_us, void *ctx)
+{
+    (void)now_us;
+    version_probe_t *p = (version_probe_t *)ctx;
+
+    if (!session) {
+        atomic_store_explicit(&p->saw_null_session, 1, memory_order_relaxed);
+    } else {
+        atomic_store_explicit(&p->ep_version,
+                              (int)moq_endpoint_negotiated_version(ep),
+                              memory_order_relaxed);
+        atomic_store_explicit(&p->session_version,
+                              (int)moq_session_version(session),
+                              memory_order_relaxed);
+    }
+    /* release: publishes both versions to whoever acquires on `ran` */
+    atomic_fetch_add_explicit(&p->ran, 1, memory_order_release);
     return MOQ_OK;
 }
 
@@ -213,6 +365,39 @@ int main(int argc, char **argv)
                           (int)MOQ_VERSION_DRAFT_16);
     MOQ_TEST_CHECK(!moq_endpoint_is_fatal(ep));
     MOQ_TEST_CHECK(!moq_endpoint_is_closed(ep));
+
+    /* == the endpoint's negotiated version IS the session's profile ==== *
+     * Established and not closing, so the task runs with a live session.
+     * Both values are read inside the same task invocation, on the context
+     * that owns them -- not sampled from two different threads at two
+     * different times. */
+    {
+        version_probe_t *vp = &g_version_probe;   /* static: see LIFETIME */
+        atomic_init(&vp->ran, 0);
+        atomic_init(&vp->saw_null_session, 0);
+        atomic_init(&vp->ep_version, 0);
+        atomic_init(&vp->session_version, 0);
+
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, version_probe_fn, vp),
+                              (int)MOQ_OK);
+        int waited = 0;
+        /* acquire on `ran`; no sleep, the wait is the endpoint's own */
+        while (atomic_load_explicit(&vp->ran, memory_order_acquire) == 0 &&
+               waited < 5000) {
+            (void)moq_endpoint_wait(ep, 100000);
+            waited += 100;
+        }
+        int vran = atomic_load_explicit(&vp->ran, memory_order_acquire);
+        MOQ_TEST_CHECK_EQ_INT(vran, 1);
+        MOQ_TEST_CHECK_EQ_INT(
+            atomic_load_explicit(&vp->saw_null_session, memory_order_relaxed),
+            0);
+        int sv = atomic_load_explicit(&vp->session_version,
+                                      memory_order_relaxed);
+        int ev = atomic_load_explicit(&vp->ep_version, memory_order_relaxed);
+        MOQ_TEST_CHECK_EQ_INT(sv, (int)MOQ_VERSION_DRAFT_16);
+        MOQ_TEST_CHECK_EQ_INT(ev, sv);
+    }
 
     /* == wait: timeout (MOQ_DONE) is observable once quiescent ======== */
     {
@@ -291,26 +476,29 @@ int main(int argc, char **argv)
     }
 
     /* == post(): FIFO + exactly-once on the network thread ============ */
+    int fifo_order_a = -1, fifo_order_b = -1;   /* reasserted after stop() */
     {
-        atomic_int ran_a, ran_b, order, live;
-        atomic_init(&ran_a, 0); atomic_init(&ran_b, 0);
-        atomic_init(&order, 0); atomic_init(&live, 0);
-        task_ctx_t ta = { &ran_a, &order, -1, 1, NULL, &live };
-        task_ctx_t tb = { &ran_b, &order, -1, 2, NULL, &live };
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, task_fn, &ta),
+        task_ctx_t *ta = &g_task_a;      /* static: see LIFETIME */
+        task_ctx_t *tb = &g_task_b;
+        atomic_init(&g_task_order, 0);
+        task_ctx_reset(ta, &g_task_order, 1);
+        task_ctx_reset(tb, &g_task_order, 2);
+
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, task_fn, ta),
                               (int)MOQ_OK);
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, task_fn, &tb),
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, task_fn, tb),
                               (int)MOQ_OK);
         int waited = 0;
-        while ((atomic_load(&ran_a) == 0 || atomic_load(&ran_b) == 0) &&
+        while ((task_ctx_done(ta) == 0 || task_ctx_done(tb) == 0) &&
                waited < 5000) {
             (void)moq_endpoint_wait(ep, 100000);
             waited += 100;
         }
-        MOQ_TEST_CHECK_EQ_INT(atomic_load(&ran_a), 1);   /* exactly once */
-        MOQ_TEST_CHECK_EQ_INT(atomic_load(&ran_b), 1);
-        MOQ_TEST_CHECK(ta.order_seen < tb.order_seen);   /* FIFO */
-        MOQ_TEST_CHECK_EQ_INT(atomic_load(&live), 1);    /* live session */
+        /* acquire completion, then observe; the draws are recorded so the
+         * post-terminal reassertion can prove they never moved */
+        check_fifo_post("live", -1, -1);
+        fifo_order_a = task_ctx_get(&ta->order_seen);
+        fifo_order_b = task_ctx_get(&tb->order_seen);
     }
 
     /* == stop: idempotent; post-after-stop never runs fn =============== */
@@ -322,13 +510,48 @@ int main(int argc, char **argv)
                               (int)MOQ_ENDPOINT_CLOSED);
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_wait(ep, 1000),
                               (int)MOQ_ERR_CLOSED);
-        atomic_int ran; atomic_init(&ran, 0);
-        task_ctx_t t = { &ran, NULL, -1, 3, NULL, NULL };
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, task_fn, &t),
+        /* post-after-stop: refused, caller keeps ctx, fn NEVER runs. The ctx
+         * is static anyway, so even a contract violation could not corrupt
+         * the stack -- it would show up as done != 0. */
+        task_ctx_t *t = &g_task_after_stop;
+        task_ctx_reset(t, NULL, 3);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(ep, task_fn, t),
                               (int)MOQ_ERR_CLOSED);
-        MOQ_TEST_CHECK_EQ_INT(atomic_load(&ran), 0);
+        MOQ_TEST_CHECK_EQ_INT(task_ctx_done(t), 0);
+
+        /* == exactly-once THROUGH the terminal drain ==================== *
+         * stop() has drained every accepted task, so no further invocation
+         * is possible. Reassert the complete postconditions here: a
+         * duplicate that arrived after the first observation -- during a
+         * later pump cycle or in the drain itself -- is invisible to a check
+         * taken at first completion, and visible here. */
+        check_fifo_post("post-stop", fifo_order_a, fifo_order_b);
+
+        {
+            version_probe_t *vp = &g_version_probe;
+            int vr = atomic_load_explicit(&vp->ran, memory_order_acquire);
+            MOQ_TEST_CHECK_EQ_INT(vr, 1);            /* still exactly once */
+            MOQ_TEST_CHECK_EQ_INT(
+                atomic_load_explicit(&vp->saw_null_session,
+                                     memory_order_relaxed), 0);
+            MOQ_TEST_CHECK_EQ_INT(
+                atomic_load_explicit(&vp->session_version,
+                                     memory_order_relaxed),
+                (int)MOQ_VERSION_DRAFT_16);
+            MOQ_TEST_CHECK_EQ_INT(
+                atomic_load_explicit(&vp->ep_version, memory_order_relaxed),
+                atomic_load_explicit(&vp->session_version,
+                                     memory_order_relaxed));
+        }
+
         moq_endpoint_destroy(ep);
         ep = NULL;
+
+        /* destroy cannot resurrect a task either */
+        check_fifo_post("post-destroy", fifo_order_a, fifo_order_b);
+        MOQ_TEST_CHECK_EQ_INT(
+            atomic_load_explicit(&g_version_probe.ran, memory_order_acquire),
+            1);
     }
 
     /* == Deterministic NULL-session terminal drain ==================== *
@@ -364,18 +587,33 @@ int main(int argc, char **argv)
         moq_endpoint_t *wep = NULL;
         moq_result_t crc = moq_endpoint_connect(&wc, &wep);
         if (crc == MOQ_OK) {
-            atomic_int ran, null_seen, live_seen;
-            atomic_init(&ran, 0);
-            atomic_init(&null_seen, 0);
-            atomic_init(&live_seen, 0);
-            task_ctx_t t = { &ran, NULL, -1, 4, &null_seen, &live_seen };
-            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(wep, task_fn, &t),
+            task_ctx_t *t = &g_task_wt;   /* static: drains at stop() */
+            task_ctx_reset(t, NULL, 4);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(wep, task_fn, t),
                                   (int)MOQ_OK);
             MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(wep), (int)MOQ_OK);
-            MOQ_TEST_CHECK_EQ_INT(atomic_load(&ran), 1);        /* exactly once */
-            MOQ_TEST_CHECK_EQ_INT(atomic_load(&null_seen), 1);  /* NULL marker */
-            MOQ_TEST_CHECK_EQ_INT(atomic_load(&live_seen), 0);
+            /* after stop(): the accepted task drained exactly once, with the
+             * NULL-session marker and no live marker */
+            int dw = task_ctx_done(t);
+            MOQ_TEST_CHECK_EQ_INT(dw, 1);                 /* exactly once */
+            if (dw >= 1) {
+                MOQ_TEST_CHECK_EQ_INT(
+                    task_ctx_get(&t->saw_null_session), 1);   /* NULL marker */
+                MOQ_TEST_CHECK_EQ_INT(
+                    task_ctx_get(&t->saw_live_session), 0);
+            }
+
             moq_endpoint_destroy(wep);
+
+            /* ... and destroy cannot resurrect it. The context is static and
+             * every field atomic, so observing it after the endpoint is gone
+             * is valid; the COMPLETE postcondition is reasserted, not just
+             * the count, so a duplicate arriving during destroy that also
+             * flipped a marker is caught. */
+            int dwd = task_ctx_done(t);
+            MOQ_TEST_CHECK_EQ_INT(dwd, 1);
+            MOQ_TEST_CHECK_EQ_INT(task_ctx_get(&t->saw_null_session), 1);
+            MOQ_TEST_CHECK_EQ_INT(task_ctx_get(&t->saw_live_session), 0);
         } else {
             MOQ_TEST_CHECK_EQ_INT((int)crc, (int)MOQ_ERR_UNSUPPORTED);
         }

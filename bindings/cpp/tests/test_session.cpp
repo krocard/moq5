@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <optional>
+#include <utility>   // std::move: the moved-from version() case
 #include <vector>
 
 // Release callback for a wrapped rcbuf: flips *ctx to true on final decref.
@@ -99,6 +100,74 @@ int main()
         auto r = moq::session::create({.perspective = moq::perspective::server});
         MOQ_CHECK(r.ok());
         MOQ_CHECK(r->state() == moq::session_state::idle);
+    }
+
+    // -- 2b. version(): the wrapper reports the C accessor, not the config
+    // default. Both drafts are exercised so a wrapper that returned a constant
+    // or echoed session_config::version would differ from moq_session_version()
+    // on at least one of them.
+    {
+        auto d16 = moq::session::create(
+            {.perspective = moq::perspective::client,
+             .version = MOQ_VERSION_DRAFT_16});
+        MOQ_CHECK(d16.ok());
+        MOQ_CHECK(d16->version() == MOQ_VERSION_DRAFT_16);
+        MOQ_CHECK(d16->version() == moq_session_version(d16->raw()));
+
+        auto d18 = moq::session::create(
+            {.perspective = moq::perspective::client,
+             .version = MOQ_VERSION_DRAFT_18});
+        MOQ_CHECK(d18.ok());
+        MOQ_CHECK(d18->version() == MOQ_VERSION_DRAFT_18);
+        MOQ_CHECK(d18->version() == moq_session_version(d18->raw()));
+
+        MOQ_CHECK(d16->version() != d18->version());
+
+        // An unset config version still reports the profile actually bound
+        // (draft-16), not the zero the config carried.
+        auto dflt = moq::session::create(
+            {.perspective = moq::perspective::client});
+        MOQ_CHECK(dflt.ok());
+        MOQ_CHECK(dflt->version() == MOQ_VERSION_DRAFT_16);
+        MOQ_CHECK(dflt->version() == moq_session_version(dflt->raw()));
+
+        // The wrapper comment states zero for a null raw handle, so prove it:
+        // a default-constructed session holds none. This is also the direct
+        // discriminator for a wrapper returning a constant NONZERO version,
+        // which every assertion above would otherwise let through.
+        moq::session empty;
+        MOQ_CHECK(empty.raw() == nullptr);
+        MOQ_CHECK(empty.version() == (moq_version_t)0);
+    }
+
+    // -- 2c. version() on a genuinely MOVED-FROM session ----------------
+    // The wrapper documents zero for a moved-from session specifically, so
+    // exercise the move itself rather than only the default-constructed
+    // stand-in: ownership transfers, the source's raw handle becomes null and
+    // its version reads zero, and the destination still reports the profile
+    // the moved session was created for.
+    {
+        auto r = moq::session::create(
+            {.perspective = moq::perspective::client,
+             .version = MOQ_VERSION_DRAFT_18});
+        MOQ_CHECK(r.ok());
+        moq::session src = std::move(*r);
+        MOQ_CHECK(src.raw() != nullptr);
+        MOQ_CHECK(src.version() == MOQ_VERSION_DRAFT_18);
+
+        moq::session dst = std::move(src);
+        MOQ_CHECK(src.raw() == nullptr);                     // moved-from
+        MOQ_CHECK(src.version() == (moq_version_t)0);
+        MOQ_CHECK(dst.raw() != nullptr);                     // destination
+        MOQ_CHECK(dst.version() == MOQ_VERSION_DRAFT_18);
+        MOQ_CHECK(dst.version() == moq_session_version(dst.raw()));
+
+        // move-assignment reaches the same state
+        moq::session assigned;
+        assigned = std::move(dst);
+        MOQ_CHECK(dst.raw() == nullptr);
+        MOQ_CHECK(dst.version() == (moq_version_t)0);
+        MOQ_CHECK(assigned.version() == MOQ_VERSION_DRAFT_18);
     }
 
     // -- 3. Start client + poll send_control ---------------------------

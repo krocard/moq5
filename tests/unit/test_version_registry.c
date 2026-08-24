@@ -69,6 +69,62 @@ int main(void)
         MOQ_TEST_CHECK(s == NULL);
     }
 
+    /* == Every profile self-reports the version it was looked up by ===== *
+     * The profile descriptor is the single authority for a session's
+     * version, so the lookup key and the table's own field must agree for
+     * EVERY supported version, not just the two named above. The domain is
+     * swept exhaustively rather than listed: moq_version_t values are IETF
+     * draft numbers -- small, monotonically increasing integers (this
+     * document is at 18) -- so 0..255 covers every plausible future draft
+     * by an order of magnitude, and a new profile added to
+     * moq_profile_lookup() without its .version member leaves 0 here and
+     * fails on its own iteration. */
+    {
+        int available = 0;
+        for (unsigned v = 0; v <= 255u; v++) {
+            const moq_profile_ops_t *ops =
+                moq_profile_lookup((moq_version_t)v);
+            if (!ops) continue;
+            available++;
+            /* the invariant: lookup key == the table's own declaration */
+            MOQ_TEST_CHECK_EQ_INT((int)ops->version, (int)v);
+        }
+        /* Non-vacuity: the sweep must actually have found profiles. */
+        MOQ_TEST_CHECK(available >= 2);
+    }
+
+    /* == moq_session_version: NULL, and the configured value ============ */
+    {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_version(NULL), 0);
+    }
+    {
+        /* The default (version 0 -> draft-16) reports draft-16, not 0. */
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&cfg, 0, &s),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_version(s),
+                              (int)MOQ_VERSION_DRAFT_16);
+        moq_session_destroy(s);
+    }
+    {
+        const moq_version_t versions[] = { MOQ_VERSION_DRAFT_16,
+                                           MOQ_VERSION_DRAFT_18 };
+        for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+            moq_result_t rc;
+            moq_session_t *s = try_create(versions[i], &rc);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+            MOQ_TEST_CHECK(s != NULL);
+            if (s) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_session_version(s),
+                                      (int)versions[i]);
+                moq_session_destroy(s);
+            }
+        }
+    }
+
     MOQ_TEST_PASS("version_registry");
     return failures != 0;
 }

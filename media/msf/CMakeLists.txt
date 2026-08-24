@@ -62,9 +62,12 @@ if(MOQ_BUILD_TESTS)
         MOQ_MSF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME msf COMMAND test_msf)
 
-    if(TARGET moq::media-object AND TARGET moq::cmaf)
+    # moq::loc is additionally required because the sized-companion cases
+    # drive a real LOC property block end to end through the parser, which
+    # is what proves the stamped version actually selects the codec.
+    if(TARGET moq::media-object AND TARGET moq::cmaf AND TARGET moq::loc)
         add_executable(test_msf_media tests/test_msf_media.c)
-        target_link_libraries(test_msf_media PRIVATE moq::msf)
+        target_link_libraries(test_msf_media PRIVATE moq::msf moq::loc)
         add_test(NAME msf_media COMMAND test_msf_media)
     endif()
 

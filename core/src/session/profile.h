@@ -74,6 +74,16 @@ typedef struct moq_dt_scan {
 } moq_dt_scan_t;
 
 typedef struct moq_profile_ops {
+    /*
+     * The wire profile this table implements. Invariant, asserted by the
+     * version-registry test: moq_profile_lookup(v)->version == v for every
+     * version this build supports. A profile that omits it leaves 0 under
+     * the designated initializers below and fails that assertion, rather
+     * than silently reporting the wrong draft. This is the single authority
+     * for a session's version -- the session stores no separate copy.
+     */
+    moq_version_t version;
+
     size_t state_size;
     size_t state_align;
 

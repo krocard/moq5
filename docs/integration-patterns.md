@@ -155,22 +155,43 @@ extracts timestamps, keyframe flags, and sample data from raw MoQ
 objects based on LOC properties and CMAF packaging. It runs on
 the network thread inside `on_lane_pump`.
 
+The track info must carry the transport draft the SESSION negotiated:
+LOC object properties are Key-Value-Pairs, and draft-16 and draft-18
+encode a KVP's integers differently (draft-16 §1.4 `(i)`, draft-18
+§1.4.1 `(vi64)`). The two agree only below 64, so a wrong draft is
+invisible on small values and wrong on everything else. A catalog
+describes the track, never the session carrying it, so the version
+comes from `moq_session_version(session)` — never from endpoint
+configuration or an offered preference.
+
 ```c
 /* Set up track info from an MSF catalog entry (recommended). */
 moq_media_track_info_t track;
 moq_cmaf_init_info_t   cmaf_init;
 moq_rcbuf_t           *init_buf = NULL;
-moq_result_t rc = moq_msf_track_to_media_info(
-    alloc, msf_track, &track, &cmaf_init, &init_buf);
-/* track.media_type, .packaging, .timescale are filled.
+moq_result_t rc = moq_msf_track_to_media_info_sized(
+    alloc, msf_track, &track, sizeof(track),
+    moq_session_version(session),        /* the live session is the authority */
+    &cmaf_init, &init_buf);
+/* track.media_type, .packaging, .timescale, .transport_version are filled.
  * cmaf_init.codec_config borrows from init_buf (decref when done).
- * For LOC tracks, init_buf is NULL and cmaf_init is zeroed. */
+ * For LOC tracks, init_buf is NULL and cmaf_init is zeroed.
+ *
+ * An unobserved (0) or unsupported version is MOQ_ERR_INVAL here rather
+ * than a silent draft-16 result -- fail closed, do not guess a codec.
+ *
+ * moq_msf_track_to_media_info() (no _sized) remains for callers compiled
+ * against the pre-version ABI. It fills only the frozen v0 prefix and
+ * expresses no version, so anything parsed with its output takes the
+ * legacy draft-16 contract. Do NOT call it and then assign struct_size
+ * and transport_version by hand. */
 
 /* Or set up manually from app config: */
-moq_media_track_info_init(&track);
-track.media_type = MOQ_MEDIA_TYPE_VIDEO;
-track.packaging  = MOQ_MEDIA_PACKAGING_CMAF;
-track.timescale  = 90000;
+moq_media_track_info_init_sized(&track, sizeof(track));
+track.media_type        = MOQ_MEDIA_TYPE_VIDEO;
+track.packaging         = MOQ_MEDIA_PACKAGING_CMAF;
+track.timescale         = 90000;
+track.transport_version = moq_session_version(session);
 
 /* Per-object parse. */
 moq_media_object_input_t in;

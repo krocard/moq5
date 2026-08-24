@@ -579,7 +579,7 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                 moq_result_t rc = moq_session_on_datagram(
                     to_session, dgdata, dglen, sp->now_us);
                 trace_input(sp, MOQ_SIM_INPUT_DATAGRAM, from, to,
-                            bytes, rc);
+                            bytes, rc, SIM_INPUT_DETAIL_NONE);
                 if (rc < 0) {
                     moq_action_cleanup(&actions[i]);
                     for (size_t j = i + 1; j < n; j++)
@@ -740,7 +740,8 @@ moq_result_t pump_direction(moq_simpair_t *sp,
 
             trace_input(sp, MOQ_SIM_INPUT_CONTROL_BYTES,
                         from, to,
-                        (moq_bytes_t){ bad_msg, sizeof(bad_msg) }, rc);
+                        (moq_bytes_t){ bad_msg, sizeof(bad_msg) }, rc,
+                        SIM_INPUT_DETAIL_NONE);
 
             (*delivered)++;
 

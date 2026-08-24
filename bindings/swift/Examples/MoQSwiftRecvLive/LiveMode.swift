@@ -125,7 +125,11 @@ func runLive(args: RecvArgs) throws {
 
                         for msfTrack in catalog.tracks {
                             do {
-                                let desc = try msfTrack.playbackDescriptor()
+/* The negotiated draft is read from the LIVE SESSION; a hardcoded
+                                 * default here would decode draft-18 property bytes with
+                                 * the draft-16 codec. */
+                                guard let tv = sess.transportVersion else { return 0 }
+                                let desc = try msfTrack.playbackDescriptor(transportVersion: tv)
                                 let pbTrack = try pb.addTrack(desc.configuration)
                                 let subTrack = try sub.subscribe(
                                     track: TrackName(namespace: ns, name: msfTrack.name))

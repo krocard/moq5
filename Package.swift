@@ -64,7 +64,7 @@ let package = Package(
         // Swift bindings.
         .target(
             name: "MoQ",
-            dependencies: ["CMoQCore"],
+            dependencies: ["CMoQCore", "MoQTransportModel"],
             path: "bindings/swift/Sources/MoQ"
         ),
 
@@ -81,8 +81,23 @@ let package = Package(
         // Swift media layer.
         .target(
             name: "MoQMedia",
-            dependencies: ["MoQ", "MoQCatalog", "CMoQMediaObject", "CMoQLOC", "CMoQCMAF", "CMoQPlayback"],
+            dependencies: ["MoQ", "MoQCatalog", "MoQTransportModel", "CMoQMediaObject", "CMoQLOC", "CMoQCMAF", "CMoQPlayback"],
             path: "bindings/swift/Sources/MoQMedia"
+        ),
+
+        // The single transport-version nominal type, shared by the service
+        // and media layers through their own aliases. Deliberately
+        // dependency-free: it is a protocol model, not a binding, so neither
+        // layer has to depend on the other to name a negotiated draft.
+        //
+        // Target only, NOT a package product: it exists so the two layers can
+        // share one type, and an application has no reason to depend on a
+        // module containing only that. The public spellings reach consumers
+        // through MoQServiceCore's `MoQVersion` and MoQMedia's
+        // `MediaTransportVersion` aliases.
+        .target(
+            name: "MoQTransportModel",
+            path: "bindings/swift/Sources/MoQTransportModel"
         ),
 
         // Pure-Swift model layer for the (future) MoQService product: public
@@ -94,6 +109,7 @@ let package = Package(
         // there is no MoQService product to collide with yet).
         .target(
             name: "MoQServiceCore",
+            dependencies: ["MoQTransportModel"],
             path: "bindings/swift/Sources/MoQServiceCore"
         ),
 
@@ -147,6 +163,22 @@ let package = Package(
             dependencies: ["MoQRecvArgs"],
             path: "bindings/swift/Tests/MoQRecvArgsTests"
         ),
+        // Negotiated-profile corpus: an INDEPENDENT Swift reader of the same
+        // vectors file the C and C++ readers read. Test wiring only -- no
+        // product module, dependency or platform change.
+        //
+        // It resolves tests/vectors/negotiated_profile.vectors from #filePath
+        // rather than from a bundle resource, because a bundle resource cannot
+        // reach it: SwiftPM refuses a resource path outside the target
+        // directory, and a symlink inside the target is copied VERBATIM into
+        // the bundle, where its relative target no longer resolves (verified:
+        // the bundle contained a dangling link). The alternatives were a
+        // checked-in copy of the corpus (forbidden) or a build plugin (a
+        // package change beyond test wiring).
+        .testTarget(
+            name: "NegotiatedProfileTests",
+            path: "tests/swift/NegotiatedProfileTests"
+        ),
         .testTarget(
             name: "MoQCatalogTests",
             dependencies: ["MoQCatalog"],
@@ -176,6 +208,14 @@ if !enableService {
             name: "MoQMediaTests",
             dependencies: ["MoQMedia", "CMoQSim"],
             path: "bindings/swift/Tests/MoQMediaTests"
+        ),
+        // Proves the service and media spellings of the negotiated
+        // transport version denote ONE nominal type. It is the only test
+        // target that imports both layers, and it exists for that reason.
+        .testTarget(
+            name: "TransportVersionAliasTests",
+            dependencies: ["MoQMedia", "MoQServiceCore", "MoQTransportModel"],
+            path: "bindings/swift/Tests/TransportVersionAliasTests"
         ),
     ]
 }

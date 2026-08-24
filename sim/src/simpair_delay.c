@@ -140,7 +140,8 @@ moq_result_t deliver_or_delay_control_chunk(
     }
     moq_bytes_t bytes = { data, len };
     moq_result_t rc = moq_session_on_control_bytes(to, data, len, sp->now_us);
-    trace_input(sp, MOQ_SIM_INPUT_CONTROL_BYTES, from, to_persp, bytes, rc);
+    trace_input(sp, MOQ_SIM_INPUT_CONTROL_BYTES, from, to_persp, bytes, rc,
+                SIM_INPUT_DETAIL_NONE);
     return rc;
 }
 
@@ -221,7 +222,8 @@ moq_result_t deliver_or_delay_bidi_chunk(
     moq_bytes_t bytes = { data, len };
     moq_result_t rc = moq_session_on_bidi_stream_bytes(
         to, ref, data, len, fin, sp->now_us);
-    trace_input(sp, MOQ_SIM_INPUT_BIDI_BYTES, from, to_persp, bytes, rc);
+    trace_input(sp, MOQ_SIM_INPUT_BIDI_BYTES, from, to_persp, bytes, rc,
+                (sim_input_detail_t){ ref, 0, fin });
     /* A FIN closes the sender's half; the slot retires once both halves close. */
     if (rc >= 0 && fin && bslot >= 0)
         sim_bidi_mark_fin(sp, bslot, from);
@@ -296,7 +298,8 @@ moq_result_t deliver_or_delay_bidi_reset(
     moq_result_t rc = moq_session_on_bidi_stream_reset(
         to, ref, error_code, sp->now_us);
     trace_input(sp, MOQ_SIM_INPUT_BIDI_RESET, from, to_persp,
-                (moq_bytes_t){0}, rc);
+                (moq_bytes_t){0}, rc,
+                (sim_input_detail_t){ ref, error_code, false });
     if (rc >= 0 && bslot >= 0) {
         sp->bidi_map[bslot].active = false;
         sp->bidi_map[bslot].generation++;
@@ -342,7 +345,8 @@ moq_result_t deliver_or_delay_bidi_stop(
     moq_result_t rc = moq_session_on_bidi_stream_stop(
         to, ref, error_code, sp->now_us);
     trace_input(sp, MOQ_SIM_INPUT_BIDI_STOP, from, to_persp,
-                (moq_bytes_t){0}, rc);
+                (moq_bytes_t){0}, rc,
+                (sim_input_detail_t){ ref, error_code, false });
     if (rc < 0 && bslot >= 0) {
         sp->bidi_map[bslot].active = false;
         sp->bidi_map[bslot].generation++;
@@ -389,7 +393,8 @@ moq_result_t deliver_or_delay_data_chunk(
     moq_bytes_t bytes = { data, len };
     moq_result_t rc = moq_session_on_data_bytes(
         to, ref, data, len, fin, sp->now_us);
-    trace_input(sp, MOQ_SIM_INPUT_DATA_BYTES, from, to_persp, bytes, rc);
+    trace_input(sp, MOQ_SIM_INPUT_DATA_BYTES, from, to_persp, bytes, rc,
+                (sim_input_detail_t){ ref, 0, fin });
     if (rc >= 0 && fin && dslot >= 0) {
         sp->stream_map[dslot].active = false;
         sp->stream_map[dslot].generation++;
@@ -503,7 +508,8 @@ moq_result_t deliver_or_delay_data_reset(
     moq_result_t rc = moq_session_on_data_reset(
         to, ref, error_code, sp->now_us);
     trace_input(sp, MOQ_SIM_INPUT_DATA_RESET, from, to_persp,
-                (moq_bytes_t){0}, rc);
+                (moq_bytes_t){0}, rc,
+                (sim_input_detail_t){ ref, error_code, false });
     if (rc >= 0 && dslot >= 0) {
         sp->stream_map[dslot].active = false;
         sp->stream_map[dslot].generation++;
@@ -553,7 +559,8 @@ moq_result_t deliver_or_delay_data_stop(
     moq_result_t rc = moq_session_on_data_stop(
         sender_session, sender_ref, error_code, sp->now_us);
     trace_input(sp, MOQ_SIM_INPUT_DATA_STOP, from, sender_persp,
-                (moq_bytes_t){0}, rc);
+                (moq_bytes_t){0}, rc,
+                (sim_input_detail_t){ sender_ref, error_code, false });
     if (rc < 0 && dslot >= 0) {
         sp->stream_map[dslot].active = false;
         sp->stream_map[dslot].generation++;
@@ -606,13 +613,15 @@ moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
             rc = moq_session_on_control_bytes(target, e->bytes, e->len,
                                                sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_CONTROL_BYTES, e->from, e->to,
-                        (moq_bytes_t){ e->bytes, e->len }, rc);
+                        (moq_bytes_t){ e->bytes, e->len }, rc,
+                        SIM_INPUT_DETAIL_NONE);
             break;
         case SIM_DELAY_BIDI_BYTES:
             rc = moq_session_on_bidi_stream_bytes(target, e->ref,
                 e->bytes, e->len, e->fin, sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_BIDI_BYTES, e->from, e->to,
-                        (moq_bytes_t){ e->bytes, e->len }, rc);
+                        (moq_bytes_t){ e->bytes, e->len }, rc,
+                        (sim_input_detail_t){ e->ref, 0, e->fin });
             if (rc >= 0 && e->fin && e->bidi_slot >= 0 &&
                 e->bidi_slot < MOQ_SIM_MAX_BIDI_STREAMS &&
                 sp->bidi_map[e->bidi_slot].generation == e->bidi_generation)
@@ -622,7 +631,8 @@ moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
             rc = moq_session_on_bidi_stream_reset(target, e->ref,
                 e->error_code, sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_BIDI_RESET, e->from, e->to,
-                        (moq_bytes_t){0}, rc);
+                        (moq_bytes_t){0}, rc,
+                        (sim_input_detail_t){ e->ref, e->error_code, false });
             if (rc >= 0 && e->bidi_slot >= 0 &&
                 e->bidi_slot < MOQ_SIM_MAX_BIDI_STREAMS &&
                 sp->bidi_map[e->bidi_slot].generation == e->bidi_generation) {
@@ -634,7 +644,8 @@ moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
             rc = moq_session_on_data_bytes(target, e->ref,
                 e->bytes, e->len, e->fin, sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_DATA_BYTES, e->from, e->to,
-                        (moq_bytes_t){ e->bytes, e->len }, rc);
+                        (moq_bytes_t){ e->bytes, e->len }, rc,
+                        (sim_input_detail_t){ e->ref, 0, e->fin });
             if (rc >= 0 && e->fin && e->data_slot >= 0 &&
                 e->data_slot < MOQ_SIM_MAX_DATA_STREAMS &&
                 sp->stream_map[e->data_slot].generation == e->data_generation) {
@@ -646,7 +657,8 @@ moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
             rc = moq_session_on_data_reset(target, e->ref,
                 e->error_code, sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_DATA_RESET, e->from, e->to,
-                        (moq_bytes_t){0}, rc);
+                        (moq_bytes_t){0}, rc,
+                        (sim_input_detail_t){ e->ref, e->error_code, false });
             if (rc >= 0 && e->data_slot >= 0 &&
                 e->data_slot < MOQ_SIM_MAX_DATA_STREAMS &&
                 sp->stream_map[e->data_slot].generation == e->data_generation) {
@@ -660,7 +672,8 @@ moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
             rc = moq_session_on_data_stop(target, e->ref,
                 e->error_code, sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_DATA_STOP, e->from, e->to,
-                        (moq_bytes_t){0}, rc);
+                        (moq_bytes_t){0}, rc,
+                        (sim_input_detail_t){ e->ref, e->error_code, false });
             if (rc < 0 && e->data_slot >= 0 &&
                 e->data_slot < MOQ_SIM_MAX_DATA_STREAMS &&
                 sp->stream_map[e->data_slot].generation == e->data_generation) {
@@ -673,7 +686,8 @@ moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
             rc = moq_session_on_bidi_stream_stop(target, e->ref,
                 e->error_code, sp->now_us);
             trace_input(sp, MOQ_SIM_INPUT_BIDI_STOP, e->from, e->to,
-                        (moq_bytes_t){0}, rc);
+                        (moq_bytes_t){0}, rc,
+                        (sim_input_detail_t){ e->ref, e->error_code, false });
             if (rc < 0 && e->bidi_slot >= 0 &&
                 e->bidi_slot < MOQ_SIM_MAX_BIDI_STREAMS &&
                 sp->bidi_map[e->bidi_slot].generation == e->bidi_generation) {

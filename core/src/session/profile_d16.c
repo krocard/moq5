@@ -4761,6 +4761,7 @@ static moq_request_error_t d16_semantic_request_error(uint64_t raw)
 }
 
 static const moq_profile_ops_t d16_ops = {
+    .version                = MOQ_VERSION_DRAFT_16,
     .state_size             = sizeof(moq_d16_profile_state_t),
     .state_align            = _Alignof(moq_d16_profile_state_t),
     .init_in_place          = d16_init_in_place,

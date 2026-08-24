@@ -233,6 +233,13 @@ struct moq_media_receiver {
     moq_endpoint_t *ep;
     bool            owns_endpoint;
 
+    /* The negotiated transport draft, latched from the LIVE SESSION at the
+     * top of every receiver_hook and read under mu wherever an object's
+     * properties are parsed. Not endpoint configuration, not an offered
+     * preference. Zero means "not yet observed" and is refused by
+     * moq_media_object_parse rather than being read as a draft. */
+    moq_version_t   transport_version;
+
     /* Owned copies of the configuration inputs. */
     moq_bytes_t    *ns_parts;
     uint8_t        *ns_data;
@@ -882,17 +889,26 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
             moq_msf_catalog_find_init_data(src, rt.init_ref);
         if (e && e->data.len > 0) { rt.has_init_data = true; rt.init_data = e->data; }
     }
+    /* The SIZED companion, not the legacy entry plus a hand-widened
+     * struct_size: this descriptor is a current-size struct we own, and the
+     * negotiated draft is the authority for the object-property codec. The
+     * sized helper refuses an unobserved (zero) or unsupported latch rather
+     * than downgrading it to draft-16, so a descriptor either carries the
+     * session's real draft or is not built at all. */
     moq_result_t irc;
     if (rt.has_init_data && rt.init_data.len > 0) {
-        irc = moq_msf_track_to_media_info(&r->alloc, &rt, &d->info,
-                                          &d->init, &t->init_buf);
+        irc = moq_msf_track_to_media_info_sized(
+            &r->alloc, &rt, &d->info, sizeof(d->info), r->transport_version,
+            &d->init, &t->init_buf);
         if (irc == MOQ_OK && t->init_buf) {
             d->has_init = true;
             d->init_data = (moq_bytes_t){ moq_rcbuf_data(t->init_buf),
                                           moq_rcbuf_len(t->init_buf) };
         }
     } else {
-        irc = moq_msf_track_to_media_info(&r->alloc, &rt, &d->info, NULL, NULL);
+        irc = moq_msf_track_to_media_info_sized(
+            &r->alloc, &rt, &d->info, sizeof(d->info), r->transport_version,
+            NULL, NULL);
     }
     if (irc != MOQ_OK) {
         moq_media_track_info_init(&d->info);
@@ -2414,6 +2430,17 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     bool fatal = r->fatal;
     pthread_mutex_unlock(&r->mu);
     if (fatal || !session) return;
+
+    /* Read the negotiated draft from the live session, under our own mutex,
+     * before any catalog is ingested or any object is parsed on this pass.
+     * The session's version is fixed at creation, so this can never disagree
+     * with the bytes on the wire. Same reconnect note as the sender's latch. */
+    {
+        moq_version_t v = moq_session_version(session);
+        pthread_mutex_lock(&r->mu);
+        r->transport_version = v;
+        pthread_mutex_unlock(&r->mu);
+    }
 
     if (!r->sub) {
         if (moq_session_state(session) != MOQ_SESS_ESTABLISHED)

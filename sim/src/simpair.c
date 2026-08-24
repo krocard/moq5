@@ -290,13 +290,13 @@ moq_result_t moq_simpair_start(moq_simpair_t *sp)
     if (!sp) return MOQ_ERR_INVAL;
     moq_result_t rc = moq_session_start(sp->client, sp->now_us);
     trace_input(sp, MOQ_SIM_INPUT_START, MOQ_PERSPECTIVE_CLIENT,
-                MOQ_PERSPECTIVE_SERVER, (moq_bytes_t){0}, rc);
+                MOQ_PERSPECTIVE_SERVER, (moq_bytes_t){0}, rc, SIM_INPUT_DETAIL_NONE);
     if (rc < 0)
         return rc;
     if (version_requires_symmetric_start(sp->version)) {
         rc = moq_session_start(sp->server, sp->now_us);
         trace_input(sp, MOQ_SIM_INPUT_START, MOQ_PERSPECTIVE_SERVER,
-                    MOQ_PERSPECTIVE_CLIENT, (moq_bytes_t){0}, rc);
+                    MOQ_PERSPECTIVE_CLIENT, (moq_bytes_t){0}, rc, SIM_INPUT_DETAIL_NONE);
     }
     return rc;
 }
@@ -415,12 +415,12 @@ moq_result_t moq_simpair_advance_to(moq_simpair_t *sp, uint64_t now_us)
     sp->now_us = now_us;
     moq_result_t client_rc = moq_session_tick(sp->client, now_us);
     trace_input(sp, MOQ_SIM_INPUT_TICK, MOQ_PERSPECTIVE_CLIENT,
-                MOQ_PERSPECTIVE_SERVER, (moq_bytes_t){0}, client_rc);
+                MOQ_PERSPECTIVE_SERVER, (moq_bytes_t){0}, client_rc, SIM_INPUT_DETAIL_NONE);
     if (client_rc < 0)
         return client_rc;
 
     moq_result_t server_rc = moq_session_tick(sp->server, now_us);
     trace_input(sp, MOQ_SIM_INPUT_TICK, MOQ_PERSPECTIVE_SERVER,
-                MOQ_PERSPECTIVE_CLIENT, (moq_bytes_t){0}, server_rc);
+                MOQ_PERSPECTIVE_CLIENT, (moq_bytes_t){0}, server_rc, SIM_INPUT_DETAIL_NONE);
     return server_rc;
 }

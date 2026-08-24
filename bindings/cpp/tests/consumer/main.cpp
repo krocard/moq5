@@ -206,11 +206,11 @@ int main()
         moq::loc::headers lh;
         lh.has_timestamp = true;
         lh.timestamp     = 42;
-        auto enc = moq::loc::encode(moq::loc::profile::loc01, lh);
+        auto enc = moq::loc::encode(MOQ_VERSION_DRAFT_16, moq::loc::profile::loc01, lh);
         CHECK(enc.ok(), 40);
         CHECK(!enc->empty(), 41);
 
-        auto dec = moq::loc::parse(moq::loc::profile::loc01,
+        auto dec = moq::loc::parse(MOQ_VERSION_DRAFT_16, moq::loc::profile::loc01,
             moq::bytes_view(enc->data(), enc->size()));
         CHECK(dec.ok(), 42);
         CHECK(dec->timestamp == 42, 43);
@@ -296,6 +296,32 @@ int main()
         // section 3, which requires 1..32 namespace fields.
         CHECK(!moq_session_supports_zero_field_track_namespace(client.raw()),
               81);
+    }
+
+    // -- session::version() through the public C++ header --------------
+    // An out-of-tree consumer both CALLS and LINKS the observing accessor on
+    // a non-default profile; a wrapper returning the config default or a
+    // constant would differ here.
+    {
+        auto d18 = moq::session::create(
+            {.perspective = moq::perspective::client,
+             .version = MOQ_VERSION_DRAFT_18});
+        CHECK(d18.ok(), 82);
+        CHECK(d18->version() == MOQ_VERSION_DRAFT_18, 83);
+
+        auto d16 = moq::session::create(
+            {.perspective = moq::perspective::client,
+             .version = MOQ_VERSION_DRAFT_16});
+        CHECK(d16.ok(), 84);
+        CHECK(d16->version() == MOQ_VERSION_DRAFT_16, 85);
+        CHECK(d16->version() != d18->version(), 86);
+
+        // The default config reports the profile actually bound, not the zero
+        // the config carried.
+        auto dflt = moq::session::create(
+            {.perspective = moq::perspective::client});
+        CHECK(dflt.ok(), 87);
+        CHECK(dflt->version() == MOQ_VERSION_DRAFT_16, 88);
     }
 
     std::printf("PASS: moq_consumer_test\n");

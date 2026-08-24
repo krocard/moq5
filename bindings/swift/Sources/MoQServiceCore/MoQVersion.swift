@@ -1,17 +1,14 @@
-/// A MoQ transport draft version this SDK can negotiate.
-@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-public enum MoQVersion: Sendable, Hashable, CaseIterable {
-    case draft16
-    case draft18
+import MoQTransportModel
 
-    /// The IETF draft number (16, 18, …) — display / logging convenience.
-    public var draftNumber: Int {
-        switch self {
-        case .draft16: return 16
-        case .draft18: return 18
-        }
-    }
-}
+/// A MoQ transport draft version this SDK can negotiate.
+///
+/// The published `MoQVersion` spelling is preserved, but it now names the
+/// SHARED nominal type `MoQTransportModel.MoQTransportVersion` rather than
+/// a service-local enum. `MoQMedia`'s media-facing alias denotes that same
+/// type, so a negotiated version crosses the service/media boundary with no
+/// conversion and no second enum to drift from this one.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public typealias MoQVersion = MoQTransportVersion
 
 /// What versions an endpoint offers during negotiation.
 ///

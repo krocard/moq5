@@ -25,7 +25,7 @@ private func encodeLOCProperties(
     }
     var props: OpaquePointer?
     let alloc = moq_alloc_default()!
-    let rc = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &headers, &props)
+    let rc = moq_loc_encode(alloc, MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, &headers, &props)
     guard rc == MOQ_OK else { throw MoQError.internal }
     guard let p = props else { return nil }
     return Buffer(adopting: p)
@@ -193,7 +193,7 @@ struct MediaObjectParserRAWTests {
             endOfGroup: false, isDatagram: false,
             payload: payload, properties: props)
 
-        let track = MediaTrackInfo(mediaType: .video, packaging: .raw)
+        let track = MediaTrackInfo(mediaType: .video, packaging: .raw, transportVersion: .draft16)
         let parsed = try MediaObjectParser.parse(track: track, object: obj)
 
         #expect(parsed.hasCaptureTime)
@@ -216,7 +216,7 @@ struct MediaObjectParserRAWTests {
             endOfGroup: false, isDatagram: false,
             payload: payload, properties: props)
 
-        let track = MediaTrackInfo(mediaType: .audio, packaging: .raw)
+        let track = MediaTrackInfo(mediaType: .audio, packaging: .raw, transportVersion: .draft16)
         let parsed = try MediaObjectParser.parse(track: track, object: obj)
 
         #expect(parsed.keyframe == true)
@@ -236,7 +236,7 @@ struct MediaObjectParserRAWTests {
             endOfGroup: false, isDatagram: false,
             payload: payload, properties: props)
 
-        let track = MediaTrackInfo(mediaType: .video, packaging: .raw)
+        let track = MediaTrackInfo(mediaType: .video, packaging: .raw, transportVersion: .draft16)
 
         // Matches the C object layer: a timestamp-less RAW/LOC object parses
         // successfully and is surfaced with hasCaptureTime == false /
@@ -274,7 +274,8 @@ struct MediaObjectParserCMAFTests {
             payload: payload, properties: nil)
 
         let track = MediaTrackInfo(
-            mediaType: .video, packaging: .cmaf, timescale: 90000)
+            mediaType: .video, packaging: .cmaf, timescale: 90000,
+            transportVersion: .draft16)
         let parsed = try MediaObjectParser.parse(track: track, object: obj)
 
         #expect(parsed.decodeTimeUS == 2_000_000)
@@ -307,7 +308,8 @@ struct MediaObjectParserCMAFTests {
             payload: payload, properties: nil)
 
         let track = MediaTrackInfo(
-            mediaType: .audio, packaging: .cmaf, timescale: 48000)
+            mediaType: .audio, packaging: .cmaf, timescale: 48000,
+            transportVersion: .draft16)
         let parsed = try MediaObjectParser.parse(track: track, object: obj)
 
         #expect(parsed.sampleCount == 3)
@@ -338,7 +340,8 @@ struct MediaObjectParserCMAFTests {
             payload: payload, properties: nil)
 
         let track = MediaTrackInfo(
-            mediaType: .audio, packaging: .cmaf, timescale: 48000)
+            mediaType: .audio, packaging: .cmaf, timescale: 48000,
+            transportVersion: .draft16)
 
         do {
             _ = try MediaObjectParser.parse(
@@ -371,7 +374,8 @@ struct MediaObjectParserValidationTests {
 
         let big: UInt64 = UInt64(UInt32.max) + 1
         let track = MediaTrackInfo(
-            mediaType: .audio, packaging: .cmaf, timescale: big)
+            mediaType: .audio, packaging: .cmaf, timescale: big,
+            transportVersion: .draft16)
 
         #expect(throws: MediaParseError.invalidArgument) {
             _ = try MediaObjectParser.parse(track: track, object: obj)
@@ -392,7 +396,8 @@ struct MediaObjectParserValidationTests {
 
         let big: UInt64 = UInt64(UInt32.max) + 1
         let track = MediaTrackInfo(
-            mediaType: .audio, packaging: .raw, timescale: big)
+            mediaType: .audio, packaging: .raw, timescale: big,
+            transportVersion: .draft16)
         let parsed = try MediaObjectParser.parse(track: track, object: obj)
         #expect(parsed.captureTimeUS == 1_000_000)
     }
@@ -407,7 +412,7 @@ struct MSFTrackInfoTests {
     func videoLOC() throws {
         let track = MSFTrack(
             name: "video", packaging: "loc", isLive: true, role: "video")
-        let info = try track.mediaTrackInfo()
+        let info = try track.mediaTrackInfo(transportVersion: .draft16)
         #expect(info.mediaType == .video)
         #expect(info.packaging == .raw)
     }
@@ -417,7 +422,7 @@ struct MSFTrackInfoTests {
         let track = MSFTrack(
             name: "audio", packaging: "cmaf", isLive: true,
             role: "audio", timescale: 48000)
-        let info = try track.mediaTrackInfo()
+        let info = try track.mediaTrackInfo(transportVersion: .draft16)
         #expect(info.mediaType == .audio)
         #expect(info.packaging == .cmaf)
         #expect(info.timescale == 48000)
@@ -427,7 +432,8 @@ struct MSFTrackInfoTests {
     func largeTimescale() throws {
         let big: UInt64 = UInt64(UInt32.max) + 1
         let info = MediaTrackInfo(
-            mediaType: .audio, packaging: .cmaf, timescale: big)
+            mediaType: .audio, packaging: .cmaf, timescale: big,
+            transportVersion: .draft16)
         #expect(info.timescale == big)
     }
 
@@ -436,7 +442,7 @@ struct MSFTrackInfoTests {
         let track = MSFTrack(
             name: "t", packaging: "loc", isLive: true)
         #expect(throws: MediaTrackInfoError.missingRole) {
-            _ = try track.mediaTrackInfo()
+            _ = try track.mediaTrackInfo(transportVersion: .draft16)
         }
     }
 
@@ -445,7 +451,7 @@ struct MSFTrackInfoTests {
         let track = MSFTrack(
             name: "t", packaging: "loc", isLive: true, role: "subtitle")
         #expect(throws: MediaTrackInfoError.unsupportedRole("subtitle")) {
-            _ = try track.mediaTrackInfo()
+            _ = try track.mediaTrackInfo(transportVersion: .draft16)
         }
     }
 
@@ -454,7 +460,7 @@ struct MSFTrackInfoTests {
         let track = MSFTrack(
             name: "t", packaging: "mp2t", isLive: true, role: "video")
         #expect(throws: MediaTrackInfoError.unsupportedPackaging("mp2t")) {
-            _ = try track.mediaTrackInfo()
+            _ = try track.mediaTrackInfo(transportVersion: .draft16)
         }
     }
 }
@@ -536,7 +542,7 @@ struct MediaObjectParserFacadeTests {
         try sub.tick(now: 0)
 
         let obj = try sub.pollObject()!
-        let trackInfo = MediaTrackInfo(mediaType: .video, packaging: .raw)
+        let trackInfo = MediaTrackInfo(mediaType: .video, packaging: .raw, transportVersion: .draft16)
         let parsed = try MediaObjectParser.parse(
             track: trackInfo, object: obj)
 

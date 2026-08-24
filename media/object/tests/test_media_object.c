@@ -3,6 +3,7 @@
 #include <moq/loc.h>
 #include <moq/cmaf.h>
 #include <moq/rcbuf.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,7 @@ static moq_rcbuf_t *make_loc_props(const moq_alloc_t *alloc,
         lh.video_frame_marking.end_of_frame = true;
     }
     moq_rcbuf_t *out = NULL;
-    if (moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &out) != MOQ_OK)
+    if (moq_loc_encode(alloc, MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, &lh, &out) != MOQ_OK)
         return NULL;
     return out;
 }
@@ -133,15 +134,21 @@ int main(void)
     /* -- init functions null-safe ------------------------------------- */
     {
         moq_media_track_info_init(NULL);
+        moq_media_track_info_init_sized(NULL, sizeof(moq_media_track_info_t));
         moq_media_object_input_init(NULL);
         moq_media_parsed_object_init(NULL);
     }
 
     /* -- init sets struct_size --------------------------------------- */
     {
+        /* The pointer-only initializer cannot know the caller's struct
+         * size, so it stamps the FROZEN v0 PREFIX and nothing more --
+         * that is what keeps it safe for a caller compiled against the
+         * pre-version ABI. */
         moq_media_track_info_t ti;
         moq_media_track_info_init(&ti);
-        CHECK(ti.struct_size == sizeof(moq_media_track_info_t));
+        CHECK(ti.struct_size == (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE);
+        CHECK(MOQ_MEDIA_TRACK_INFO_V0_SIZE < sizeof(moq_media_track_info_t));
 
         moq_media_object_input_t oi;
         moq_media_object_input_init(&oi);
@@ -228,7 +235,7 @@ int main(void)
         lh.has_timestamp = true;
         lh.timestamp = 5000;
         moq_rcbuf_t *props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
 
         moq_media_object_input_t oi;
         moq_media_object_input_init(&oi);
@@ -459,7 +466,7 @@ int main(void)
         lh.has_video_frame_marking = true;
         lh.video_frame_marking.independent = false;
         moq_rcbuf_t *props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
 
         size_t len = build_fragment(buf, 90000, 3000, 2, 0x00000000, 0, mdat, 2);
         moq_rcbuf_t *payload = NULL;
@@ -483,7 +490,7 @@ int main(void)
         lh.has_video_frame_marking = true;
         lh.video_frame_marking.independent = true;
         props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
 
         len = build_fragment(buf, 90000, 3000, 2, 0x00010000, 0, mdat, 2);
         payload = NULL;
@@ -1258,6 +1265,222 @@ int main(void)
 
         moq_rcbuf_decref(payload);
         moq_rcbuf_decref(props);
+    }
+
+    /* -- Track-info ABI: the frozen v0 prefix and the appended version -
+     *
+     * The hazard this guards is an OLD caller -- one compiled against the
+     * pre-version header, whose struct really is only the frozen prefix.
+     * Writing transport_version into such a struct would run past its
+     * allocation, and reading it would read whatever follows. Both
+     * initializers and the parser are therefore keyed on struct_size, and
+     * every case below states which of the two callers it is standing in
+     * for. */
+    {
+        const moq_alloc_t *alloc = moq_alloc_default();
+
+        /* The v0 prefix is genuinely shorter than the current struct;
+         * without that the canaries below would all be vacuous. */
+        CHECK(MOQ_MEDIA_TRACK_INFO_V0_SIZE < sizeof(moq_media_track_info_t));
+
+        /* -- the sized initializer ----------------------------------- */
+        {
+            moq_media_track_info_t ti;
+            memset(&ti, 0xAB, sizeof(ti));
+            moq_media_track_info_init_sized(&ti, sizeof(ti));
+            CHECK(ti.struct_size == (uint32_t)sizeof(ti));
+            /* Covers the appended field, so it is stamped with the
+             * behaviour-preserving default rather than left as garbage. */
+            CHECK(ti.transport_version == MOQ_VERSION_DRAFT_16);
+            CHECK(ti.media_type == 0 && ti.packaging == 0 &&
+                  ti.timescale == 0);
+        }
+
+        /* An OLD caller's size: clears and stamps exactly the prefix, and
+         * must not touch the appended field. The sentinel byte pattern
+         * past the prefix is asserted intact -- that is the actual
+         * out-of-bounds proof, not merely the struct_size value. */
+        {
+            moq_media_track_info_t ti;
+            memset(&ti, 0xAB, sizeof(ti));
+            moq_media_track_info_init_sized(&ti, MOQ_MEDIA_TRACK_INFO_V0_SIZE);
+            CHECK(ti.struct_size == (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE);
+            const unsigned char *raw = (const unsigned char *)&ti;
+            for (size_t i = MOQ_MEDIA_TRACK_INFO_V0_SIZE; i < sizeof(ti); i++)
+                CHECK(raw[i] == 0xAB);
+        }
+
+        /* Below the frozen prefix nothing may be written at all. */
+        {
+            moq_media_track_info_t ti;
+            memset(&ti, 0xAB, sizeof(ti));
+            moq_media_track_info_init_sized(&ti,
+                                            MOQ_MEDIA_TRACK_INFO_V0_SIZE - 1);
+            const unsigned char *raw = (const unsigned char *)&ti;
+            for (size_t i = 0; i < sizeof(ti); i++)
+                CHECK(raw[i] == 0xAB);
+        }
+
+        /* A size LARGER than this build knows is clamped: the extra bytes
+         * belong to a future field this build must not assume it owns. */
+        {
+            moq_media_track_info_t ti;
+            memset(&ti, 0xAB, sizeof(ti));
+            moq_media_track_info_init_sized(&ti, sizeof(ti) + 64);
+            CHECK(ti.struct_size == (uint32_t)sizeof(ti));
+        }
+
+        /* -- the parser's reading of struct_size --------------------- */
+
+        /* A minimal well-formed RAW object with no LOC properties: the
+         * point of every case below is the VERSION decision, so the
+         * payload is held constant. */
+        moq_rcbuf_t *payload = NULL;
+        CHECK(moq_rcbuf_create(alloc, (const uint8_t *)"p", 1, &payload)
+              == MOQ_OK);
+
+        moq_media_object_input_t in;
+        moq_media_object_input_init(&in);
+        in.status = MOQ_OBJECT_NORMAL;
+        in.payload = payload;
+
+        /* OLD caller (struct_size exactly the frozen prefix): the legacy
+         * standalone contract applies and the object parses, even though
+         * the struct's version field holds garbage -- proving the parser
+         * did not read it. */
+        {
+            moq_media_track_info_t ti;
+            memset(&ti, 0xAB, sizeof(ti));
+            ti.struct_size = (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE;
+            ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+            ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+            ti.timescale = 0;
+            moq_media_parsed_object_t out;
+            CHECK(moq_media_object_parse(&ti, &in, NULL, 0, &out, NULL)
+                  == MOQ_OK);
+        }
+
+        /* One byte short of covering the version is still an old caller. */
+        {
+            moq_media_track_info_t ti;
+            moq_media_track_info_init_sized(&ti, sizeof(ti));
+            ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+            ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+            ti.transport_version = (moq_version_t)0;
+            ti.struct_size =
+                (uint32_t)(offsetof(moq_media_track_info_t, transport_version)
+                           + sizeof(ti.transport_version) - 1);
+            moq_media_parsed_object_t out;
+            CHECK(moq_media_object_parse(&ti, &in, NULL, 0, &out, NULL)
+                  == MOQ_OK);
+        }
+
+        /* CURRENT caller: the field is covered, so it is owned and must
+         * name a supported version. Zero must NOT masquerade as draft-16
+         * -- this is the case that separates "the caller said draft-16"
+         * from "the caller said nothing". */
+        {
+            moq_media_track_info_t ti;
+            moq_media_track_info_init_sized(&ti, sizeof(ti));
+            ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+            ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+            ti.transport_version = (moq_version_t)0;
+            moq_media_parsed_object_t out;
+            CHECK(moq_media_object_parse(&ti, &in, NULL, 0, &out, NULL)
+                  == MOQ_ERR_INVAL);
+        }
+
+        /* Likewise any unregistered version, including a plausible
+         * neighbouring draft number. */
+        {
+            static const moq_version_t bad[] = {
+                (moq_version_t)1, (moq_version_t)15, (moq_version_t)17,
+                (moq_version_t)19, (moq_version_t)0xffff,
+            };
+            for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+                moq_media_track_info_t ti;
+                moq_media_track_info_init_sized(&ti, sizeof(ti));
+                ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+                ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+                ti.transport_version = bad[i];
+                moq_media_parsed_object_t out;
+                CHECK(moq_media_object_parse(&ti, &in, NULL, 0, &out, NULL)
+                      == MOQ_ERR_INVAL);
+            }
+        }
+
+        /* The rejection happens before any packaging branch: a CMAF track
+         * carrying no LOC properties at all is refused too, so the check
+         * cannot be reached only when a property block happens to exist. */
+        {
+            moq_media_track_info_t ti;
+            moq_media_track_info_init_sized(&ti, sizeof(ti));
+            ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+            ti.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+            ti.timescale = 90000;
+            ti.transport_version = (moq_version_t)0;
+            moq_media_parsed_object_t out;
+            CHECK(moq_media_object_parse(&ti, &in, NULL, 0, &out, NULL)
+                  == MOQ_ERR_INVAL);
+        }
+
+        /* -- the version actually selects the codec ------------------- */
+        {
+            /* A Capture Timestamp of 33333, encoded for each draft, must
+             * surface only under the matching version. */
+            moq_loc_headers_t lh;
+            moq_loc_headers_init(&lh);
+            lh.has_timestamp = true;
+            lh.timestamp = 33333;
+
+            const moq_version_t vs[2] = { MOQ_VERSION_DRAFT_16,
+                                          MOQ_VERSION_DRAFT_18 };
+            for (size_t k = 0; k < 2; k++) {
+                moq_rcbuf_t *props = NULL;
+                CHECK(moq_loc_encode(alloc, vs[k], MOQ_LOC_PROFILE_01, &lh,
+                                     &props) == MOQ_OK);
+                if (!props) continue;
+
+                moq_media_object_input_t oi;
+                moq_media_object_input_init(&oi);
+                oi.status = MOQ_OBJECT_NORMAL;
+                oi.payload = payload;
+                oi.properties = props;
+
+                moq_media_track_info_t ti;
+                moq_media_track_info_init_sized(&ti, sizeof(ti));
+                ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+                ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+                ti.transport_version = vs[k];
+
+                moq_media_parsed_object_t out;
+                CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &out, NULL)
+                      == MOQ_OK);
+                CHECK(out.has_capture_time);
+                CHECK(out.capture_time_us == 33333u);
+
+                /* The other draft's codec must not reproduce it. */
+                ti.transport_version = vs[k ? 0 : 1];
+                moq_media_parsed_object_t other;
+                moq_media_drop_reason_t why = 0;
+                moq_result_t rc =
+                    moq_media_object_parse(&ti, &oi, NULL, 0, &other, &why);
+                bool reproduced = (rc == MOQ_OK) && other.has_capture_time &&
+                                  other.capture_time_us == 33333u;
+                if (reproduced) {
+                    fprintf(stderr,
+                        "FAIL: %s:%d: a draft-%d property block surfaced "
+                        "33333 through the draft-%d codec\n",
+                        __FILE__, __LINE__,
+                        vs[k] == MOQ_VERSION_DRAFT_16 ? 16 : 18,
+                        vs[k] == MOQ_VERSION_DRAFT_16 ? 18 : 16);
+                    failures++;
+                }
+                moq_rcbuf_decref(props);
+            }
+        }
+
+        moq_rcbuf_decref(payload);
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

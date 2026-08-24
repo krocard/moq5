@@ -230,6 +230,25 @@ if(MOQ_BUILD_TESTS)
         PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
     target_compile_features(moq-service-test-internals PUBLIC c_std_11)
 
+    # Negotiated-profile substrate: the endpoint-offer/AUTO half of the
+    # future-draft drift gate (the core half lives in tests/unit). It reuses
+    # the SAME declared tables the core half uses -- one topology, two
+    # authorities compared against it.
+    add_executable(test_negotiated_profile_offer
+        tests/test_negotiated_profile_offer.c
+        ${CMAKE_SOURCE_DIR}/tests/support/np/np_tables.c
+        ${CMAKE_SOURCE_DIR}/tests/support/np/np_oracle.c)
+    target_link_libraries(test_negotiated_profile_offer PRIVATE
+        moq-service-test-internals moq::core)
+    target_compile_definitions(test_negotiated_profile_offer PRIVATE
+        ${_MOQ_SERVICE_FACADE_DEFS})
+    target_include_directories(test_negotiated_profile_offer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tests/unit
+        ${CMAKE_SOURCE_DIR}/tests/support/np)
+    add_test(NAME negotiated_profile_offer
+             COMMAND test_negotiated_profile_offer)
+
     add_executable(test_endpoint_resolve tests/test_endpoint_resolve.c)
     target_link_libraries(test_endpoint_resolve PRIVATE
         moq-service-test-internals moq::core)
@@ -545,6 +564,39 @@ if(MOQ_BUILD_TESTS)
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_sender_refresh
                 COMMAND test_media_sender_refresh)
+
+            # Negotiated-profile closure REDs (step 6). Two independent directions
+            # over the SAME substrate: a real sender's LOC-01 property bytes
+            # checked against the pure oracle, and independently built bytes fed
+            # to a real receiver. Both need the sender AND receiver seams plus a
+            # real SimPair peer, which is exactly what the refresh internals
+            # object set already provides. The np role objects are built in
+            # tests/ (where the four-role policy scans them) and linked here.
+            #
+            # These tests assert the CORRECT per-draft contract, so the draft-18
+            # halves FAIL until the encoder/decoder become version-aware. That is
+            # deliberate: they are the RED, not a pending feature.
+            add_executable(test_np_closure_sender
+                tests/test_np_closure_sender.c)
+            target_link_libraries(test_np_closure_sender PRIVATE
+                moq-service-refresh-test-internals moq::core moq::msf
+                moq::sim Threads::Threads
+                np_runner_obj np_builder_obj np_oracle_obj)
+            target_include_directories(test_np_closure_sender PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit
+                ${CMAKE_SOURCE_DIR}/tests/support/np)
+            add_test(NAME np_closure_sender COMMAND test_np_closure_sender)
+
+            add_executable(test_np_closure_receiver
+                tests/test_np_closure_receiver.c)
+            target_link_libraries(test_np_closure_receiver PRIVATE
+                moq-service-refresh-test-internals moq::core moq::msf
+                moq::sim Threads::Threads
+                np_runner_obj np_builder_obj np_oracle_obj)
+            target_include_directories(test_np_closure_receiver PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit
+                ${CMAKE_SOURCE_DIR}/tests/support/np)
+            add_test(NAME np_closure_receiver COMMAND test_np_closure_receiver)
         endif()
 
         # C++17 public-header consumer: the service headers must compile,

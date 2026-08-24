@@ -356,8 +356,41 @@ static void test_crossed_accept_publish_reject_namespace(moq_version_t ver)
         : "sender_crossed_accept_pub_reject_ns_d16");
 }
 
+/*
+ * The one public NULL-endpoint case with no durable assertion anywhere:
+ * moq_media_sender_attach(NULL, cfg, &out). (The create() case -- a valid cfg
+ * with cfg.endpoint == NULL -- is ALREADY covered by
+ * test_media_sender.c:1281-1286 and is deliberately not duplicated here.)
+ *
+ * Network-free: pure validation, no endpoint is created and nothing connects.
+ *
+ * Only the DOCUMENTED result is asserted. The header requires a non-NULL
+ * endpoint; it does not promise anything about *out when the call is refused,
+ * and the current return-before-clear ordering is incidental -- pinning it
+ * would freeze an undocumented side effect.
+ */
+static void test_public_attach_null_endpoint_rejected(void)
+{
+    moq_bytes_t ns_parts[2] = {
+        MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_t *s = NULL;
+
+    /* a valid BORROWING cfg: attach forbids cfg.endpoint, so it stays unset */
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ ns_parts, 2 };
+    cfg.publish_tracks = true;
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_attach(NULL, &cfg, &s),
+                          (int)MOQ_ERR_INVAL);
+
+    MOQ_TEST_PASS("sender_public_attach_null_endpoint_rejected");
+}
+
 int main(void)
 {
+    test_public_attach_null_endpoint_rejected();
+
     for (int vi = 0; vi < 2; vi++) {
         moq_version_t ver = vi ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
         test_namespace_rejected(ver);

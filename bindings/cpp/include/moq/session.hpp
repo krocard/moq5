@@ -1018,6 +1018,14 @@ public:
         return moq_session_next_deadline_us(s_);
     }
 
+    // The wire profile this session was created for; fixed for its lifetime.
+    // Not a negotiator -- see moq_session_version() in <moq/session.h>.
+    // Zero on a moved-from session (raw handle null).
+    moq_version_t version() const noexcept
+    {
+        return moq_session_version(s_);
+    }
+
     // -- Raw access ----------------------------------------------------
 
     moq_session_t       *raw() noexcept { return s_; }

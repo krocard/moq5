@@ -1,12 +1,16 @@
 #include <moq/loc.h>
-#include <moq/kvp.h>
+#include <moq/vi64.h>
 #include <moq/wire.h>
+#include <stdint.h>
 #include <string.h>
 
 /*
- * LOC-02 uses transport-17/18 vi64 integer encoding and a different
- * KVP wire format. Until a vi64 codec lands in moq-core, LOC-02
- * parse/encode returns MOQ_ERR_INVAL.
+ * LOC-02 uses the draft-18 property identifiers and would additionally
+ * reassign Audio Level's ID to Timestamp; that profile is still reserved
+ * here and parse/encode returns MOQ_ERR_INVAL for it. The KVP INTEGER
+ * CODEC is a separate axis and is selected by transport_version below --
+ * a draft-18 session carrying LOC-01 properties is a supported and
+ * exercised combination, not a profile bump.
  */
 
 /* -- Property IDs (LOC-01, draft-ietf-moq-loc-01) -------------------- */
@@ -15,6 +19,199 @@
 #define LOC01_VIDEO_FRAME_MARKING 0x04u
 #define LOC01_AUDIO_LEVEL         0x06u
 #define LOC01_VIDEO_CONFIG        0x0du
+
+/* An odd-type KVP value carries a Length; both drafts cap it at 2^16-1
+ * (draft-16 section 1.4.2, draft-18 section 1.4.3). */
+#define LOC_KVP_MAX_VALUE_LEN 0xFFFFu
+
+/* -- The reviewed integer-codec table --------------------------------
+ *
+ * One row per transport draft whose property codec has been read and
+ * deliberately registered. Every KVP field -- Delta Type, the odd-type
+ * Length, and the even-type value -- goes through the SAME row, so a
+ * draft cannot be half-applied. Lookup returns NULL for anything not in
+ * the table, which is what makes an unknown or future version fail
+ * closed instead of silently borrowing draft-16's encoding.
+ */
+typedef struct loc_int_codec {
+    /* Bytes needed for `value`; 0 when the codec cannot represent it. */
+    size_t (*len)(uint64_t value);
+    /* Minimal-form encode; 0 on unrepresentable value or short buffer. */
+    size_t (*encode)(uint64_t value, uint8_t *buf, size_t buf_len);
+    /* Decode one integer; 0 on truncation. */
+    size_t (*decode)(const uint8_t *buf, size_t buf_len, uint64_t *out);
+    uint64_t max_value;
+} loc_int_codec_t;
+
+static const loc_int_codec_t k_codec_d16 = {
+    moq_quic_varint_len, moq_quic_varint_encode, moq_quic_varint_decode,
+    MOQ_QUIC_VARINT_MAX,
+};
+
+static const loc_int_codec_t k_codec_d18 = {
+    moq_vi64_len, moq_vi64_encode, moq_vi64_decode,
+    UINT64_MAX,
+};
+
+static const loc_int_codec_t *loc_codec_for(moq_version_t v)
+{
+    switch (v) {
+    case MOQ_VERSION_DRAFT_16: return &k_codec_d16;  /* section 1.4 (i)    */
+    case MOQ_VERSION_DRAFT_18: return &k_codec_d18;  /* section 1.4.1 vi64 */
+    default: return NULL;   /* unknown/unregistered: fail closed */
+    }
+}
+
+/* -- The bounded KVP walker ------------------------------------------
+ *
+ * Key-Value-Pair { Delta Type (int), [Length (int),] Value (..) }, with
+ * the Length present and the Value a byte sequence exactly when the
+ * ABSOLUTE type is odd, and the Value a single integer when it is even
+ * (draft-16 section 1.4.2, draft-18 section 1.4.3). The two drafts share
+ * this structure exactly and differ only in `codec`, which is why one
+ * walker serves both.
+ *
+ * Bounded by construction: every field length is checked against the
+ * bytes that remain before those bytes are read, and each step consumes
+ * at least one byte, so the walk terminates on any input.
+ */
+typedef struct loc_kvp_walker {
+    const loc_int_codec_t *codec;
+    const uint8_t         *buf;
+    size_t                 remaining;
+    uint64_t               prev_type;
+    bool                   first;
+} loc_kvp_walker_t;
+
+typedef struct loc_kvp_item {
+    uint64_t       type;       /* resolved absolute type */
+    bool           is_varint;  /* type is even */
+    uint64_t       value;      /* is_varint */
+    const uint8_t *bytes;      /* !is_varint; borrowed from the input */
+    size_t         bytes_len;
+} loc_kvp_item_t;
+
+static void loc_kvp_walker_init(loc_kvp_walker_t *w,
+                                const loc_int_codec_t *codec,
+                                const uint8_t *buf, size_t len)
+{
+    w->codec     = codec;
+    w->buf       = buf;
+    w->remaining = len;
+    w->prev_type = 0;
+    w->first     = true;
+}
+
+/* MOQ_OK with *item filled, MOQ_DONE at the end of the block, or
+ * MOQ_ERR_PROTO on a truncated field, an over-long odd value, or a delta
+ * that overflows the absolute type. */
+static moq_result_t loc_kvp_next(loc_kvp_walker_t *w, loc_kvp_item_t *item)
+{
+    if (w->remaining == 0) return MOQ_DONE;
+
+    uint64_t delta = 0;
+    size_t n = w->codec->decode(w->buf, w->remaining, &delta);
+    if (n == 0) return MOQ_ERR_PROTO;
+    w->buf += n;
+    w->remaining -= n;
+
+    uint64_t abs_type;
+    if (w->first) {
+        abs_type = delta;
+        w->first = false;
+    } else {
+        if (delta > UINT64_MAX - w->prev_type) return MOQ_ERR_PROTO;
+        abs_type = w->prev_type + delta;
+    }
+    w->prev_type = abs_type;
+
+    item->type      = abs_type;
+    item->is_varint = ((abs_type & 1u) == 0);
+    item->value     = 0;
+    item->bytes     = NULL;
+    item->bytes_len = 0;
+
+    if (item->is_varint) {
+        n = w->codec->decode(w->buf, w->remaining, &item->value);
+        if (n == 0) return MOQ_ERR_PROTO;
+        w->buf += n;
+        w->remaining -= n;
+        return MOQ_OK;
+    }
+
+    uint64_t vlen = 0;
+    n = w->codec->decode(w->buf, w->remaining, &vlen);
+    if (n == 0) return MOQ_ERR_PROTO;
+    w->buf += n;
+    w->remaining -= n;
+
+    if (vlen > LOC_KVP_MAX_VALUE_LEN) return MOQ_ERR_PROTO;
+    if (vlen > w->remaining) return MOQ_ERR_PROTO;
+
+    item->bytes     = w->buf;
+    item->bytes_len = (size_t)vlen;
+    w->buf += (size_t)vlen;
+    w->remaining -= (size_t)vlen;
+    return MOQ_OK;
+}
+
+/* Encoded size of one entry, or 0 if the codec cannot represent a field. */
+static size_t loc_kvp_item_len(const loc_int_codec_t *codec,
+                               uint64_t prev_type,
+                               const loc_kvp_item_t *item)
+{
+    if (item->type < prev_type) return 0;
+    if (item->bytes_len > LOC_KVP_MAX_VALUE_LEN) return 0;
+    if (item->bytes_len > 0 && !item->bytes) return 0;
+
+    size_t total = codec->len(item->type - prev_type);
+    if (total == 0) return 0;
+
+    if (item->is_varint) {
+        size_t vl = codec->len(item->value);
+        if (vl == 0) return 0;
+        if (vl > SIZE_MAX - total) return 0;
+        return total + vl;
+    }
+
+    size_t ll = codec->len((uint64_t)item->bytes_len);
+    if (ll == 0) return 0;
+    if (ll > SIZE_MAX - total) return 0;
+    total += ll;
+    if (item->bytes_len > SIZE_MAX - total) return 0;
+    return total + item->bytes_len;
+}
+
+/* Write one entry; 0 on any refusal, never a partial write the caller
+ * could mistake for progress. */
+static size_t loc_kvp_item_encode(const loc_int_codec_t *codec,
+                                  uint64_t prev_type,
+                                  const loc_kvp_item_t *item,
+                                  uint8_t *buf, size_t buf_len)
+{
+    if (!buf) return 0;
+    size_t needed = loc_kvp_item_len(codec, prev_type, item);
+    if (needed == 0 || buf_len < needed) return 0;
+
+    size_t pos = codec->encode(item->type - prev_type, buf, buf_len);
+    if (pos == 0) return 0;
+
+    if (item->is_varint) {
+        size_t vn = codec->encode(item->value, buf + pos, buf_len - pos);
+        if (vn == 0) return 0;
+        return pos + vn;
+    }
+
+    size_t ln = codec->encode((uint64_t)item->bytes_len,
+                              buf + pos, buf_len - pos);
+    if (ln == 0) return 0;
+    pos += ln;
+    if (item->bytes_len > 0) {
+        memcpy(buf + pos, item->bytes, item->bytes_len);
+        pos += item->bytes_len;
+    }
+    return pos;
+}
 
 void moq_loc_headers_init(moq_loc_headers_t *h)
 {
@@ -82,12 +279,18 @@ static uint64_t encode_audio_level(const moq_loc_audio_level_t *al)
 
 /* -- Parse ----------------------------------------------------------- */
 
-moq_result_t moq_loc_parse(moq_loc_profile_t profile,
+moq_result_t moq_loc_parse(moq_version_t transport_version,
+                            moq_loc_profile_t profile,
                             moq_bytes_t properties,
                             moq_loc_headers_t *out)
 {
     if (!out) return MOQ_ERR_INVAL;
     moq_loc_headers_init(out);
+
+    /* Both selectors are checked before the empty-block shortcut: an
+     * unnamed codec is refused whether or not there are bytes to read. */
+    const loc_int_codec_t *codec = loc_codec_for(transport_version);
+    if (!codec) return MOQ_ERR_INVAL;
 
     if (profile != MOQ_LOC_PROFILE_01)
         return MOQ_ERR_INVAL;
@@ -97,45 +300,42 @@ moq_result_t moq_loc_parse(moq_loc_profile_t profile,
     if (!properties.data)
         return MOQ_ERR_INVAL;
 
-    moq_kvp_decoder_t dec;
-    moq_kvp_decoder_init(&dec, properties.data, properties.len);
+    loc_kvp_walker_t w;
+    loc_kvp_walker_init(&w, codec, properties.data, properties.len);
 
-    moq_kvp_entry_t entry;
+    loc_kvp_item_t item;
     moq_result_t rc;
-    while ((rc = moq_kvp_decode_next(&dec, &entry)) == MOQ_OK) {
-        if (entry.is_varint) {
-            uint64_t val = 0;
-            if (moq_quic_varint_decode(entry.value, entry.value_len, &val)
-                != entry.value_len)
-                return MOQ_ERR_PROTO;
-
-            switch (entry.type) {
+    while ((rc = loc_kvp_next(&w, &item)) == MOQ_OK) {
+        if (item.is_varint) {
+            /* Duplicate known properties: the last value wins. */
+            switch (item.type) {
             case LOC01_CAPTURE_TIMESTAMP:
                 out->has_timestamp = true;
-                out->timestamp = val;
+                out->timestamp = item.value;
                 break;
             case LOC01_VIDEO_FRAME_MARKING: {
                 moq_result_t drc = decode_video_frame_marking(
-                    val, &out->video_frame_marking);
+                    item.value, &out->video_frame_marking);
                 if (drc < 0) return drc;
                 out->has_video_frame_marking = true;
                 break;
             }
             case LOC01_AUDIO_LEVEL: {
                 moq_result_t drc = decode_audio_level(
-                    val, &out->audio_level);
+                    item.value, &out->audio_level);
                 if (drc < 0) return drc;
                 out->has_audio_level = true;
                 break;
             }
             default:
+                /* A well-formed unknown property is skipped, not an error. */
                 break;
             }
         } else {
-            if (entry.type == LOC01_VIDEO_CONFIG) {
+            if (item.type == LOC01_VIDEO_CONFIG) {
                 out->has_video_config = true;
-                out->video_config.data = entry.value;
-                out->video_config.len = entry.value_len;
+                out->video_config.data = item.bytes;
+                out->video_config.len = item.bytes_len;
             }
         }
     }
@@ -147,56 +347,17 @@ moq_result_t moq_loc_parse(moq_loc_profile_t profile,
 
 /* -- Encode ---------------------------------------------------------- */
 
-/*
- * One planned LOC-01 property. Planning every field into a single list
- * keeps the encoded byte count and the emitted bytes driven by the same
- * iteration: the list is built once, measured, then written.
- */
-typedef struct loc01_prop {
-    uint64_t       type;
-    bool           is_varint;
-    uint64_t       val;       /* is_varint */
-    const uint8_t *bytes;     /* !is_varint, borrowed */
-    size_t         bytes_len;
-} loc01_prop_t;
-
-static size_t loc01_prop_encoded_len(uint64_t prev, const loc01_prop_t *p)
-{
-    if (p->is_varint)
-        return moq_kvp_varint_entry_encoded_len(prev, p->type, p->val);
-
-    moq_kvp_entry_t e;
-    memset(&e, 0, sizeof(e));
-    e.type = p->type;
-    e.is_varint = false;
-    e.value = p->bytes;
-    e.value_len = p->bytes_len;
-    return moq_kvp_entry_encoded_len(prev, &e);
-}
-
-static size_t loc01_prop_encode(uint64_t prev, const loc01_prop_t *p,
-                                 uint8_t *buf, size_t buf_len)
-{
-    if (p->is_varint)
-        return moq_kvp_encode_varint_entry(prev, p->type, p->val,
-                                            buf, buf_len);
-
-    moq_kvp_entry_t e;
-    memset(&e, 0, sizeof(e));
-    e.type = p->type;
-    e.is_varint = false;
-    e.value = p->bytes;
-    e.value_len = p->bytes_len;
-    return moq_kvp_encode_entry(prev, &e, buf, buf_len);
-}
-
 moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
+                             moq_version_t transport_version,
                              moq_loc_profile_t profile,
                              const moq_loc_headers_t *headers,
                              moq_rcbuf_t **out_properties)
 {
     if (!alloc || !headers || !out_properties) return MOQ_ERR_INVAL;
     *out_properties = NULL;
+
+    const loc_int_codec_t *codec = loc_codec_for(transport_version);
+    if (!codec) return MOQ_ERR_INVAL;
 
     if (profile != MOQ_LOC_PROFILE_01)
         return MOQ_ERR_INVAL;
@@ -208,45 +369,44 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
         return MOQ_ERR_INVAL;
     if (headers->has_timescale)
         return MOQ_ERR_INVAL;
+    /* A timestamp the SELECTED codec cannot represent is refused here
+     * rather than truncated. Under draft-16 that is anything above
+     * MOQ_QUIC_VARINT_MAX; under draft-18 the whole uint64 range fits. */
+    if (headers->has_timestamp && headers->timestamp > codec->max_value)
+        return MOQ_ERR_INVAL;
 
     /* Plan every present field in ascending LOC-01 property-ID order:
      * 0x02 timestamp, 0x04 frame marking, 0x06 audio level,
      * 0x0d video config. */
-    loc01_prop_t props[4];
+    loc_kvp_item_t props[4];
     size_t prop_count = 0;
+    memset(props, 0, sizeof(props));
 
     if (headers->has_timestamp) {
         props[prop_count].type = LOC01_CAPTURE_TIMESTAMP;
         props[prop_count].is_varint = true;
-        props[prop_count].val = headers->timestamp;
-        props[prop_count].bytes = NULL;
-        props[prop_count].bytes_len = 0;
+        props[prop_count].value = headers->timestamp;
         prop_count++;
     }
 
     if (headers->has_video_frame_marking) {
         props[prop_count].type = LOC01_VIDEO_FRAME_MARKING;
         props[prop_count].is_varint = true;
-        props[prop_count].val = encode_video_frame_marking(
+        props[prop_count].value = encode_video_frame_marking(
             &headers->video_frame_marking);
-        props[prop_count].bytes = NULL;
-        props[prop_count].bytes_len = 0;
         prop_count++;
     }
 
     if (headers->has_audio_level) {
         props[prop_count].type = LOC01_AUDIO_LEVEL;
         props[prop_count].is_varint = true;
-        props[prop_count].val = encode_audio_level(&headers->audio_level);
-        props[prop_count].bytes = NULL;
-        props[prop_count].bytes_len = 0;
+        props[prop_count].value = encode_audio_level(&headers->audio_level);
         prop_count++;
     }
 
     if (headers->has_video_config) {
         props[prop_count].type = LOC01_VIDEO_CONFIG;
         props[prop_count].is_varint = false;
-        props[prop_count].val = 0;
         props[prop_count].bytes = headers->video_config.data;
         props[prop_count].bytes_len = headers->video_config.len;
         prop_count++;
@@ -257,12 +417,13 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
      * so the selected buffer is always written before it is copied. */
     if (prop_count == 0) return MOQ_OK;
 
-    /* Compute total encoded size. */
+    /* Compute total encoded size under the selected codec. */
     size_t total = 0;
     uint64_t prev = 0;
     for (size_t i = 0; i < prop_count; i++) {
-        size_t n = loc01_prop_encoded_len(prev, &props[i]);
+        size_t n = loc_kvp_item_len(codec, prev, &props[i]);
         if (n == 0) return MOQ_ERR_INVAL;
+        if (n > SIZE_MAX - total) return MOQ_ERR_INVAL;
         total += n;
         prev = props[i].type;
     }
@@ -280,7 +441,8 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     size_t pos = 0;
     prev = 0;
     for (size_t i = 0; i < prop_count; i++) {
-        size_t n = loc01_prop_encode(prev, &props[i], buf + pos, total - pos);
+        size_t n = loc_kvp_item_encode(codec, prev, &props[i],
+                                       buf + pos, total - pos);
         if (n == 0) {
             if (heap) alloc->free(buf, total, alloc->ctx);
             return MOQ_ERR_INVAL;

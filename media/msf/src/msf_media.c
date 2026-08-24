@@ -1,4 +1,5 @@
 #include <moq/msf_media.h>
+#include <stddef.h>
 #include <string.h>
 
 static bool bytes_eq(moq_bytes_t b, const char *s)
@@ -54,17 +55,54 @@ static bool role_is_non_media(moq_bytes_t role)
     return false;
 }
 
-moq_result_t moq_msf_track_to_media_info(
+/* struct_size at or above this covers transport_version. Spelled from
+ * offsetof rather than assumed, so it tracks the struct. */
+#define MSF_TRACK_INFO_VERSION_SIZE \
+    (offsetof(moq_media_track_info_t, transport_version) + \
+     sizeof(((moq_media_track_info_t *)0)->transport_version))
+
+/*
+ * The ONE mapping implementation. Both public entry points below are thin
+ * shells over it, so the MSF role/packaging/timescale logic exists once and
+ * the two entry points cannot drift apart in how they read a catalog.
+ *
+ * They differ only in how out_info is prepared:
+ *   want_version == false -- legacy: the frozen v0 prefix only, exactly as
+ *       the pointer-only initializer leaves it;
+ *   want_version == true  -- sized: out_info_size bytes, with the negotiated
+ *       draft stamped.
+ */
+static moq_result_t msf_track_to_media_info_impl(
     const moq_alloc_t *alloc,
     const moq_msf_track_t *track,
     moq_media_track_info_t *out_info,
+    size_t out_info_size,
+    bool want_version,
+    moq_version_t transport_version,
     moq_cmaf_init_info_t *out_init,
     moq_rcbuf_t **out_init_buf)
 {
     if (!track || !out_info)
         return MOQ_ERR_INVAL;
 
-    moq_media_track_info_init(out_info);
+    if (want_version) {
+        /* An undersized current request is REFUSED, never quietly answered
+         * with a v0 output: a caller that asked for a version and got a
+         * struct too small to hold one would silently fall back to the
+         * legacy draft-16 contract at parse time, which is exactly the trap
+         * this entry point exists to remove. */
+        if (out_info_size < MSF_TRACK_INFO_VERSION_SIZE)
+            return MOQ_ERR_INVAL;
+        /* Zero and unsupported versions are refused rather than downgraded. */
+        if (transport_version != MOQ_VERSION_DRAFT_16 &&
+            transport_version != MOQ_VERSION_DRAFT_18)
+            return MOQ_ERR_INVAL;
+
+        moq_media_track_info_init_sized(out_info, out_info_size);
+        out_info->transport_version = transport_version;
+    } else {
+        moq_media_track_info_init(out_info);
+    }
 
     if (out_init)
         moq_cmaf_init_info_init(out_init);
@@ -171,4 +209,32 @@ moq_result_t moq_msf_track_to_media_info(
     }
 
     return MOQ_OK;
+}
+
+moq_result_t moq_msf_track_to_media_info(
+    const moq_alloc_t *alloc,
+    const moq_msf_track_t *track,
+    moq_media_track_info_t *out_info,
+    moq_cmaf_init_info_t *out_init,
+    moq_rcbuf_t **out_init_buf)
+{
+    /* Legacy v0-safe entry: it cannot know the caller's struct size, so it
+     * writes only the frozen prefix and expresses no version. */
+    return msf_track_to_media_info_impl(
+        alloc, track, out_info, MOQ_MEDIA_TRACK_INFO_V0_SIZE,
+        false, (moq_version_t)0, out_init, out_init_buf);
+}
+
+moq_result_t moq_msf_track_to_media_info_sized(
+    const moq_alloc_t *alloc,
+    const moq_msf_track_t *track,
+    moq_media_track_info_t *out_info,
+    size_t out_info_size,
+    moq_version_t transport_version,
+    moq_cmaf_init_info_t *out_init,
+    moq_rcbuf_t **out_init_buf)
+{
+    return msf_track_to_media_info_impl(
+        alloc, track, out_info, out_info_size,
+        true, transport_version, out_init, out_init_buf);
 }

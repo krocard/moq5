@@ -92,7 +92,7 @@ struct DescriptorCMAFTests {
             initData: initSeg.base64EncodedString(),
             width: 1920, height: 1080, timescale: 90000)
 
-        let desc = try track.playbackDescriptor()
+        let desc = try track.playbackDescriptor(transportVersion: .draft16)
 
         #expect(desc.configuration.mediaType == .video)
         #expect(desc.configuration.packaging == .cmaf)
@@ -121,7 +121,7 @@ struct DescriptorCMAFTests {
             samplerate: 48000, timescale: 48000,
             channelConfig: "2")
 
-        let desc = try track.playbackDescriptor()
+        let desc = try track.playbackDescriptor(transportVersion: .draft16)
 
         #expect(desc.configuration.mediaType == .audio)
         #expect(desc.configuration.packaging == .cmaf)
@@ -146,7 +146,7 @@ struct DescriptorLOCTests {
             initData: Data(avcc).base64EncodedString(),
             width: 1920, height: 1080)
 
-        let desc = try track.playbackDescriptor()
+        let desc = try track.playbackDescriptor(transportVersion: .draft16)
 
         #expect(desc.configuration.mediaType == .video)
         #expect(desc.configuration.packaging == .raw)
@@ -166,7 +166,7 @@ struct DescriptorLOCTests {
             initData: Data(asc).base64EncodedString(),
             samplerate: 48000, channelConfig: "2")
 
-        let desc = try track.playbackDescriptor()
+        let desc = try track.playbackDescriptor(transportVersion: .draft16)
 
         #expect(desc.configuration.mediaType == .audio)
         #expect(desc.configuration.packaging == .raw)
@@ -189,7 +189,7 @@ struct DescriptorErrorTests {
             initData: Data([0x01]).base64EncodedString())
 
         #expect(throws: MediaTrackInfoError.missingRole) {
-            _ = try track.playbackDescriptor()
+            _ = try track.playbackDescriptor(transportVersion: .draft16)
         }
     }
 
@@ -201,7 +201,7 @@ struct DescriptorErrorTests {
             initData: Data([0x01]).base64EncodedString())
 
         #expect(throws: MediaTrackInfoError.unsupportedPackaging("mp2t")) {
-            _ = try track.playbackDescriptor()
+            _ = try track.playbackDescriptor(transportVersion: .draft16)
         }
     }
 
@@ -212,7 +212,7 @@ struct DescriptorErrorTests {
             role: "video", codec: "avc1")
 
         #expect(throws: MSFError.missingInitData) {
-            _ = try track.playbackDescriptor()
+            _ = try track.playbackDescriptor(transportVersion: .draft16)
         }
     }
 }

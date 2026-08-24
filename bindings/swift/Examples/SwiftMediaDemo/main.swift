@@ -256,7 +256,13 @@ func run() throws {
 
     // 10. Client receives and parses the media object.
     let mediaObj = try sub.pollObject()!
-    let trackInfo = try receivedCatalog.tracks[0].mediaTrackInfo()
+    /* The negotiated draft comes from the live client session -- never a
+     * hardcoded default. */
+    guard let tv = client.transportVersion else {
+        fatalError("session negotiated no known transport version")
+    }
+    let trackInfo = try receivedCatalog.tracks[0].mediaTrackInfo(
+        transportVersion: tv)
     let parsed = try MediaObjectParser.parse(
         track: trackInfo, object: mediaObj)
 

@@ -51,7 +51,14 @@ static int failures = 0;
 /* -- Test seam (media_receiver.c, MOQ_MEDIA_RECEIVER_TESTING) ----------- */
 moq_media_receiver_t *moq_media_receiver_test_new_cfg(
     const moq_media_receiver_cfg_t *cfg);
-void moq_media_receiver_test_free(moq_media_receiver_t *r);
+/* The SESSION-AWARE teardown seam: the pumped receiver_hook creates the
+ * subscriber facade, so only this seam runs the production teardown (live-handle
+ * snapshot, per-handle UNSUBSCRIBE on the supplied session, facade destroy)
+ * before freeing the receiver. The raw shell free cannot retire a subscriber the
+ * hook created. */
+void moq_media_receiver_test_destroy_with_session(moq_media_receiver_t *r,
+                                                  moq_session_t *session,
+                                                  uint64_t now_us);
 void moq_media_receiver_test_pump(moq_media_receiver_t *r,
                                   moq_session_t *session, uint64_t now_us);
 
@@ -388,7 +395,16 @@ int main(void)
     MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 0);
     MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
 
-    moq_media_receiver_test_free(r);
+    /* Retire through the production teardown path while the client session is
+     * live and the pair is quiescent (so each UNSUBSCRIBE has action capacity),
+     * then deliver that teardown traffic before the pair goes away. */
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    now += 1000;
+    moq_media_receiver_test_destroy_with_session(r, client, now);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    { moq_event_t ev;
+      while (moq_session_poll_events(client, &ev, 1) == 1) moq_event_cleanup(&ev);
+      while (moq_session_poll_events(server, &ev, 1) == 1) moq_event_cleanup(&ev); }
     moq_simpair_destroy(sp);
 
     if (failures == 0)

@@ -14,6 +14,8 @@
  * moq::core, moq::loc, moq::cmaf).
  */
 
+#include <stddef.h>
+
 #include <moq/types.h>
 #include <moq/session.h>
 #include <moq/rcbuf.h>
@@ -47,14 +49,61 @@ typedef enum moq_media_type {
 
 /* -- Track info (caller-supplied context) ----------------------------- */
 
+/*
+ * The FROZEN v0 PREFIX runs from struct_size through `timescale`. Those
+ * four fields and their order will not change; anything appended after
+ * `timescale` is a tail field that only a caller whose struct_size
+ * covers it may be assumed to own.
+ *
+ * `transport_version` is the first such tail field. It names the
+ * negotiated MoQ transport draft, which selects the integer codec the
+ * object's LOC Key-Value-Pair properties are written in (see <moq/loc.h>).
+ */
 typedef struct moq_media_track_info {
+    /* -- frozen v0 prefix ------------------------------------------- */
     uint32_t             struct_size;
     moq_media_type_t     media_type;
     moq_media_packaging_t packaging;
     uint32_t             timescale;
+    /* -- appended after v0 ------------------------------------------ */
+    moq_version_t        transport_version;
 } moq_media_track_info_t;
 
+/* Size of the frozen v0 prefix: struct_size .. timescale inclusive. A
+ * struct_size equal to this is an OLD caller that does not own
+ * transport_version. */
+#define MOQ_MEDIA_TRACK_INFO_V0_SIZE \
+    (offsetof(moq_media_track_info_t, timescale) + \
+     sizeof(((moq_media_track_info_t *)0)->timescale))
+
+/*
+ * Pointer-only initializer, SAFE FOR AN OLD, SMALLER CALLER.
+ *
+ * It cannot know how large the caller's struct is, so it touches ONLY
+ * the frozen v0 prefix and stamps struct_size = MOQ_MEDIA_TRACK_INFO_V0_SIZE.
+ * transport_version is deliberately NOT written -- a caller who wants it
+ * must use moq_media_track_info_init_sized, which is told the size.
+ *
+ * An object parsed with an info initialized this way therefore takes the
+ * legacy standalone old-prefix contract (draft-16), preserved for callers
+ * compiled against the pre-version ABI.
+ */
 MOQ_API void moq_media_track_info_init(moq_media_track_info_t *info);
+
+/*
+ * Sized initializer for a caller that knows its own struct size.
+ *
+ * Clears exactly min(info_size, sizeof(current)) bytes -- never past an
+ * old caller's allocation, never past the fields this build knows --
+ * and stamps struct_size with the number of bytes actually written. When
+ * that covers transport_version, it is set to MOQ_VERSION_DRAFT_16, the
+ * behaviour-preserving default for a caller that does not override it;
+ * a caller on a draft-18 session MUST assign the negotiated version.
+ *
+ * info_size below MOQ_MEDIA_TRACK_INFO_V0_SIZE writes nothing.
+ */
+MOQ_API void moq_media_track_info_init_sized(moq_media_track_info_t *info,
+                                             size_t info_size);
 
 /* -- Object input ---------------------------------------------------- */
 
@@ -117,8 +166,23 @@ MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
  *
  * Stateless, allocation-free, no retained refs.
  *
+ * The LOC property codec is selected by track->transport_version, and
+ * ONLY when track->struct_size FULLY COVERS that field.
+ *
+ * Any valid struct_size that stops short of covering the whole field --
+ * the frozen v0 prefix itself, or any partial prefix in between -- comes
+ * from a caller that cannot express a version, so the legacy standalone
+ * contract, draft-16, applies. A partially covered tail field is never
+ * read: half a version is not a version.
+ *
+ * When the field IS fully covered the caller owns it and must name a
+ * supported version: 0 is INVALID and does not masquerade as draft-16,
+ * so a caller who cleared the struct by hand is refused rather than
+ * silently given a codec.
+ *
  * Returns MOQ_OK on success.
  * Returns MOQ_ERR_INVAL on bad struct_size, NULL required pointers,
+ *   a covered-but-unsupported transport_version,
  *   invalid packaging/media_type, terminal with payload, normal
  *   without payload, or CMAF with zero timescale.
  * Returns MOQ_ERR_PROTO on media-level parse failure; if drop_reason

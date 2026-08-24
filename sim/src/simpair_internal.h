@@ -143,12 +143,30 @@ bool sim_reorder_fires(const moq_simpair_t *sp,
 void trace_record(moq_simpair_t *sp,
                   const moq_sim_trace_record_t *record);
 
+/*
+ * The appended per-input detail (trace record v1). Every trace_input() call
+ * site supplies one EXPLICITLY -- kinds that carry no stream pass
+ * SIM_INPUT_DETAIL_NONE rather than relying on a default, so a new call site
+ * cannot inherit zeros by omission.
+ *
+ * ref is the ref the delivery itself used, i.e. the ref valid at the SESSION
+ * being fed after SimPair's mapping -- never the far-end ref.
+ */
+typedef struct sim_input_detail {
+    moq_stream_ref_t ref;
+    uint64_t         error_code;
+    bool             fin;
+} sim_input_detail_t;
+
+#define SIM_INPUT_DETAIL_NONE ((sim_input_detail_t){ { 0 }, 0, false })
+
 void trace_input(moq_simpair_t *sp,
                  moq_sim_trace_input_kind_t input_kind,
                  moq_perspective_t from,
                  moq_perspective_t to,
                  moq_bytes_t bytes,
-                 moq_result_t result);
+                 moq_result_t result,
+                 sim_input_detail_t detail);
 
 void trace_action(moq_simpair_t *sp,
                   moq_perspective_t from,

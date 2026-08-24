@@ -285,6 +285,14 @@ struct moq_media_sender {
     moq_endpoint_t  *ep;
     bool             owns_endpoint;
 
+    /* The negotiated transport draft, latched from the LIVE SESSION at the
+     * top of every sender_hook and read under mu by the property encoder.
+     * It is NOT taken from endpoint configuration or an offered preference:
+     * only the established session knows what was actually negotiated.
+     * Zero means "not yet observed", and encoding fails closed on it -- the
+     * sender never falls back to a draft. */
+    moq_version_t    transport_version;
+
     /* Namespace + catalog track name, deep-copied (same idiom as the
      * receiver): [ns part bytes...][catalog name bytes]. */
     moq_bytes_t     *ns_parts;
@@ -515,6 +523,13 @@ static moq_bytes_t default_role(moq_media_type_t t)
  * standard-key validation in write() and the (next slice's) property
  * generation both key off this, so they can never disagree on the
  * profile. */
+/* Whether the latched draft names a codec the property encoder can use.
+ * Zero -- the never-observed value -- is not one of them. */
+static bool sender_version_usable(moq_version_t v)
+{
+    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+}
+
 static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
 {
     (void)s;   /* version-driven once LOC-02 lands; LOC-01-only for now */
@@ -1032,8 +1047,14 @@ static bool sender_build_props(moq_media_sender_t *s,
         h.has_video_frame_marking = true;
         h.video_frame_marking.independent = e->is_sync;
     }
+    /* Fail closed on an unobserved or unsupported draft: an object may not
+     * be encoded before the session's version has been latched, and there
+     * is deliberately no draft-16 fallback here. */
+    if (!sender_version_usable(s->transport_version))
+        return false;
     moq_rcbuf_t *loc = NULL;
-    if (moq_loc_encode(&s->alloc, sender_loc_profile(s), &h, &loc) != MOQ_OK)
+    if (moq_loc_encode(&s->alloc, s->transport_version,
+                       sender_loc_profile(s), &h, &loc) != MOQ_OK)
         return false;
     *out = loc;   /* has_timestamp is always set, so loc is non-NULL */
     return true;
@@ -2365,6 +2386,20 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                            moq_endpoint_fatal_code_internal(s->ep));
     }
     if (!session) return;
+
+    /* Read the negotiated draft from the live session, under our own mutex,
+     * before any work in this pass can encode an object. The session's
+     * version is fixed at creation and immutable, so the latch cannot go
+     * stale. Endpoint v0 owns one session per endpoint and never reconnects
+     * (MOQ_ENDPOINT_RECONNECTING is reserved but unentered), so re-reading
+     * each pass is redundant today -- it is the ordering that stays correct
+     * when reconnect lands. */
+    {
+        moq_version_t v = moq_session_version(session);
+        pthread_mutex_lock(&s->mu);
+        s->transport_version = v;
+        pthread_mutex_unlock(&s->mu);
+    }
 
     if (!s->pub) {
         if (moq_session_state(session) != MOQ_SESS_ESTABLISHED)
@@ -3837,19 +3872,28 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         return MOQ_ERR_WRONG_STATE;
     }
 
-    /* The LOC Capture Timestamp is emitted as a QUIC varint by moq_loc_encode,
-     * but ONLY for RAW packaging (CMAF passes the app's property block through
-     * untouched, so its timestamp fields are never encoded here). A value beyond
-     * the varint range cannot be encoded; left to the drain path it would fatal
-     * the sender AFTER the object was queued and its payload ownership taken.
-     * Reject it synchronously -- before any enqueue / ownership transfer. The
-     * encoded value is capture_time_us when has_capture_time, else the
-     * presentation_time_us fallback (sender_build_props), so validate whichever
-     * will be encoded. MOQ_QUIC_VARINT_MAX itself is encodable (accepted). */
+    /* The LOC Capture Timestamp is emitted by moq_loc_encode, but ONLY for
+     * RAW packaging (CMAF passes the app's property block through untouched,
+     * so its timestamp fields are never encoded here). A value the NEGOTIATED
+     * draft's codec cannot represent cannot be encoded; left to the drain path
+     * it would fatal the sender AFTER the object was queued and its payload
+     * ownership taken. Reject it synchronously -- before any enqueue /
+     * ownership transfer. The encoded value is capture_time_us when
+     * has_capture_time, else the presentation_time_us fallback
+     * (sender_build_props), so validate whichever will be encoded.
+     *
+     * The bound FOLLOWS THE CODEC: draft-16 (i) tops out at
+     * MOQ_QUIC_VARINT_MAX, which is itself encodable and accepted, while
+     * draft-18 vi64 carries the complete uint64 range and rejects nothing
+     * here. Before the session's draft has been observed the STRICTER
+     * draft-16 bound applies -- a write that has not yet met its session
+     * must not be admitted on a promise only draft-18 could keep. */
     if (track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
         uint64_t loc_ts = obj->has_capture_time ? obj->capture_time_us
                                                 : obj->presentation_time_us;
-        if (loc_ts > MOQ_QUIC_VARINT_MAX) {
+        uint64_t loc_ts_max = (s->transport_version == MOQ_VERSION_DRAFT_18)
+                                  ? UINT64_MAX : MOQ_QUIC_VARINT_MAX;
+        if (loc_ts > loc_ts_max) {
             s->stats.last_error = MOQ_ERR_INVAL;
             pthread_mutex_unlock(&s->mu);
             return MOQ_ERR_INVAL;
@@ -4476,6 +4520,16 @@ moq_media_sender_t *moq_media_sender_test_new(void)
 void moq_media_sender_test_free(moq_media_sender_t *s)
 {
     if (!s) return;
+    /* The pumped hook creates the publisher facade (moq_pub_create), and
+     * sender_free does not own it -- moq_media_sender_destroy does. Tear it
+     * down here for the same reason the catalog track is released below, or a
+     * seam test that pumped even once retains the whole publisher graph.
+     *
+     * Inline destruction is correct HERE: this endpoint-free seam is driven
+     * and destroyed on its owning test thread, so the hook cannot be running
+     * concurrently. Production posts sender_destroy_pub_task instead because
+     * its facade lives on the endpoint's network thread. */
+    if (s->pub) { moq_pub_destroy(s->pub); s->pub = NULL; }
     /* A test may have lazily created the private catalog track (via
      * moq_media_sender_test_catalog_track); sender_free does not own it (destroy
      * does), so release it here to keep the test leak-free. */
