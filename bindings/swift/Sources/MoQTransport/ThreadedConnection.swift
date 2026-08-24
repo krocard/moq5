@@ -4,7 +4,7 @@ import MoQ
 
 // MARK: - Pump Context
 
-/// Information passed to the on_pump callback.
+/// Information passed to the lane-pump callback.
 public struct ThreadedPumpContext: @unchecked Sendable {
     /// Current network time in microseconds.
     public let nowUS: UInt64
@@ -20,8 +20,8 @@ public struct ThreadedPumpContext: @unchecked Sendable {
     /// adapter's session. Returns nil if not yet connected.
     /// The returned Session is valid for the ThreadedConnection's
     /// lifetime but must only be used on the network thread
-    /// (inside on_pump). It may be stored in long-lived objects
-    /// like Subscriber that are also confined to on_pump.
+    /// (inside the lane pump). It may be stored in long-lived objects
+    /// like Subscriber that are also confined to the lane pump.
     package func borrowSession() -> Session? {
         guard let ptr = sessionRaw else { return nil }
         return Session(borrowing: ptr)
@@ -37,10 +37,21 @@ private final class PumpBox {
     }
 }
 
-/// C trampoline for on_pump.
+/// C trampoline for `on_lane_pump`.
+///
+/// The signature mirrors the C callback exactly:
+/// `on_lane_pump(t, lane, now_us, user)`.
+///
+/// `lane` is accepted and deliberately unused: this wrapper is CLIENT-ONLY,
+/// so the adapter has exactly one lane and one session, and
+/// `moq_pq_threaded_session(t)` is the documented way to reach it. A server
+/// wrapper could not do this -- it would have to iterate the lane's
+/// connections -- which is why the parameter is named rather than dropped.
 private func pumpTrampoline(
-    _ t: OpaquePointer?, _ nowUS: UInt64, _ ctx: UnsafeMutableRawPointer?
+    _ t: OpaquePointer?, _ lane: OpaquePointer?, _ nowUS: UInt64,
+    _ ctx: UnsafeMutableRawPointer?
 ) -> Int32 {
+    _ = lane
     guard let ctx else { return 0 }
     let box = Unmanaged<PumpBox>.fromOpaque(ctx).takeUnretainedValue()
     let session = t.flatMap { moq_pq_threaded_session($0) }
@@ -65,8 +76,9 @@ private func pumpTrampoline(
 ///     # → throws MoQError.invalidArgument (port must be 1..65535)
 ///
 /// The threaded adapter creates and owns the moq_session_t internally.
-/// A future phase will add a non-owning Session wrapper to expose it
-/// to the Publisher/Subscriber facades via ThreadedPumpContext.sessionRaw.
+/// `ThreadedPumpContext.borrowSession()` exposes it to the
+/// Publisher/Subscriber facades as a non-owning Session, valid on the
+/// network thread inside the lane pump.
 public final class ThreadedConnection {
     private let raw: OpaquePointer  // moq_pq_threaded_t*
     private let pumpBox: PumpBox
@@ -98,8 +110,8 @@ public final class ThreadedConnection {
         cfg.insecure_skip_verify = insecureSkipVerify
         cfg.send_request_capacity = sendRequestCapacity
         cfg.initial_request_capacity = initialRequestCapacity
-        cfg.on_pump = pumpTrampoline
-        cfg.on_pump_ctx = Unmanaged.passUnretained(box).toOpaque()
+        cfg.on_lane_pump = pumpTrampoline
+        cfg.on_lane_pump_ctx = Unmanaged.passUnretained(box).toOpaque()
 
         // host is consumed during create (getaddrinfo) and not
         // retained, so withCString lifetime is sufficient.
@@ -123,7 +135,7 @@ public final class ThreadedConnection {
         try MoQError.check(moq_pq_threaded_wait(raw, timeoutUS))
     }
 
-    /// Signal the network thread to wake up and run on_pump.
+    /// Signal the network thread to wake up and run the lane pump.
     public func wake() throws {
         try MoQError.check(moq_pq_threaded_wake(raw))
     }

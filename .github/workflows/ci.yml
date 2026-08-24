@@ -66,9 +66,9 @@ jobs:
 
       # Default Swift build: SwiftPM compiles the in-tree C core + media
       # sources directly (no CMake/install step needed). Transport targets
-      # are gated behind MOQ_TRANSPORT=1 and are intentionally NOT
-      # exercised here - they need installed adapters + pkg-config, which
-      # is a separate, later task.
+      # are gated behind MOQ_TRANSPORT=1 and are not built HERE because they
+      # need installed adapters + pkg-config; they are built in the
+      # swift-service-binding job below, against its installed prefix.
       - name: Buffer Sendable contract guard
         run: scripts/check_swift_buffer_sendable.sh
 
@@ -157,9 +157,17 @@ jobs:
           -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
           -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
 
+      # The nested picoquic tree is installed into the SAME prefix, because
+      # the installed <moq/picoquic_threaded.h> includes <picoquic.h>: the
+      # transport target below consumes both through pkg-config alone, with no
+      # source-tree include flags. picolog_t is built explicitly because the
+      # LibMoQ configure only builds the picoquic libraries it links, while
+      # picoquic's install rules also ship that tool.
       - name: Build + install prefix
         run: >
           cmake --build build/swift-service -j3 &&
+          cmake --build build/swift-service/_deps/picoquic --target picolog_t -j3 &&
+          cmake --install build/swift-service/_deps/picoquic --prefix "$PWD/build/service-prefix" &&
           cmake --install build/swift-service --prefix "$PWD/build/service-prefix"
 
       # Gated suite: MoQService bridge mapping tests + the C-free suites
@@ -198,6 +206,17 @@ jobs:
         run: >
           cd bindings/swift/Examples/SimplePlayer &&
           MOQ_SERVICE=1 swift build
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
+
+      # Transport-gated target + its two live examples, built against the
+      # INSTALLED prefix only. No -Xcc source-tree include flags: if the
+      # installed headers or the pkg-config cflags stop being self-sufficient,
+      # or the Swift wrapper drifts from the picoquic-threaded lane callback
+      # contract again, this step fails. That drift is exactly what went
+      # unnoticed while this target was unexercised.
+      - name: Transport target + live examples build (MOQ_TRANSPORT=1)
+        run: MOQ_TRANSPORT=1 swift build
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
 
