@@ -40,6 +40,8 @@ option(MOQ_PICO_WT_BUILD_LOOPBACK "Build pico_wt loopback test (needs picoquic-t
 option(MOQ_BUILD_PICO_WT_MANAGED  "Build managed picoquic WebTransport helper" OFF)
 option(MOQ_BUILD_FUZZ              "Build fuzz targets"             OFF)
 option(MOQ_REQUIRE_FUZZ            "Fail if fuzz targets cannot be built" OFF)
+# Black-box JSONL probe over the MSF/CMSF catalog parser (requires moq-msf).
+option(MOQ_BUILD_MEDIA_PROBE       "Build the moq_media_probe tool"  OFF)
 
 # Treat warnings as errors for libmoq-OWNED targets only. Applied PRIVATE
 # (or directory-scope in dirs that define only owned targets) so it never
@@ -54,7 +56,7 @@ option(MOQ_REQUIRE_FUZZ            "Fail if fuzz targets cannot be built" OFF)
 #              (picoquic raw + threaded, mvfst, pico_wt, proxygen) and
 #              their tests, the conformance tests, the C/C++ unit+scenario
 #              tests, the C++ binding's in-tree tests, and tools
-#              (moq-interop-client).
+#              (moq-interop-client and moq_media_probe).
 #   EXCLUDED - the `moq_cpp` / adapter INTERFACE (consumer-facing) targets
 #              and cold-consumer test builds (must not force -Werror on
 #              downstreams); examples (demonstration code, several gated
@@ -119,6 +121,14 @@ endif()
 # -- MSF catalog parser ---------------------------------------------
 if(MOQ_BUILD_MSF)
     add_subdirectory(media/msf)
+endif()
+
+# -- moq_media_probe (black-box catalog-parse probe) ----------------
+if(MOQ_BUILD_MEDIA_PROBE)
+    if(NOT MOQ_BUILD_MSF)
+        message(FATAL_ERROR "MOQ_BUILD_MEDIA_PROBE=ON requires MOQ_BUILD_MSF=ON")
+    endif()
+    add_subdirectory(tools/moq-media-probe)
 endif()
 
 # -- Adapters -------------------------------------------------------
