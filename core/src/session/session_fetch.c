@@ -316,6 +316,7 @@ static moq_result_t fetch_reject_pending_join(moq_session_t *s, int slot,
 /* Scratch bytes a single releasing join consumes (its FETCH_REQUEST token array +
  * value copies). The array alloc is alignment-padded; values are byte-packed.
  * Releases accumulate (each event keeps its scratch until polled). */
+
 static size_t pending_join_release_scratch(const moq_fetch_entry_t *e)
 {
     if (e->join_token_count == 0) return 0;
@@ -324,6 +325,35 @@ static size_t pending_join_release_scratch(const moq_fetch_entry_t *e)
     for (size_t t = 0; t < e->join_token_count; t++)
         n += e->join_tokens[t].token_value.len;
     return n;
+}
+
+/*
+ * The End Location of a Joining Fetch, from a Joining Location object.
+ *
+ * draft-16 9.16.1 / draft-18 10.12.1 define a FETCH End Location as "the end
+ * Location, plus 1", and state that an End Location.Object of 0 means the
+ * ENTIRE group is requested. So when the Joining Location object sits at the
+ * negotiated profile's Location ceiling, the exact representable End is
+ * {same group, 0} -- which covers the whole end group and therefore still
+ * includes the Joining Location itself, exactly as 9.16.2.1 / 10.12.2.1
+ * require ("the last Object included ... is the Object at the Joining
+ * Location").
+ *
+ * Deliberately NOT moq_loc_successor(): that helper carries to
+ * {group + 1, 0} and exists for subscription filter START windows. A FETCH End
+ * uses the same-group zero sentinel, so the end GROUP must not move.
+ *
+ * The arithmetic is checked in BOTH profiles rather than relying on unsigned
+ * wrap. On draft-18 the ceiling is UINT64_MAX and wrap happens to land on the
+ * same value; on draft-16 the ceiling is 2^62-1, where +1 is outside the
+ * profile's encoding altogether. One rule, no accidental correctness.
+ *
+ * All three Joining-Fetch end computations route through here so they cannot
+ * drift apart.
+ */
+static uint64_t fetch_joining_end_object(const moq_session_t *s, uint64_t object)
+{
+    return object == s->profile->location_varint_max ? 0 : object + 1;
 }
 
 moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t sub_req_id,
@@ -400,7 +430,7 @@ moq_result_t session_core_release_pending_joins(moq_session_t *s, int sub_slot)
             continue;
         }
         uint64_t end_group = sub->largest_group;
-        uint64_t end_object = sub->largest_object + 1;
+        uint64_t end_object = fetch_joining_end_object(s, sub->largest_object);
         uint64_t start_group, start_object = 0;
         if (e->join_fetch_type == 2) {
             start_group = e->join_start > sub->largest_group
@@ -549,6 +579,105 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
                 }
             }
         }
+        /*
+         * No subscription matched. A Joining Request ID may equally name a
+         * PUBLISH-INITIATED subscription (draft-18 5.1: "A publisher initiates
+         * a subscription to a track by sending the PUBLISH message"), which
+         * lives in the publication pool. Resolve it there before rejecting.
+         *
+         * The scan is unambiguous by construction: only PUBLISHER-role entries
+         * are considered (this endpoint sent the PUBLISH, so it is the one that
+         * would serve the fetch), and a request id is unique per pool, so at
+         * most one entry can match.
+         */
+        int jpub = -1;
+        if (jsub < 0) {
+            for (size_t i = 0; i < s->pub_cap; i++) {
+                const moq_pub_entry_t *pe = &s->publishes[i];
+                if (pe->state == MOQ_PUB_FREE) continue;
+                if (pe->role != MOQ_PUB_ROLE_PUBLISHER) continue;
+                if (pe->request_id != d->joining_request_id) continue;
+                jpub = (int)i;
+                break;
+            }
+        }
+
+        if (jpub >= 0) {
+            const moq_pub_entry_t *pe = &s->publishes[jpub];
+            /* 10.12.2's state list is "Established or Pending (subscriber)":
+             * Pending (Publisher) is deliberately absent, so a join before
+             * PUBLISH_OK is INVALID_JOINING_REQUEST_ID and is NOT buffered. */
+            if (pe->state != MOQ_PUB_ESTABLISHED || pe->done_pending) {
+                rc = fetch_auto_reject(s, d,
+                    MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID);
+                if (rc < 0) { result = rc; goto cleanup_all; }
+                s->profile->commit_inbound_request(s, &d->endpoint);
+                auth_committed = true;
+                process_auth_tokens_commit_txn(s, &d->auth_txn);
+                result = MOQ_OK;
+                goto cleanup_all;
+            }
+            if (!pub_joining_eligible(s, pe)) {
+                /* draft-18 10.12.2: Forward State 0 -> INVALID_RANGE.
+                 * draft-16 9.16.2: a non-Largest-Object filter is a protocol
+                 * violation, not a request error. */
+                if (!moq_session_uses_request_streams(s)) {
+                    result = close_with_error(s, 0x3,
+                        "joining fetch requires LARGEST_OBJECT filter");
+                    goto cleanup_all;
+                }
+                rc = fetch_auto_reject(s, d, MOQ_REQUEST_ERROR_INVALID_RANGE);
+                if (rc < 0) { result = rc; goto cleanup_all; }
+                s->profile->commit_inbound_request(s, &d->endpoint);
+                auth_committed = true;
+                process_auth_tokens_commit_txn(s, &d->auth_txn);
+                result = MOQ_OK;
+                goto cleanup_all;
+            }
+            /* The LATCHED Joining Location -- never a live history read. */
+            if (!pe->has_joining_loc) {
+                rc = fetch_auto_reject(s, d, MOQ_REQUEST_ERROR_INVALID_RANGE);
+                if (rc < 0) { result = rc; goto cleanup_all; }
+                s->profile->commit_inbound_request(s, &d->endpoint);
+                auth_committed = true;
+                process_auth_tokens_commit_txn(s, &d->auth_txn);
+                result = MOQ_OK;
+                goto cleanup_all;
+            }
+            /* 10.12.2.1: End is {Joining Location.Group,
+             * Joining Location.Object + 1}; a Relative start is
+             * {Joining Location.Group - Joining Start, 0}. */
+            d->start_object = 0;
+            d->end_group = pe->joining_group;
+            d->end_object = fetch_joining_end_object(s, pe->joining_object);
+            if (d->fetch_type == 2) {
+                d->start_group = (d->joining_start > pe->joining_group)
+                                     ? 0
+                                     : pe->joining_group - d->joining_start;
+            } else {
+                /* Absolute: the Start comes from the REQUEST while the End
+                 * comes from the Joining Location, so the two can disagree --
+                 * unlike Relative, which derives both from the location and
+                 * clamps at 0. 10.13 requires End >= Start, and a Start past
+                 * the Largest is INVALID_RANGE. Same rule the SUBSCRIBE-origin
+                 * branch below applies. */
+                d->start_group = d->joining_start;
+                if (d->start_group > pe->joining_group) {
+                    rc = fetch_auto_reject(s, d,
+                        MOQ_REQUEST_ERROR_INVALID_RANGE);
+                    if (rc < 0) { result = rc; goto cleanup_all; }
+                    s->profile->commit_inbound_request(s, &d->endpoint);
+                    auth_committed = true;
+                    process_auth_tokens_commit_txn(s, &d->auth_txn);
+                    result = MOQ_OK;
+                    goto cleanup_all;
+                }
+            }
+            d->joining_pub_slot = jpub;
+            d->joining_sub_slot = -1;
+            goto joining_resolved;
+        }
+
         if (jsub < 0 ||
             (s->subs[jsub].state != MOQ_SUB_ESTABLISHED &&
              s->subs[jsub].state != MOQ_SUB_PENDING_PUBLISHER)) {
@@ -603,7 +732,7 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
             goto cleanup_all;
         }
         d->end_group = jsub_e->largest_group;
-        d->end_object = jsub_e->largest_object + 1;
+        d->end_object = fetch_joining_end_object(s, jsub_e->largest_object);
         if (d->fetch_type == 2) {
             if (d->joining_start > jsub_e->largest_group)
                 d->start_group = 0;
@@ -624,6 +753,8 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
             }
         }
         d->joining_sub_slot = jsub;
+        d->joining_pub_slot = -1;
+joining_resolved: ;
     }
 
     if (event_queue_full(s)) {
@@ -749,6 +880,8 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
     e.u.fetch_request.track_name = ev_name;
     if (d->joining_sub_slot >= 0)
         e.u.fetch_request.joining_sub = s->subs[d->joining_sub_slot].handle;
+    if (d->joining_pub_slot >= 0)
+        e.u.fetch_request.joining_pub = s->publishes[d->joining_pub_slot].handle;
     e.u.fetch_request.start_group = d->start_group;
     e.u.fetch_request.start_object = d->start_object;
     e.u.fetch_request.end_group = d->end_group;
@@ -1026,11 +1159,52 @@ moq_result_t session_core_on_fetch_ok(moq_session_t *s,
 
 /* -- Public API ---------------------------------------------------- */
 
+/*
+ * Pointer-only init: touches ONLY the frozen v0 prefix. A caller compiled
+ * against the older header allocated exactly that much, so a newer library
+ * must not clear or stamp past it -- that is the whole point of freezing the
+ * floor rather than memset(sizeof(*cfg)).
+ */
+/* Pin the PUBLIC macro to the first appended field.
+ *
+ * offsetof(auth_tokens) is by definition that field's starting offset -- any
+ * preceding padding is already inside it -- so this is not guarding against
+ * alignment. What it guards is the macro's DEFINITION: someone redefining
+ * MOQ_FETCH_CFG_V0_SIZE to a larger boundary (say offsetof(joining_pub)) would
+ * make the pointer-only initializer write past an allocation sized from the
+ * original layout, and that enlargement fails the build here instead. */
+_Static_assert(MOQ_FETCH_CFG_V0_SIZE ==
+                   offsetof(moq_fetch_cfg_t, auth_tokens),
+               "MOQ_FETCH_CFG_V0_SIZE must end exactly at auth_tokens");
+/* The appended fields are ordered auth_tokens, auth_token_count, joining_pub;
+ * a reordering would silently change which sized offers reach what. */
+_Static_assert(offsetof(moq_fetch_cfg_t, auth_tokens) <
+                   offsetof(moq_fetch_cfg_t, auth_token_count) &&
+               offsetof(moq_fetch_cfg_t, auth_token_count) <
+                   offsetof(moq_fetch_cfg_t, joining_pub),
+               "appended FETCH cfg fields must stay in append order");
+
 void moq_fetch_cfg_init(moq_fetch_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_fetch_cfg_t);
+    memset(cfg, 0, MOQ_FETCH_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_FETCH_CFG_V0_SIZE;
+}
+
+void moq_fetch_cfg_init_sized(moq_fetch_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    /* Clear exactly what the caller allocated, never more than this library's
+     * struct knows about -- the same contract as moq_publish_cfg_init_sized().
+     * A size too small even to hold the stamp touches NOTHING: inflating it to
+     * the v0 floor would write past a caller's allocation, which is the one
+     * thing a sized initializer exists to prevent. Rejecting a stamp below the
+     * frozen floor is the CONSUMING call's job (moq_session_fetch), not this
+     * one's. */
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 void moq_accept_fetch_cfg_init(moq_accept_fetch_cfg_t *cfg)
@@ -1221,8 +1395,9 @@ moq_result_t moq_session_fetch(moq_session_t *s,
                                 moq_fetch_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
-#define FETCH_CFG_MIN offsetof(moq_fetch_cfg_t, auth_tokens)
-    if (cfg->struct_size < FETCH_CFG_MIN) return MOQ_ERR_INVAL;
+    /* The public frozen floor, not a duplicate local offset: a stamp below it
+     * cannot describe even the original layout. */
+    if (cfg->struct_size < MOQ_FETCH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define FETCH_CFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_fetch_cfg_t, f) + sizeof(cfg->f))
     *out_handle = MOQ_FETCH_INVALID;
@@ -1235,8 +1410,22 @@ moq_result_t moq_session_fetch(moq_session_t *s,
     }
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
         return MOQ_ERR_INVAL;
+
+    /* Exactly one joining discriminator. Checked here, before
+     * session_begin_advance and before any state is touched, so a malformed
+     * pair can never half-apply. */
+    /* "Named", not "well-formed": a caller that set a STALE or malformed
+     * handle has still named that discriminator, and must hear
+     * MOQ_ERR_STALE_HANDLE from the resolver rather than have the field read
+     * as absent. Only a zero handle means "not set". */
+    const bool has_join_pub =
+        FETCH_CFG_HAS(joining_pub) && cfg->joining_pub._opaque != 0;
+    const bool has_join_sub = cfg->joining_sub._opaque != 0;
+    if (cfg->is_joining && (has_join_pub == has_join_sub))
+        return MOQ_ERR_INVAL;      /* both, or neither */
+    if (!cfg->is_joining && (has_join_pub || has_join_sub))
+        return MOQ_ERR_INVAL;      /* a standalone fetch names no owner */
 #undef FETCH_CFG_HAS
-#undef FETCH_CFG_MIN
 
     session_begin_advance(s, now_us);
 
@@ -1245,7 +1434,28 @@ moq_result_t moq_session_fetch(moq_session_t *s,
 
     uint64_t joining_wire_request_id = 0;
     uint64_t joining_computed_start_group = 0;
-    if (cfg->is_joining) {
+    if (cfg->is_joining && has_join_pub) {
+        /* PUBLISH-initiated subscription (draft-18 5.1). Established only:
+         * 10.12.2's state list is "Established or Pending (subscriber)", which
+         * deliberately excludes Pending (Publisher). */
+        int jpub = pub_resolve_handle(s, cfg->joining_pub);
+        if (jpub < 0) return MOQ_ERR_STALE_HANDLE;
+        const moq_pub_entry_t *pe = &s->publishes[jpub];
+        if (pe->state != MOQ_PUB_ESTABLISHED) return MOQ_ERR_WRONG_STATE;
+        if (pe->done_pending) return MOQ_ERR_WRONG_STATE;
+        if (!pub_joining_eligible(s, pe)) return MOQ_ERR_WRONG_STATE;
+        /* The LATCHED Joining Location, not a live history read. */
+        if (!pe->has_joining_loc) return MOQ_ERR_INVAL;
+        joining_wire_request_id = pe->request_id;
+        if (cfg->joining_relative) {
+            joining_computed_start_group =
+                (cfg->joining_start > pe->joining_group)
+                    ? 0
+                    : pe->joining_group - cfg->joining_start;
+        } else {
+            joining_computed_start_group = cfg->joining_start;
+        }
+    } else if (cfg->is_joining) {
         int jsub = sub_resolve_handle(s, cfg->joining_sub);
         if (jsub < 0) return MOQ_ERR_STALE_HANDLE;
         if (s->subs[jsub].state != MOQ_SUB_ESTABLISHED &&

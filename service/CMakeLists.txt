@@ -645,6 +645,18 @@ if(MOQ_BUILD_TESTS)
         # a media_sender over a REAL pq_threaded endpoint whose catalog group
         # advances while idle only if the adapter wakes itself at the refresh
         # deadline. Public API only (shipping moq::service). Network.
+        add_executable(test_media_sender_demand_refresh
+            tests/test_media_sender_demand_refresh.c)
+        target_link_libraries(test_media_sender_demand_refresh PRIVATE
+            moq::service moq::adapter-picoquic-threaded moq::msf
+            Threads::Threads)
+        target_include_directories(test_media_sender_demand_refresh PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_demand_refresh
+            COMMAND test_media_sender_demand_refresh
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+
         add_executable(test_media_sender_idle_refresh
             tests/test_media_sender_idle_refresh.c)
         target_link_libraries(test_media_sender_idle_refresh PRIVATE

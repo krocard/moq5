@@ -69,7 +69,12 @@ future Joining FETCH requests, also install it with
 `moq_pub_set_retained_group()`.
 
 Do not rely on plain `SUBSCRIBE` to replay retained objects. MSF catalog
-consumers should use `SUBSCRIBE` plus Joining FETCH offset 0. Any
+consumers should use `SUBSCRIBE` plus Joining FETCH offset 0 — that is what
+MSF-01 §5 requires, literally, and a `PUBLISH`-initiated subscription does
+not substitute for it. A Joining FETCH keyed on a publication
+(`joining_pub`) is a separate transport capability that draft-18 §5.1 and
+§10.12.2 require independently; it reaches the same retained group, but it
+is not a way to satisfy MSF-01 §5. Any
 origin-local compatibility behavior that replays retained objects to a
 plain direct subscriber is not a relay-safe protocol guarantee.
 
@@ -178,7 +183,25 @@ subscribers, and installs the same dense group for Joining FETCH.
 An inbound FETCH is answered from the retained group when:
 
 - **Joining FETCH** — the track is resolved by the FETCH's joining
-  subscription, OR
+  subscription. That subscription may have been initiated either way: by a
+  `SUBSCRIBE`, in which case the requester names it with
+  `moq_fetch_cfg_t::joining_sub`, or by a `PUBLISH`, in which case it names
+  the publication with `joining_pub`. Exactly one of the two is set; both or
+  neither is `MOQ_ERR_INVAL`. Reaching `joining_pub` requires
+  `moq_fetch_cfg_init_sized()` — the pointer-only `moq_fetch_cfg_init()`
+  stops at the frozen v0 layout, so under it the field reads as absent.
+
+  A publication join is supported on **both** draft profiles, under each
+  profile's own eligibility rule:
+
+  | | draft-18 | draft-16 |
+  |---|---|---|
+  | eligibility | Established with Forward State 1 (§10.12.2) | Largest Object subscription filter negotiated at acceptance (§9.16.2) |
+  | saved location | Largest from the publish request, or from the acknowledgement of an update raising Forward 0→1 (§5.1) | establishment-time Largest only (§5.1); no later update moves it |
+  | ineligible, received | request error `INVALID_RANGE` | protocol violation — the session closes, as §9.16.2 requires |
+  | before establishment | request error `INVALID_JOINING_REQUEST_ID`, not buffered | same |
+
+  OR
 - **Standalone FETCH** — the track is resolved by the FETCH's explicit
   namespace + track name (the shape a relay emits to pull a catalog),
 
@@ -188,7 +211,8 @@ both forms: the whole dense group must be inside `[start, end)`.
 
 A **standalone** FETCH must additionally be authorized (a Joining FETCH is
 not, since its joining subscription is itself proof of an accepted
-subscription). Because a standalone FETCH names the track directly, it is
+subscription — for a `joining_pub` join, of a `PUBLISH` this endpoint sent
+and the peer accepted). Because a standalone FETCH names the track directly, it is
 served only when:
 
 - the publisher's `accept_mode` is `MOQ_PUB_ACCEPT_ALL`, OR

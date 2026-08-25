@@ -1290,6 +1290,11 @@ typedef struct moq_fetch_request_event {
     uint8_t            _pad[2];
     const moq_resolved_token_t *tokens;  /* BORROWED; NULL if none */
     size_t                       token_count;
+    /* Appended: the joined owner when the Joining Request ID named a
+     * PUBLISH-initiated subscription. Surfaced on BOTH draft profiles.
+     * Mutually exclusive with joining_sub -- for any joining fetch exactly one
+     * of the two is valid, and both are zero for a standalone fetch. */
+    moq_publication_t  joining_pub;
 } moq_fetch_request_event_t;
 
 typedef struct moq_fetch_error_event {
@@ -1967,19 +1972,98 @@ typedef struct moq_fetch_cfg {
     /* Appended: authorization tokens (borrowed for the call). */
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
+    /* Appended: join a PUBLISH-initiated subscription instead of a
+     * SUBSCRIBE-initiated one. A subscription can be initiated either way, so
+     * a peer that accepted a PUBLISH holds a subscription a Joining FETCH may
+     * name -- but it holds it as a publication handle, not a subscription
+     * handle. This field names it directly.
+     *
+     * For a joining fetch EXACTLY ONE of joining_sub / joining_pub must be
+     * named; both or neither is MOQ_ERR_INVAL, checked before anything is
+     * mutated. "Named" means non-zero, not well-formed: a stale or malformed
+     * handle still selects its discriminator and is answered
+     * MOQ_ERR_STALE_HANDLE by the resolver. Reaching this field requires
+     * moq_fetch_cfg_init_sized() with the full struct size.
+     *
+     * BOTH draft profiles are supported, with DIFFERENT eligibility rules --
+     * the joined publication must satisfy the rule of the negotiated profile:
+     *
+     *   draft-18 (5.1, 10.12.2): the publication must be Established with
+     *   Forward State 1, and it supplies a saved Joining Location -- the
+     *   Largest carried by the publish request that established it, or by
+     *   the acknowledgement of a publication update that raised Forward
+     *   from 0 to 1. Joining while Forward is 0 gives
+     *   MOQ_REQUEST_ERROR_INVALID_RANGE; joining before the publication is
+     *   established -- Pending (Publisher) -- gives
+     *   MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID and is NOT buffered.
+     *
+     *   draft-16 (5.1, 9.16.2): the publication must have negotiated
+     *   the Largest Object subscription filter when it was accepted, and the
+     *   saved location is the establishment-time Largest -- no later update
+     *   moves it. A RECEIVED join against a publication with any other filter is a
+     *   protocol violation and closes the session, as 9.16.2 requires; it is
+     *   not a request error.
+     *
+     * This is a transport capability in its own right. It does NOT satisfy
+     * MSF-01 section 5, which requires SUBSCRIBE with a Joining FETCH
+     * (offset = 0) literally. */
+    moq_publication_t       joining_pub;
 } moq_fetch_cfg_t;
 
+/*
+ * Frozen v0 prefix: everything through joining_start, i.e. the layout BEFORE
+ * the first appended field. auth_tokens/auth_token_count were themselves
+ * appended after that original layout, and joining_pub after them, so the
+ * floor sits immediately before auth_tokens -- exactly as the adjacent
+ * MOQ_PUBLISH_CFG_V0_SIZE does for PUBLISH.
+ *
+ * The pointer-only init stamps exactly this, so a caller that allocated the
+ * ORIGINAL struct is never written past its own storage. Reaching either
+ * auth-token field, or joining_pub, requires moq_fetch_cfg_init_sized().
+ */
+#define MOQ_FETCH_CFG_V0_SIZE offsetof(moq_fetch_cfg_t, auth_tokens)
+
+/* The frozen prefix must end exactly where the appended field begins; that is
+ * asserted at compile time in session_fetch.c (this header is also consumed by
+ * pre-C11 translation units, where _Static_assert is not available). */
+
+/* Initialize the frozen v0 prefix only. Use the sized form to reach the
+ * appended auth-token fields or joining_pub. */
 MOQ_API void moq_fetch_cfg_init(moq_fetch_cfg_t *cfg);
+
+/*
+ * Sized init: clears and stamps exactly min(cfg_size, sizeof(*cfg)) bytes and
+ * never writes past what the caller supplied. A cfg_size too small to hold
+ * struct_size itself touches NOTHING and leaves the storage unchanged -- it is
+ * deliberately not inflated to the v0 floor, since that would overwrite a
+ * caller allocation smaller than the floor. A stamped size below
+ * MOQ_FETCH_CFG_V0_SIZE is rejected by moq_session_fetch(), not here; a stamp
+ * AT the floor is accepted and simply carries no appended field.
+ */
+MOQ_API void moq_fetch_cfg_init_sized(moq_fetch_cfg_t *cfg, size_t cfg_size);
 
 /*
  * Initiate a fetch (subscriber side). Advancing call.
  * Set is_joining=true for a joining fetch; joining_relative selects
- * relative (true) or absolute (false) mode. joining_sub must be a
- * subscription with the LARGEST_OBJECT filter that has a *current*
- * stored largest location -- i.e. one that has received SUBSCRIBE_OK
- * (established). A still-pending subscription has no current largest
- * yet and is rejected with MOQ_ERR_INVAL. Track namespace/name are
+ * relative (true) or absolute (false) mode. Track namespace/name are
  * ignored for joining fetches.
+ *
+ * Name the joined subscription with EXACTLY ONE of:
+ *
+ *   joining_sub -- a SUBSCRIBE-initiated subscription with the LARGEST_OBJECT
+ *     filter that has a *current* stored largest location, i.e. one that has
+ *     received SUBSCRIBE_OK (established). A still-pending subscription has no
+ *     current largest yet and is rejected with MOQ_ERR_INVAL.
+ *   joining_pub -- a PUBLISH-initiated subscription that is ESTABLISHED,
+ *     eligible under the NEGOTIATED PROFILE's rule (draft-18: Forward State 1;
+ *     draft-16: a Largest Object filter negotiated at acceptance -- see the
+ *     field comment on moq_fetch_cfg_t::joining_pub), and holds a saved Joining
+ *     Location. Requires moq_fetch_cfg_init_sized(). A publication still
+ *     Pending (Publisher), or one ineligible under its profile, is rejected
+ *     with MOQ_ERR_WRONG_STATE; one with no saved Joining Location gives
+ *     MOQ_ERR_INVAL.
+ *
+ * Setting both, or neither, is MOQ_ERR_INVAL and mutates nothing.
  * Returns MOQ_ERR_REQUEST_BLOCKED if no request capacity.
  */
 MOQ_API moq_result_t moq_session_fetch(moq_session_t *s,

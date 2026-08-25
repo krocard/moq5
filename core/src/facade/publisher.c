@@ -870,7 +870,17 @@ static bool retained_can_advertise_largest(const moq_pub_track_t *t)
 /* Initialize a subscribe-accept cfg, advertising the retained object as the
  * subscription's Largest Location only when retained_can_advertise_largest().
  * That is what lets a subscriber issue a Joining FETCH for the retained catalog
- * object (§9.16.2 requires a known Largest). */
+ * object (§9.16.2 requires a known Largest).
+ *
+ * NOTE (pre-existing, deliberately out of scope here): this is NARROWER than
+ * the track's largest history. §10.2.11 says a publisher that has published
+ * Objects MUST report the largest Location it observed, and §5.1.2 makes that
+ * a monotonic high-water mark independent of what is still cached -- which is
+ * what PUBLISH reports (see track_install_retained). SUBSCRIBE_OK instead
+ * reports only what the retained cache can still SERVE, so the advertise check
+ * and the serve guard stay in step for the Joining-FETCH path. The two can
+ * therefore disagree after the retained group is cleared or replaced by a
+ * lower group. Reconciling them is its own change. */
 static void pub_init_accept_cfg(const moq_pub_track_t *t,
                                 moq_accept_subscribe_cfg_t *acc)
 {
@@ -1851,6 +1861,9 @@ static moq_result_t track_install_retained(moq_pub_track_t *t, uint64_t group_id
     t->retained_group_id = group_id;
     t->has_retained = true;
     t->wrote_object = false;   /* retained group is now the latest published loc */
+    if (retained_can_advertise_largest(t))
+        track_hist_merge(t->hist, group_id,
+                         pub_track_retained_last_object_id(t));
     return MOQ_OK;
 }
 
@@ -3048,11 +3061,17 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
 
         /* Resolve the retained track: by the joining subscription for a Joining
          * FETCH, or by explicit namespace/name for a standalone FETCH. */
-        const bool standalone = !moq_subscription_is_valid(fr->joining_sub);
+        /* Three shapes: a Joining FETCH on a PUBLISH-initiated subscription
+         * (draft-18 5.1), a Joining FETCH on a SUBSCRIBE-initiated one, or a
+         * bounded standalone FETCH. The session guarantees exactly one joining
+         * discriminator is set. */
+        const bool pub_join = moq_publication_is_valid(fr->joining_pub);
+        const bool standalone =
+            !pub_join && !moq_subscription_is_valid(fr->joining_sub);
         moq_pub_track_t *track =
-            standalone
-                ? find_track(pub, &fr->track_namespace, fr->track_name)
-                : find_track_by_sub(pub, fr->joining_sub);
+            pub_join     ? find_track_by_pub(pub, fr->joining_pub)
+            : standalone ? find_track(pub, &fr->track_namespace, fr->track_name)
+                         : find_track_by_sub(pub, fr->joining_sub);
 
         /* Standalone-FETCH authorization. A standalone FETCH resolves a track by
          * explicit namespace/name and would otherwise serve its retained objects
@@ -3066,8 +3085,9 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
          * UNAUTHORIZED -- regardless of whether the track exists or has a
          * retained group, so a protected track's existence is not leaked via
          * DOES_NOT_EXIST. A Joining FETCH is unaffected: its joining subscription
-         * is itself proof of an accepted subscription. This check consults only
-         * publisher state; it never invokes the subscribe callback. */
+         * is itself proof of an accepted subscription, and a publication join is
+         * proof the PEER accepted this publisher's PUBLISH. This check consults
+         * only publisher state; it never invokes the subscribe callback. */
         if (standalone &&
             pub->cfg.accept_mode != MOQ_PUB_ACCEPT_ALL &&
             !(track && track_has_subscriber(track))) {

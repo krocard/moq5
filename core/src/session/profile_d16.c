@@ -1616,6 +1616,7 @@ static moq_result_t d16_decode_fetch(moq_session_t *s,
     out->subscriber_priority = 128;
     out->group_order = MOQ_GROUP_ORDER_ASCENDING;
     out->joining_sub_slot = -1;
+    out->joining_pub_slot = -1;
 
     if (!session_is_active(s)) {
         *out_consumed = true;

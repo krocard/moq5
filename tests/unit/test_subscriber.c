@@ -3303,6 +3303,107 @@ static void test_fetch_old_struct_size(void) {
     MOQ_TEST_PASS("fetch_old_struct_size");
 }
 
+/* The complement of fetch_old_struct_size: when the caller DOES supply auth
+ * tokens, the facade must forward them. That is not automatic -- the session's
+ * auth-token fields are APPENDED past the frozen fetch-cfg floor, so the
+ * facade has to build its inner cfg with the sized initializer. With the
+ * pointer-only form the tokens are silently dropped and the peer sees none,
+ * which the old-struct-size test above cannot distinguish from correct
+ * behaviour because it expects zero either way. */
+static void test_fetch_forwards_auth_tokens(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *ptrack;
+    setup_pair(&as, &alloc, &sp, &pub, &ptrack);
+
+    moq_sub_cfg_t cfg; moq_sub_cfg_init(&cfg);
+    moq_subscriber_t *sub = NULL;
+    MOQ_TEST_CHECK_EQ_INT(moq_sub_create(moq_simpair_client(sp), &alloc,
+        &cfg, &sub), MOQ_OK);
+
+    uint8_t tok_val[] = { 0xBE, 0xEF };
+    moq_auth_token_t tok = {
+        .token_type = 7,
+        .token_value = { tok_val, sizeof(tok_val) },
+    };
+    moq_sub_fetch_cfg_t fcfg; moq_sub_fetch_cfg_init(&fcfg);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("test") };
+    fcfg.track_namespace.parts = ns;
+    fcfg.track_namespace.count = 1;
+    fcfg.track_name = MOQ_BYTES_LITERAL("video");
+    fcfg.end_group = 1;
+    fcfg.auth_tokens = &tok;
+    fcfg.auth_token_count = 1;
+
+    moq_sub_fetch_req_t *freq = NULL;
+    MOQ_TEST_CHECK_EQ_INT(moq_sub_fetch(sub, &fcfg,
+        moq_simpair_now_us(sp), &freq), MOQ_OK);
+    /* The facade must hand back a request before anything is inspected. */
+    MOQ_TEST_CHECK(freq != NULL);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+
+    /* Classify the COMPLETE server queue in one drain: exactly one
+     * FETCH_REQUEST, nothing foreign, no duplicate. MOQ_TEST_CHECK does not
+     * return, so nothing below reads or cleans an event unless the poll
+     * actually produced one of that kind -- a no-event or wrong-kind
+     * perturbation must be a named diagnostic, never an uninitialized read. */
+    int events = 0, reqs = 0, foreign = 0;
+    int tok_count = -1;
+    uint64_t tok_type = 0;
+    size_t tok_len = 0;
+    bool tok_data_null = false, tok_bytes_ok = false;
+    for (;;) {
+        moq_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        if (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) != 1)
+            break;
+        events++;
+        if (ev.kind == MOQ_EVENT_FETCH_REQUEST) {
+            reqs++;
+            /* The union is read ONLY under this kind guard. */
+            tok_count = (int)ev.u.fetch_request.token_count;
+            if (tok_count == 1) {
+                if (!ev.u.fetch_request.tokens) {
+                    tok_data_null = true;
+                } else {
+                    tok_type = ev.u.fetch_request.tokens[0].token_type;
+                    tok_len = ev.u.fetch_request.tokens[0].token_value.len;
+                    if (tok_len == sizeof(tok_val)) {
+                        if (!ev.u.fetch_request.tokens[0].token_value.data)
+                            tok_data_null = true;
+                        else
+                            tok_bytes_ok = memcmp(
+                                ev.u.fetch_request.tokens[0].token_value.data,
+                                tok_val, sizeof(tok_val)) == 0;
+                    }
+                }
+            }
+        } else {
+            foreign++;
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(events, 1);
+    MOQ_TEST_CHECK_EQ_INT(reqs, 1);
+    MOQ_TEST_CHECK_EQ_INT(foreign, 0);
+    /* Exact token inventory: count, type, length, non-NULL data, bytes. */
+    MOQ_TEST_CHECK_EQ_INT(tok_count, 1);
+    MOQ_TEST_CHECK(!tok_data_null);
+    MOQ_TEST_CHECK_EQ_U64(tok_type, 7);
+    MOQ_TEST_CHECK_EQ_SIZE(tok_len, sizeof(tok_val));
+    MOQ_TEST_CHECK(tok_bytes_ok);
+
+    moq_sub_destroy(sub);
+    moq_pub_destroy(pub);
+    { moq_event_t d;
+      while (moq_session_poll_events(moq_simpair_server(sp), &d, 1) == 1)
+          moq_event_cleanup(&d);
+      while (moq_session_poll_events(moq_simpair_client(sp), &d, 1) == 1)
+          moq_event_cleanup(&d); }
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("fetch_forwards_auth_tokens");
+}
+
 static void test_track_status_old_struct_size(void) {
     test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
     moq_publisher_t *pub; moq_pub_track_t *ptrack;
@@ -4094,6 +4195,7 @@ int main(void) {
     test_subscribe_auth_token_invalid();
     test_subscribe_old_struct_size();
     test_fetch_old_struct_size();
+    test_fetch_forwards_auth_tokens();
     test_track_status_old_struct_size();
     test_subscribe_done_marks_track_done();
     test_finish_subscribers_keeps_session();

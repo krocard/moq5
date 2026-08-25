@@ -8970,6 +8970,127 @@ static moq_track_hist_t *pub_find_hist(moq_session_t *s, const char *ns0,
     return r;
 }
 
+/* Installing a retained group merges its last object into the track's largest
+ * history, and that history is MONOTONIC -- it is a high-water mark of what the
+ * endpoint published, not a statement about what is still cached.
+ *
+ * draft-18 5.1.2: "Largest Object updates when the first byte of an Object with
+ * a Location larger than the previous value is published or received". 10.2.11:
+ * the parameter "contains the largest Location in the Track observed by the
+ * sending endpoint", and if omitted "the sending endpoint has not published or
+ * received any Objects in the Track". Neither is conditioned on the Object
+ * still being retrievable, so clearing or replacing the retained cache must NOT
+ * retract it.
+ *
+ * This pins the two sequences a general caller can drive through the public
+ * API, which the catalog path itself never reaches (catalog generations only
+ * ever advance). */
+static void test_retained_install_merges_monotonic_history(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    simpair_setup(&as, &alloc, &sp);
+    moq_session_t *sv = moq_simpair_server(sp);
+
+    moq_pub_cfg_t cfg;
+    moq_pub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    moq_pub_create(sv, &alloc, &cfg, &pub);
+
+    moq_pub_track_cfg_t tcfg;
+    moq_pub_track_cfg_init(&tcfg);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    tcfg.track_namespace.parts = ns_parts;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_pub_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_pub_add_track(pub, &tcfg, moq_simpair_now_us(sp), &track)
+        == MOQ_OK);
+
+    /* Nothing published yet: no Largest to report (10.2.11's omitted case). */
+    moq_track_hist_t *r = pub_find_hist(sv, "live", "video");
+    MOQ_TEST_CHECK(r != NULL && !r->has_largest);
+
+    uint8_t d[] = { 9, 8, 7 };
+    moq_rcbuf_t *pay = NULL;
+    moq_rcbuf_create(&alloc, d, sizeof(d), &pay);
+
+    /* Install retained GROUP 5 with objects 0..2: the last object is the
+     * track's latest published Location. */
+    {
+        moq_pub_retained_object_t objs[3];
+        for (int i = 0; i < 3; i++) {
+            memset(&objs[i], 0, sizeof(objs[i]));
+            objs[i].object_id = (uint64_t)i;
+            objs[i].payload = pay;
+        }
+        moq_pub_retained_group_cfg_t rg;
+        moq_pub_retained_group_cfg_init(&rg);
+        rg.group_id = 5;
+        rg.objects = objs;
+        rg.object_count = 3;
+        MOQ_TEST_CHECK(moq_pub_set_retained_group(pub, track, &rg) == MOQ_OK);
+    }
+    r = pub_find_hist(sv, "live", "video");
+    MOQ_TEST_CHECK(r && r->has_largest);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_group, 5);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_object, 2);
+
+    /* CLEAR: the cache is gone, the high-water mark is not. A PUBLISH composed
+     * now still reports (5,2), which is what 5.1.2 defines it to be. */
+    MOQ_TEST_CHECK(moq_pub_clear_retained_group(pub, track) == MOQ_OK);
+    r = pub_find_hist(sv, "live", "video");
+    MOQ_TEST_CHECK(r && r->has_largest);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_group, 5);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_object, 2);
+
+    /* REPLACE with a LOWER group: the retained cache becomes group 2, and the
+     * history still reports the high-water mark. track_hist_merge is a
+     * monotonic max, so the lower install is a no-op on it. */
+    {
+        moq_pub_retained_object_t objs[1];
+        memset(&objs[0], 0, sizeof(objs[0]));
+        objs[0].object_id = 0;
+        objs[0].payload = pay;
+        moq_pub_retained_group_cfg_t rg;
+        moq_pub_retained_group_cfg_init(&rg);
+        rg.group_id = 2;
+        rg.objects = objs;
+        rg.object_count = 1;
+        MOQ_TEST_CHECK(moq_pub_set_retained_group(pub, track, &rg) == MOQ_OK);
+    }
+    r = pub_find_hist(sv, "live", "video");
+    MOQ_TEST_CHECK(r && r->has_largest);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_group, 5);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_object, 2);
+
+    /* REPLACE with a HIGHER group: the mark advances. */
+    {
+        moq_pub_retained_object_t objs[2];
+        for (int i = 0; i < 2; i++) {
+            memset(&objs[i], 0, sizeof(objs[i]));
+            objs[i].object_id = (uint64_t)i;
+            objs[i].payload = pay;
+        }
+        moq_pub_retained_group_cfg_t rg;
+        moq_pub_retained_group_cfg_init(&rg);
+        rg.group_id = 9;
+        rg.objects = objs;
+        rg.object_count = 2;
+        MOQ_TEST_CHECK(moq_pub_set_retained_group(pub, track, &rg) == MOQ_OK);
+    }
+    r = pub_find_hist(sv, "live", "video");
+    MOQ_TEST_CHECK(r && r->has_largest);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_group, 9);
+    MOQ_TEST_CHECK_EQ_U64(r->largest_object, 1);
+
+    moq_rcbuf_decref(pay);
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("retained_install_merges_monotonic_history");
+}
+
 /* Layer B: the publisher reserves a per-track history record at add_track and
  * advances it on every accepted object -- including zero-destination writes --
  * with an exactly-once, allocation-free merge; empty reservations are
@@ -14681,6 +14802,7 @@ int main(void) {
     test_finish_subscribers_pub_mid_object();
     test_publish_restart_after_peer_unsubscribe_d16();
     test_publish_restart_d18_cancel();
+    test_retained_install_merges_monotonic_history();
     test_pub_history_reservation_and_merge();
     test_pub_history_capacity_at_add_track();
     test_pub_history_validate_before_mutate();

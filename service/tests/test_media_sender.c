@@ -79,6 +79,42 @@ typedef struct {
                                      must arrive via publication-forward demand */
     bool         pub_cat_ok;      /* accepted the catalog track's PUBLISH */
     moq_publication_t pub_cat;    /* its handle (capture key in push mode) */
+    /* Push-mode bootstrap (draft-18 10.2.11): the catalog PUBLISH's advertised
+     * LARGEST_OBJECT, and the FETCH the consumer pulls the retained catalog
+     * with -- standalone by default, or keyed on the publication when
+     * push_join is set (draft-18 5.1 + 10.12.2). Neither is MSF-01 5, which
+     * requires SUBSCRIBE plus a Joining FETCH. */
+    bool         push_fetch;      /* enable the bootstrap FETCH */
+    bool         push_join;       /* issue it as a Joining FETCH(offset 0) */
+    bool         offer_d18;       /* server ALPN list carries moqt-18 first */
+    /* Deterministic ordering barrier for the publication-keyed join: one
+     * benign REQUEST_UPDATE on the PUBLISH request bidi, whose ACK proves the
+     * remote publisher processed our PUBLISH_OK. */
+    /* PUMP-OWNED terminal state: written and read only on the pump thread, so
+     * no cross-thread access and no lock is involved. */
+    bool         cat_upd_issued;  /* the one successful update went out */
+    bool         cat_upd_done;    /* stop attempting (success, or hard error) */
+    bool         cat_upd_acked;   /* the ACK arrived: the join may go out */
+    /* REPORT inventory: written by the pump under st->mu, read by the test
+     * under st->mu. Never read across threads without it. */
+    int          cat_upd_sent;    /* successful moq_session_update_publication */
+    int          cat_upd_hard;    /* non-OK, non-WOULD_BLOCK results */
+    int          cat_upd_last_rc; /* the exact result of the last hard error */
+    int          cat_upd_ok;      /* MOQ_EVENT_PUBLICATION_UPDATE_OK count */
+    int          jfetch_errs;     /* FETCH_ERROR count on the join */
+    bool         cat_pub_has_lg;  /* LARGEST_OBJECT present on the catalog PUBLISH */
+    uint64_t     cat_pub_lg_group;
+    uint64_t     cat_pub_lg_object;
+    int          cat_pub_reqs;    /* catalog PUBLISH_REQUESTs seen (expect 1) */
+    bool         cat_sfetch_issued;
+    moq_fetch_t  cat_sfetch;
+    int          sfetch_ok;       /* FETCH_OK count for that fetch */
+    int          sfetch_obj;      /* FETCH_OBJECT count */
+    int          sfetch_done;     /* FETCH_COMPLETE count */
+    uint64_t     sfetch_end_group, sfetch_end_object;   /* from FETCH_OK */
+    uint64_t     sfetch_obj_group, sfetch_obj_object;   /* from FETCH_OBJECT */
+    uint8_t      sfetch_buf[4096];
+    size_t       sfetch_len;
     bool         cat_subscribed;
     bool         cat_fetch_issued; /* Joining FETCH(offset 0) for the catalog --
                                       how a joiner obtains the retained generation
@@ -206,15 +242,27 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
              * track's publication handle so its live generations (delivered
              * WITHOUT any SUBSCRIBE) can be captured below. */
             const moq_publish_request_event_t *pr = &ev.u.publish_request;
-            moq_accept_publish_cfg_t acc;
-            moq_accept_publish_cfg_init(&acc);
-            if (moq_session_accept_publish(session, pr->pub, &acc,
-                                           now_us) == MOQ_OK &&
+            const bool is_catalog =
                 pr->track_name.len == strlen(MOQ_MSF_CATALOG_TRACK_NAME) &&
                 memcmp(pr->track_name.data, MOQ_MSF_CATALOG_TRACK_NAME,
-                       pr->track_name.len) == 0) {
-                st->pub_cat = pr->pub;
+                       pr->track_name.len) == 0;
+            const moq_publication_t cand = pr->pub;
+            /* Read every borrowed/inline field BEFORE the advancing accept. */
+            const bool  lg_present = pr->has_largest;
+            const uint64_t lg_group = pr->largest_group;
+            const uint64_t lg_object = pr->largest_object;
+            moq_accept_publish_cfg_t acc;
+            moq_accept_publish_cfg_init(&acc);
+            if (moq_session_accept_publish(session, cand, &acc,
+                                           now_us) == MOQ_OK && is_catalog) {
+                st->pub_cat = cand;
                 st->pub_cat_ok = true;
+                pthread_mutex_lock(&st->mu);
+                st->cat_pub_reqs++;
+                st->cat_pub_has_lg = lg_present;
+                st->cat_pub_lg_group = lg_group;
+                st->cat_pub_lg_object = lg_object;
+                pthread_mutex_unlock(&st->mu);
             }
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
             const moq_object_received_event_t *o = &ev.u.object_received;
@@ -317,10 +365,149 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
              * generation (gen 0) -- capture it as a catalog generation. */
             const moq_fetch_object_event_t *fo = &ev.u.fetch_object;
             if (st->cat_fetch_issued &&
-                moq_fetch_eq(fo->fetch, st->cat_fetch))
+                moq_fetch_eq(fo->fetch, st->cat_fetch)) {
                 srv_capture_catalog(st, fo->group_id, fo->object_id, fo->payload);
+            } else if (st->cat_sfetch_issued &&
+                       moq_fetch_eq(fo->fetch, st->cat_sfetch)) {
+                /* Push bootstrap: the retained catalog. This capture serves
+                 * BOTH forms -- the standalone FETCH over the advertised
+                 * Largest range, and the publication-keyed Joining FETCH whose
+                 * range the session derives. */
+                pthread_mutex_lock(&st->mu);
+                st->sfetch_obj++;
+                st->sfetch_obj_group = fo->group_id;
+                st->sfetch_obj_object = fo->object_id;
+                if (fo->payload) {
+                    size_t n = moq_rcbuf_len(fo->payload);
+                    if (n && n <= sizeof(st->sfetch_buf)) {
+                        memcpy(st->sfetch_buf, moq_rcbuf_data(fo->payload), n);
+                        st->sfetch_len = n;
+                    }
+                }
+                pthread_mutex_unlock(&st->mu);
+            }
+        } else if (ev.kind == MOQ_EVENT_FETCH_OK) {
+            const moq_fetch_ok_event_t *fk = &ev.u.fetch_ok;
+            if (st->cat_sfetch_issued &&
+                moq_fetch_eq(fk->fetch, st->cat_sfetch)) {
+                pthread_mutex_lock(&st->mu);
+                st->sfetch_ok++;
+                st->sfetch_end_group = fk->end_group;
+                st->sfetch_end_object = fk->end_object;
+                pthread_mutex_unlock(&st->mu);
+            }
+        } else if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) {
+            const moq_fetch_complete_event_t *fc = &ev.u.fetch_complete;
+            if (st->cat_sfetch_issued &&
+                moq_fetch_eq(fc->fetch, st->cat_sfetch)) {
+                pthread_mutex_lock(&st->mu);
+                st->sfetch_done++;
+                pthread_mutex_unlock(&st->mu);
+            }
+        } else if (ev.kind == MOQ_EVENT_FETCH_ERROR) {
+            /* Counted, never recovered from: the ordering barrier below is
+             * what sequences this exchange, so any FETCH_ERROR is a failure to
+             * report rather than something to retry around. */
+            const moq_fetch_error_event_t *fe = &ev.u.fetch_error;
+            if (st->cat_sfetch_issued &&
+                moq_fetch_eq(fe->fetch, st->cat_sfetch)) {
+                pthread_mutex_lock(&st->mu);
+                st->jfetch_errs++;
+                pthread_mutex_unlock(&st->mu);
+            }
+        } else if (ev.kind == MOQ_EVENT_PUBLICATION_UPDATE_OK) {
+            if (st->pub_cat_ok &&
+                moq_publication_eq(ev.u.publication_update_ok.pub,
+                                   st->pub_cat)) {
+                st->cat_upd_acked = true;    /* pump-owned gate */
+                pthread_mutex_lock(&st->mu);
+                st->cat_upd_ok++;            /* reported under the lock */
+                pthread_mutex_unlock(&st->mu);
+            }
         }
         moq_event_cleanup(&ev);
+    }
+
+    /* Push-mode bootstrap, two shapes over the same accounting. NEITHER is the
+     * MSF-01 5 sequence, which requires SUBSCRIBE with a Joining FETCH
+     * (offset = 0); both are transport/facade coverage of the push path.
+     *
+     * push_join: a JOINING FETCH with offset 0 keyed on the catalog
+     * PUBLICATION. draft-18 5.1 names PUBLISH as a Joining Location source and
+     * 10.12.2.1 derives the range from it, so the consumer supplies no range
+     * of its own -- which is the point: it cannot ask for the wrong one.
+     *
+     * otherwise: a STANDALONE FETCH over exactly
+     * [{lg.group,0} .. {lg.group,lg.object+1}), computed by the consumer from
+     * the advertised Largest -- coverage of the retained-cache path. */
+    /* The join's ordering barrier: one benign REQUEST_UPDATE on the SAME
+     * PUBLISH request bidi. PUBLISH_OK was queued on that bidi first, so the
+     * peer cannot process the update before it -- and its ACK is therefore
+     * positive proof the remote publisher left Pending (Publisher). Only then
+     * is the Joining FETCH issued, on its own bidi. Subscriber-priority is
+     * chosen deliberately: it changes no Forward state, so the barrier cannot
+     * be confused with the transition under test elsewhere. */
+    if (st->push_mode && st->push_join && st->pub_cat_ok && !st->cat_upd_done) {
+        moq_publication_update_cfg_t uc;
+        moq_publication_update_cfg_init(&uc);
+        uc.has_subscriber_priority = true;
+        uc.subscriber_priority = 200;
+        moq_result_t urc =
+            moq_session_update_publication(session, st->pub_cat, &uc, now_us);
+        if (urc == MOQ_OK) {
+            st->cat_upd_issued = true;
+            st->cat_upd_done = true;         /* exactly one, never repeated */
+            pthread_mutex_lock(&st->mu);
+            st->cat_upd_sent++;
+            pthread_mutex_unlock(&st->mu);
+        } else if (urc != MOQ_ERR_WOULD_BLOCK) {
+            /* ONLY WOULD_BLOCK retries. A hard error stops attempting and is
+             * recorded exactly -- retrying it forever would turn a real
+             * failure into a hang. */
+            st->cat_upd_done = true;
+            pthread_mutex_lock(&st->mu);
+            st->cat_upd_hard++;
+            st->cat_upd_last_rc = (int)urc;
+            pthread_mutex_unlock(&st->mu);
+        }
+    }
+
+    if (st->push_mode && st->push_fetch && st->pub_cat_ok &&
+        !st->cat_sfetch_issued &&
+        (!st->push_join || st->cat_upd_acked)) {
+        bool have; uint64_t g, o;
+        pthread_mutex_lock(&st->mu);
+        have = st->cat_pub_has_lg;
+        g = st->cat_pub_lg_group;
+        o = st->cat_pub_lg_object;
+        pthread_mutex_unlock(&st->mu);
+        if (have) {
+            /* Same namespace fill_cfg() gives the sender. */
+            moq_bytes_t nsparts[2] = {
+                { (const uint8_t *)"svc", 3 }, { (const uint8_t *)"demo", 4 },
+            };
+            moq_fetch_cfg_t fcfg;
+            /* sized init: joining_pub lives past the frozen v0 floor */
+            moq_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
+            fcfg.track_namespace = (moq_namespace_t){ nsparts, 2 };
+            fcfg.track_name = (moq_bytes_t){
+                (const uint8_t *)MOQ_MSF_CATALOG_TRACK_NAME,
+                strlen(MOQ_MSF_CATALOG_TRACK_NAME) };
+            if (st->push_join) {
+                fcfg.is_joining = true;
+                fcfg.joining_relative = true;
+                fcfg.joining_start = 0;     /* offset = 0 */
+                fcfg.joining_pub = st->pub_cat;
+            } else {
+                fcfg.start_group = g;
+                fcfg.start_object = 0;
+                fcfg.end_group = g;
+                fcfg.end_object = o + 1; /* exclusive end == Largest.Object+1 */
+            }
+            if (moq_session_fetch(session, &fcfg, now_us,
+                                  &st->cat_sfetch) == MOQ_OK)
+                st->cat_sfetch_issued = true;
+        }
     }
 
     if (atomic_load(&st->ns_accepted) && !st->push_mode) {
@@ -447,6 +634,14 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
         cfg.goaway_timeout_us = st->goaway_timeout_us;  /* 0 = off for most tests */
         cfg.on_lane_pump = server_pump;
         cfg.on_lane_pump_ctx = st;
+        /* The default (alpn_count == 0) is the legacy single draft-16 ALPN.
+         * A test that needs draft-18 opts in; the server then picks the first
+         * of this list the client offers, so a draft-16 client is unaffected. */
+        static const char *const alpn18[] = { "moqt-18", "moqt-16" };
+        if (st->offer_d18) {
+            cfg.alpn_list = alpn18;
+            cfg.alpn_count = 2;
+        }
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&cfg, &srv) == MOQ_OK) {
             *out_port = port;
@@ -2480,6 +2675,243 @@ int main(int argc, char **argv)
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
         MOQ_TEST_PASS("push_catalog_updates_no_subscriber");
+    }
+
+    /* == PUSH transport/facade coverage: advertisement -> STANDALONE FETCH == *
+     * draft-18 10.2.11: a publisher that has published Objects MUST include
+     * LARGEST_OBJECT, and 5.1.2 defines it as the largest Location the sending
+     * endpoint observed. The catalog's retained group IS such an Object, so the
+     * catalog PUBLISH must advertise it.
+     *
+     * The consumer here reads that advertised Largest and pulls the retained
+     * group with a STANDALONE FETCH over exactly that range. This block covers
+     * the advertisement and the retained-cache serving path; it does NOT
+     * satisfy MSF-01 5, which requires a Joining FETCH with offset 0. The
+     * MSF-01 sequence is the block that follows.
+     *
+     * A prior revision of this comment claimed the Joining variant was not
+     * expressible in push mode. That is no longer true: draft-18 5.1 makes
+     * PUBLISH a subscription initiator and a Joining Location source, and
+     * moq_fetch_cfg_t::joining_pub now names a publication directly. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.push_mode = true;
+        g_srv.push_fetch = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.publish_tracks = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        /* Wait for the fetch to complete (bounded). */
+        for (int i = 0; i < 400; i++) {
+            pthread_mutex_lock(&g_srv.mu);
+            int done = g_srv.sfetch_done;
+            pthread_mutex_unlock(&g_srv.mu);
+            if (done) break;
+            usleep(5000);
+        }
+
+        pthread_mutex_lock(&g_srv.mu);
+        const bool     has_lg   = g_srv.cat_pub_has_lg;
+        const uint64_t lg_group = g_srv.cat_pub_lg_group;
+        const uint64_t lg_obj   = g_srv.cat_pub_lg_object;
+        const int      cat_reqs = g_srv.cat_pub_reqs;
+        const int      f_ok     = g_srv.sfetch_ok;
+        const int      f_obj    = g_srv.sfetch_obj;
+        const int      f_done   = g_srv.sfetch_done;
+        const uint64_t e_group  = g_srv.sfetch_end_group;
+        const uint64_t e_object = g_srv.sfetch_end_object;
+        const uint64_t o_group  = g_srv.sfetch_obj_group;
+        const uint64_t o_object = g_srv.sfetch_obj_object;
+        const size_t   f_len    = g_srv.sfetch_len;
+        static uint8_t fetched[4096];
+        memcpy(fetched, g_srv.sfetch_buf, f_len);
+        pthread_mutex_unlock(&g_srv.mu);
+
+        /* 1. The catalog PUBLISH advertised a Largest at all. */
+        MOQ_TEST_CHECK_EQ_INT(cat_reqs, 1);
+        MOQ_TEST_CHECK(has_lg);
+        /* 2. It is the retained group's identity: generation 0, object 0.
+         *    Derived from the sender's own initial generation, not a constant
+         *    of convenience -- sender_hook installs the initial catalog as
+         *    retained group 0 object 0. */
+        MOQ_TEST_CHECK_EQ_U64(lg_group, 0);
+        MOQ_TEST_CHECK_EQ_U64(lg_obj, 0);
+        /* 3. The FETCH derived from it was accepted, with the End Location the
+         *    range implies: {Largest.Group, Largest.Object + 1}. */
+        MOQ_TEST_CHECK_EQ_INT(f_ok, 1);
+        MOQ_TEST_CHECK_EQ_U64(e_group, lg_group);
+        MOQ_TEST_CHECK_EQ_U64(e_object, lg_obj + 1);
+        /* 4. Exactly one object came back, at exactly the advertised Location. */
+        MOQ_TEST_CHECK_EQ_INT(f_obj, 1);
+        MOQ_TEST_CHECK_EQ_U64(o_group, lg_group);
+        MOQ_TEST_CHECK_EQ_U64(o_object, lg_obj);
+        /* 5. The fetch completed. */
+        MOQ_TEST_CHECK_EQ_INT(f_done, 1);
+        /* 6. The payload is the real catalog: it parses, and it declares the
+         *    track this sender registered. Byte presence alone would pass on an
+         *    empty or truncated object. */
+        MOQ_TEST_CHECK(f_len > 0);
+        if (f_len > 0) {
+            const moq_alloc_t *al = moq_alloc_default();
+            moq_msf_catalog_t cat;
+            moq_result_t prc =
+                moq_msf_catalog_parse(al, (moq_bytes_t){ fetched, f_len }, &cat);
+            MOQ_TEST_CHECK_EQ_INT((int)prc, (int)MOQ_OK);
+            if (prc == MOQ_OK) {
+                MOQ_TEST_CHECK(find_track(&cat, "v") != NULL);
+                moq_msf_catalog_cleanup(al, &cat);
+            }
+        }
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("push_bootstrap_publish_largest_then_fetch");
+    }
+
+    /* == PUBLISH-keyed Joining FETCH(offset = 0) over the service tier ==== *
+     * A TRANSPORT capability, not an MSF-01 5 sequence. MSF-01 5 requires
+     * catalog subscribers to use SUBSCRIBE with a Joining FETCH (offset = 0),
+     * and a PUBLISH-initiated subscription does not fulfil that literal
+     * requirement -- it is a different initiator, and this block does not
+     * claim otherwise. What draft-18 does establish is that the capability
+     * must exist: 5.1 makes PUBLISH a subscription initiator and a Joining
+     * Location source, and 10.12.2 permits a Joining Fetch against any
+     * Established subscription whatever initiated it.
+     *
+     * The value here is that the consumer supplies NO range at all: it names
+     * the catalog PUBLICATION and an offset of 0, and the session derives the
+     * range from the latched Joining Location. That is the discriminator
+     * against the standalone block above -- a consumer that computed the range
+     * itself could compute a wrong one; this one cannot express a range. It
+     * also drives the retained-group facade path through the publication
+     * owner rather than through a namespace/track lookup.
+     *
+     * Ordering is deterministic, not raced: a benign REQUEST_UPDATE goes out
+     * on the SAME PUBLISH request bidi behind PUBLISH_OK, and its ACK is what
+     * releases the FETCH. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.push_mode = true;
+        g_srv.push_fetch = true;
+        g_srv.push_join = true;
+        g_srv.offer_d18 = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        /* Pinned to draft-18: 5.1's Forward 0 -> 1 rule is what supplies the
+         * Joining Location from a PUBLISH. Draft-16 instead requires the
+         * publication to have negotiated SUBSCRIPTION_FILTER=LARGEST_OBJECT
+         * (9.16.2), which this sender does not set -- that profile's join is
+         * covered by the focused unit rows, not here. */
+        static const moq_version_t v18_join = MOQ_VERSION_DRAFT_18;
+        ec.versions.struct_size = sizeof(moq_version_offer_t);
+        ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+        ec.versions.versions = &v18_join;
+        ec.versions.version_count = 1;
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.publish_tracks = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        for (int i = 0; i < 400; i++) {
+            pthread_mutex_lock(&g_srv.mu);
+            int done = g_srv.sfetch_done;
+            pthread_mutex_unlock(&g_srv.mu);
+            if (done) break;
+            usleep(5000);
+        }
+
+        pthread_mutex_lock(&g_srv.mu);
+        const bool     has_lg   = g_srv.cat_pub_has_lg;
+        const uint64_t lg_group = g_srv.cat_pub_lg_group;
+        const uint64_t lg_obj   = g_srv.cat_pub_lg_object;
+        const int      cat_reqs = g_srv.cat_pub_reqs;
+        const int      upd_ok   = g_srv.cat_upd_ok;
+        const int      f_errs   = g_srv.jfetch_errs;
+        const int      f_ok     = g_srv.sfetch_ok;
+        const int      f_obj    = g_srv.sfetch_obj;
+        const int      f_done   = g_srv.sfetch_done;
+        const uint64_t e_group  = g_srv.sfetch_end_group;
+        const uint64_t e_object = g_srv.sfetch_end_object;
+        const uint64_t o_group  = g_srv.sfetch_obj_group;
+        const uint64_t o_object = g_srv.sfetch_obj_object;
+        const size_t   f_len    = g_srv.sfetch_len;
+        const int      upd_sent = g_srv.cat_upd_sent;
+        const int      upd_hard = g_srv.cat_upd_hard;
+        const int      upd_rc   = g_srv.cat_upd_last_rc;
+        static uint8_t jfetched[4096];
+        memcpy(jfetched, g_srv.sfetch_buf, f_len);
+        pthread_mutex_unlock(&g_srv.mu);
+
+        /* The PUBLISH that established the subscription carried Largest. */
+        MOQ_TEST_CHECK_EQ_INT(cat_reqs, 1);
+        MOQ_TEST_CHECK(has_lg);
+        /* Exactly one barrier update, no hard update error, and exactly one
+         * ACK -- the ACK is the ordering proof, so a missing one would make
+         * the rest meaningless. */
+        MOQ_TEST_CHECK_EQ_INT(upd_sent, 1);
+        MOQ_TEST_CHECK_EQ_INT(upd_hard, 0);
+        MOQ_TEST_CHECK_EQ_INT(upd_rc, 0);
+        MOQ_TEST_CHECK_EQ_INT(upd_ok, 1);
+        /* No protocol rejection anywhere: ordering is the barrier's job, and
+         * a retry is not a substitute for it. */
+        MOQ_TEST_CHECK_EQ_INT(f_errs, 0);
+        MOQ_TEST_CHECK_EQ_U64(lg_group, 0);
+        MOQ_TEST_CHECK_EQ_U64(lg_obj, 0);
+        /* 10.12.2.1: End = {Joining Location.Group, Joining Location.Object+1},
+         * derived by the session -- the consumer supplied no range. */
+        MOQ_TEST_CHECK_EQ_INT(f_ok, 1);
+        MOQ_TEST_CHECK_EQ_U64(e_group, lg_group);
+        MOQ_TEST_CHECK_EQ_U64(e_object, lg_obj + 1);
+        /* Exactly one object, at exactly the Joining Location. No duplicates. */
+        MOQ_TEST_CHECK_EQ_INT(f_obj, 1);
+        MOQ_TEST_CHECK_EQ_U64(o_group, lg_group);
+        MOQ_TEST_CHECK_EQ_U64(o_object, lg_obj);
+        MOQ_TEST_CHECK_EQ_INT(f_done, 1);
+        /* The payload is the real catalog, parsed, declaring the registered
+         * track -- byte presence alone would pass on a truncated object. */
+        MOQ_TEST_CHECK(f_len > 0);
+        if (f_len > 0) {
+            const moq_alloc_t *al = moq_alloc_default();
+            moq_msf_catalog_t cat;
+            moq_result_t prc =
+                moq_msf_catalog_parse(al, (moq_bytes_t){ jfetched, f_len }, &cat);
+            MOQ_TEST_CHECK_EQ_INT((int)prc, (int)MOQ_OK);
+            if (prc == MOQ_OK) {
+                MOQ_TEST_CHECK(find_track(&cat, "v") != NULL);
+                moq_msf_catalog_cleanup(al, &cat);
+            }
+        }
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("push_publication_keyed_joining_fetch_offset0");
     }
 
 

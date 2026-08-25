@@ -114,6 +114,10 @@ struct fetch_config {
     bool           is_joining      = false;
     bool           joining_relative = false;
     subscription   joining_sub     = {};
+    /* Join a PUBLISH-initiated subscription instead of a SUBSCRIBE-initiated
+     * one. For a joining fetch exactly one of joining_sub / joining_pub must
+     * be set; both or neither is errc::invalid. */
+    publication    joining_pub     = {};
     uint64_t       joining_start   = 0;
     std::span<const moq_auth_token_t> auth_tokens = {};
 };

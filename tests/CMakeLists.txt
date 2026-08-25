@@ -389,6 +389,11 @@ if(TARGET moq::sim)
     target_link_libraries(test_d18_datagram PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_datagram COMMAND test_d18_datagram)
 
+    add_executable(test_publish_joining_fetch unit/test_publish_joining_fetch.c)
+    target_link_libraries(test_publish_joining_fetch PRIVATE
+        moq-core-test-internals moq::sim)
+    add_test(NAME publish_joining_fetch COMMAND test_publish_joining_fetch)
+
     add_executable(test_d18_joining unit/test_d18_joining.c)
     target_link_libraries(test_d18_joining PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_joining COMMAND test_d18_joining)

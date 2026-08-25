@@ -72,9 +72,28 @@ moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
         track_hist_merge(e->hist, largest_group, largest_object);
     /* Latch the acknowledged Forward state: object delivery (streams and
      * datagrams) gates on it from this point on. */
+    const bool fwd_rising = e->update_has_forward && e->update_forward &&
+                            !e->send_allowed;
     if (e->update_has_forward)
         e->send_allowed = e->update_forward;
     e->update_has_forward = false;
+    /* draft-18 5.1: a REQUEST_UPDATE_OK that changes the Forward State from 0
+     * to 1 supplies a NEW Joining Location -- the Largest it carried, exactly
+     * as carried. A rise with no Largest leaves the previous location alone
+     * rather than inventing one from history.
+     *
+     * PROFILE-SCOPED to draft-18. Draft-16 5.1 saves the Largest communicated
+     * in PUBLISH or SUBSCRIBE_OK WHEN ESTABLISHING the subscription and states
+     * no update-driven transition rule, so applying this here would move a
+     * draft-16 Joining Location the draft never moves.
+     *
+     * The location is latched DIRECTLY from the acknowledged snapshot; the
+     * establishment record (publish_has_largest / publish_largest_*) is left
+     * exactly as the PUBLISH set it. */
+    if (moq_session_uses_request_streams(s) && fwd_rising && has_largest) {
+        e->has_joining_loc = false;      /* re-latch under the new state */
+        pub_latch_joining_location_at(s, e, largest_group, largest_object);
+    }
     /* §9.8: latch acknowledged timeout carriers; retained legacy stays
      * EXACT milliseconds, recomputed from the complete current pair. */
     if (e->dt_upd_has_object) {
@@ -715,6 +734,12 @@ moq_result_t session_core_on_publish(moq_session_t *s,
      * after push_event so a WOULD_BLOCK'd (replayable) request mutates nothing. */
     if (d->has_largest && phist)
         track_hist_merge(phist, d->largest_group, d->largest_object);
+    /* Retain the EXACT Largest this PUBLISH advertised. It becomes the Joining
+     * Location only once PUBLISH_OK establishes an eligible state (5.1); it is
+     * deliberately not read back from history, which keeps moving. */
+    entry->publish_has_largest = d->has_largest;
+    entry->publish_largest_group = d->has_largest ? d->largest_group : 0;
+    entry->publish_largest_object = d->has_largest ? d->largest_object : 0;
     /* Gates outbound new-group requests on the accept and later updates. */
     entry->dynamic_groups = d->dynamic_groups;
     /* Initial Forward State (§9.4): with FORWARD omitted/1 the publisher may begin
@@ -828,7 +853,43 @@ moq_result_t session_core_on_publish_ok(moq_session_t *s,
                                   snap_has, snap_g, snap_o,
                                   s->profile->location_varint_max, &e->window);
     }
+    /* ESTABLISHED, with the peer's effective Forward/filter now known: latch
+     * the Largest this PUBLISH advertised as the Joining Location (5.1). */
+    pub_latch_joining_location(s, e);
     return MOQ_OK;
+}
+
+/* -- Joining Location (draft-18 5.1 / draft-16 5.1) ---------------- */
+
+bool pub_joining_eligible(const moq_session_t *s, const moq_pub_entry_t *pe)
+{
+    if (moq_session_uses_request_streams(s))
+        return pe->send_allowed;                 /* draft-18: Forward State 1 */
+    return pe->filter_type == MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+}
+
+/* Latch an EXPLICIT location as the Joining Location.
+ *
+ * The caller supplies the exact Largest it is acting on -- for an update this
+ * is the snapshot encoded into the REQUEST_UPDATE_OK, never a re-read of
+ * moving history. publish_has_largest / publish_largest_* are deliberately NOT
+ * touched: those record what the PUBLISH carried at establishment and stay
+ * truthful to that, so a later update cannot rewrite the establishment record. */
+void pub_latch_joining_location_at(const moq_session_t *s, moq_pub_entry_t *pe,
+                                   uint64_t group, uint64_t object)
+{
+    if (!pub_joining_eligible(s, pe)) return;
+    pe->has_joining_loc = true;
+    pe->joining_group = group;
+    pe->joining_object = object;
+}
+
+/* Latch the ESTABLISHMENT-time location: the Largest the PUBLISH carried. */
+void pub_latch_joining_location(const moq_session_t *s, moq_pub_entry_t *pe)
+{
+    if (!pe->publish_has_largest) return;        /* no Largest -> no location */
+    pub_latch_joining_location_at(s, pe, pe->publish_largest_group,
+                                  pe->publish_largest_object);
 }
 
 /* -- Inbound PUBLISH error (REQUEST_ERROR for publish) ------------- */
@@ -1017,6 +1078,8 @@ moq_result_t moq_session_publish(moq_session_t *s,
      *. Released on the encode/push failure paths and in
      * pub_free_entry. */
     moq_track_hist_t *phist = NULL;
+    bool     adv_has_largest = false;
+    uint64_t adv_largest_group = 0, adv_largest_object = 0;
     {
         bool forward = cfg->has_forward ? cfg->forward : true;
 
@@ -1086,6 +1149,11 @@ moq_result_t moq_session_publish(moq_session_t *s,
             .largest_group = phist->has_largest ? phist->largest_group : 0,
             .largest_object = phist->has_largest ? phist->largest_object : 0,
         };
+        /* Same snapshot the encoder just used, captured for the entry so the
+         * Joining Location can never diverge from what went on the wire. */
+        adv_has_largest = args.has_largest;
+        adv_largest_group = args.largest_group;
+        adv_largest_object = args.largest_object;
 
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, s->send_buf + s->send_len,
@@ -1147,6 +1215,12 @@ moq_result_t moq_session_publish(moq_session_t *s,
         entry->dynamic_groups = s->profile->track_properties_dynamic_groups(
             cfg->track_properties.data, cfg->track_properties.len);
         entry->handle = pub_make_handle(s, (size_t)slot);
+        /* Retain the EXACT Largest this PUBLISH put on the wire (the same
+         * snapshot the encoder used, not a later history read). It becomes the
+         * Joining Location when PUBLISH_OK establishes an eligible state. */
+        entry->publish_has_largest = adv_has_largest;
+        entry->publish_largest_group = adv_largest_group;
+        entry->publish_largest_object = adv_largest_object;
         req_ep.kind = MOQ_REQ_PUBLISH;
         req_ep.slot = slot;
         if (req_stream) {
@@ -1294,6 +1368,9 @@ moq_result_t moq_session_accept_publish(
         s->publishes[slot].req_start_object = f_start_object;
         s->publishes[slot].req_end_group = f_end_group;
     }
+    /* ESTABLISHED with the effective Forward/filter now known: the Largest the
+     * PUBLISH advertised becomes this subscription's Joining Location (5.1). */
+    pub_latch_joining_location(s, &s->publishes[slot]);
     return MOQ_OK;
 }
 
@@ -1698,8 +1775,26 @@ moq_result_t session_core_on_publish_request_update(
 
     if (d->has_subscriber_priority)
         e->subscriber_priority = d->subscriber_priority;
+    /* draft-18 5.1: this endpoint is the PUBLISHER, and the REQUEST_UPDATE_OK
+     * it just queued is the message that changes the Forward State. When that
+     * change is 0 -> 1 the publisher MUST save the Largest that ACK carried --
+     * and a later publication-keyed Joining FETCH resolves on THIS entry, so
+     * omitting it here would leave the serving side with no location while the
+     * requester has one.
+     *
+     * usnap_* is the single registry snapshot taken before encoding and is
+     * exactly what went into the ACK, so the latch cannot disagree with the
+     * wire. It runs after push_event committed, i.e. only once the response
+     * and event path can no longer fail. Draft-16 has no update-driven
+     * transition rule, so this is draft-18 only. */
+    const bool upd_fwd_rising =
+        d->has_forward && d->forward && !e->send_allowed;
     if (d->has_forward)
         e->send_allowed = d->forward;
+    if (moq_session_uses_request_streams(s) && upd_fwd_rising && usnap_has) {
+        e->has_joining_loc = false;      /* re-latch under the new state */
+        pub_latch_joining_location_at(s, e, usnap_g, usnap_o);
+    }
     if (d->dt_has_object) {
         e->dt_sub_has_object = true;
         e->dt_sub_object_ms = d->dt_object_ms;

@@ -1413,6 +1413,7 @@ static moq_result_t d18_process_request_stream(
         moq_decoded_fetch_t fd;
         memset(&fd, 0, sizeof(fd));
         fd.joining_sub_slot = -1;
+        fd.joining_pub_slot = -1;
         moq_d18_fetch_t f;
         rc = moq_d18_decode_fetch(env.payload, env.payload_len,
                                   fd.track_namespace_parts,

@@ -1264,7 +1264,10 @@ moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
     if (!r) return MOQ_ERR_WOULD_BLOCK;
 
     moq_fetch_cfg_t fcfg;
-    moq_fetch_cfg_init(&fcfg);
+    /* SIZED: this forwards the caller's auth tokens, which are an APPENDED
+     * field past the frozen v0 floor. The pointer-only init stamps only that
+     * floor, so the session would ignore them. */
+    moq_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
     fcfg.track_namespace = cfg->track_namespace;
     fcfg.track_name = cfg->track_name;
     fcfg.start_group = cfg->start_group;

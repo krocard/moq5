@@ -525,7 +525,9 @@ public:
             return errc::invalid;
 
         moq_fetch_cfg_t c;
-        moq_fetch_cfg_init(&c);
+        /* sized init: the binding always exposes the full struct, including
+         * the appended joining_pub discriminator */
+        moq_fetch_cfg_init_sized(&c, sizeof c);
         c.track_namespace        = cfg.ns.c_namespace();
         c.track_name             = cfg.track.raw();
         c.start_group            = cfg.start_group;
@@ -538,6 +540,7 @@ public:
         c.is_joining             = cfg.is_joining;
         c.joining_relative       = cfg.joining_relative;
         c.joining_sub            = cfg.joining_sub.raw();
+        c.joining_pub            = cfg.joining_pub.raw();
         c.joining_start          = cfg.joining_start;
         c.auth_tokens            = cfg.auth_tokens.data();
         c.auth_token_count       = cfg.auth_tokens.size();

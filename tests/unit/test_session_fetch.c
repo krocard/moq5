@@ -3664,7 +3664,10 @@ int main(void)
 
         moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
         moq_fetch_cfg_t fcfg;
-        moq_fetch_cfg_init(&fcfg);
+        /* SIZED: auth tokens are an APPENDED field past the frozen v0 floor,
+         * so the pointer-only init would leave them unreachable and this test
+         * would silently assert nothing. */
+        moq_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
         fcfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
         fcfg.track_name = MOQ_BYTES_LITERAL("t");
         fcfg.end_group = 1;

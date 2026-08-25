@@ -287,6 +287,7 @@ struct fetch_request {
     moq_namespace_t                       ns_raw;
     bytes_view                            track_name;
     subscription                          joining_sub;
+    publication                           joining_pub;
     uint64_t                              start_group;
     uint64_t                              start_object;
     uint64_t                              end_group;
@@ -789,7 +790,7 @@ public:
             return event::fetch_request{
                 fetch_handle(d.fetch), d.track_namespace,
                 bytes_view(d.track_name), subscription(d.joining_sub),
-                d.start_group, d.start_object, d.end_group, d.end_object,
+                publication(d.joining_pub), d.start_group, d.start_object, d.end_group, d.end_object,
                 d.subscriber_priority, group_order_from_c(d.group_order),
                 {d.tokens, d.token_count}};
         }

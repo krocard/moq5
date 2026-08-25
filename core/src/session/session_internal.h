@@ -540,6 +540,33 @@ typedef struct moq_pub_entry {
      * keeps it, so an empty re-feed resumes and completes exactly once.
      * Cleared on every free/reuse. */
     bool               handoff_fin_pending;
+    /* -- Joining Location (draft-18 5.1, draft-16 5.1) ----------------
+     * "A publisher MUST save the Largest Location communicated in
+     * SUBSCRIBE_OK, PUBLISH or REQUEST_UPDATE_OK that changes the Forward
+     * State from 0 to 1. This value is called the Joining Location and can be
+     * used in a Joining FETCH ... while the subscription is in the Established
+     * state."
+     *
+     * LATCHED, never a live read of track history: the value is frozen at the
+     * transition that made this publication joinable, so objects published
+     * afterwards cannot move the range a joined FETCH resolves to.
+     *
+     * publish_largest_* holds what the PUBLISH itself carried (advertised by
+     * the local publisher, or received from the peer) until the establishing
+     * PUBLISH_OK decides whether it becomes the Joining Location.
+     * joining_* is the latched result; has_joining_loc gates every read.
+     * Absence of a required Largest leaves no Joining Location at all -- there
+     * is no fallback to stale or current state. */
+    bool               publish_has_largest;
+    uint64_t           publish_largest_group;
+    uint64_t           publish_largest_object;
+    bool               has_joining_loc;
+    uint64_t           joining_group;
+    uint64_t           joining_object;
+    /* draft-16 9.16.2 gates a joining fetch on the associated subscription
+     * having Filter Type Largest Object. A publication negotiates its filter
+     * on PUBLISH_OK (draft-16 9.2.2.5) into the existing filter_type field
+     * above; draft-18 replaced this gate with Forward State 1 and ignores it. */
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -2453,6 +2480,10 @@ typedef struct moq_decoded_fetch {
     uint64_t         joining_request_id;
     uint64_t         joining_start;
     int              joining_sub_slot;
+    /* Publication-origin join (draft-18 5.1): the joined owner is a
+     * PUBLISH-initiated subscription in the publication pool. Exactly one of
+     * joining_sub_slot / joining_pub_slot is >= 0 for a joining fetch. */
+    int              joining_pub_slot;
     uint8_t          subscriber_priority;
     uint8_t          group_order;
     moq_resolved_token_t tokens[MOQ_DECODED_MAX_TOKENS];
@@ -3207,6 +3238,33 @@ void request_registry_remove_by_streamref(
 /* True if the bound profile correlates requests by per-request bidi stream
  * identity (draft-16: false). */
 bool moq_session_uses_request_streams(const moq_session_t *s);
+
+/*
+ * Whether a PUBLISH-initiated subscription may be joined by a Joining FETCH.
+ *
+ * draft-18 10.12.2: "A Joining Fetch is only permitted when the associated
+ * subscription has Forward State 1; otherwise the publisher MUST respond with
+ * a REQUEST_ERROR with error code INVALID_RANGE." A publication's Forward
+ * State is its acknowledged send_allowed.
+ *
+ * draft-16 9.16.2 instead requires the associated subscription to have Filter
+ * Type Largest Object; a publication negotiates its filter on PUBLISH_OK
+ * (9.2.2.5), so the established filter_type is what that gate reads. draft-18
+ * has no filter requirement and must not inherit one.
+ */
+bool pub_joining_eligible(const moq_session_t *s, const moq_pub_entry_t *pe);
+
+/*
+ * Latch the Joining Location from the Largest this publication's PUBLISH
+ * carried, if the state is now eligible (5.1). Idempotent. Does nothing when
+ * no Largest was advertised -- absence leaves no Joining Location rather than
+ * reusing stale or current state.
+ */
+void pub_latch_joining_location(const moq_session_t *s, moq_pub_entry_t *pe);
+/* Latch an explicit location (an update-acknowledged snapshot). Leaves the
+ * PUBLISH establishment record untouched. */
+void pub_latch_joining_location_at(const moq_session_t *s, moq_pub_entry_t *pe,
+                                   uint64_t group, uint64_t object);
 
 /* moq_session_classify_peer_uni is declared in session_transport.h (the
  * bridge-facing contract), since the transport bridge calls it. */
