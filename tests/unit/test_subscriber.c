@@ -110,6 +110,12 @@ static void test_subscribe_accepted(void) {
 
     MOQ_TEST_CHECK(cbs.subscribed == 1);
     MOQ_TEST_CHECK(cbs.last_track == track);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK(st.struct_size == sizeof(st));
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, 8) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_U64(st.subscribe_ok, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.subscribe_errors, 0);
 
     moq_sub_destroy(sub);
     moq_pub_destroy(pub);
@@ -162,6 +168,10 @@ static void test_subscribe_rejected(void) {
     moq_sub_tick(sub, moq_simpair_now_us(sp));
 
     MOQ_TEST_CHECK(cbs.error == 1);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.subscribe_ok, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.subscribe_errors, 1);
 
     moq_sub_destroy(sub);
     moq_pub_destroy(pub);
@@ -204,6 +214,13 @@ static void test_object_received(void) {
     moq_simpair_run_until_quiescent(sp, 16, NULL);
     moq_sub_tick(sub, moq_simpair_now_us(sp));
 
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_received, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_polled, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 5);
+
     moq_sub_object_t obj;
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_OK);
     MOQ_TEST_CHECK(obj.track == track);
@@ -214,6 +231,11 @@ static void test_object_received(void) {
     MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(obj.payload), "hello", 5) == 0);
     moq_sub_object_cleanup(&obj);
 
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_received, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_polled, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 0);
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_DONE);
 
     moq_sub_destroy(sub);
@@ -654,6 +676,12 @@ static void test_pending_retry_with_properties(void) {
 
     moq_result_t rc = moq_sub_tick(sub, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_received, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 11);
+    MOQ_TEST_CHECK_EQ_U64(st.tick_would_blocks, 1);
 
     moq_sub_object_t obj;
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_OK);
@@ -722,6 +750,12 @@ static void test_object_byte_budget_payload_only(void) {
 
     moq_result_t rc = moq_sub_tick(sub, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_received, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 16);
+    MOQ_TEST_CHECK_EQ_U64(st.tick_would_blocks, 1);
 
     moq_sub_object_t obj;
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_OK);
@@ -730,6 +764,10 @@ static void test_object_byte_budget_payload_only(void) {
     moq_sub_object_cleanup(&obj);
 
     /* Polling the first frees its bytes; retry flushes the pending object. */
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_polled, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 8);
     rc = moq_sub_tick(sub, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
 
@@ -738,6 +776,11 @@ static void test_object_byte_budget_payload_only(void) {
     MOQ_TEST_CHECK(moq_rcbuf_len(obj.payload) == 8);
     moq_sub_object_cleanup(&obj);
 
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_polled, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.tick_would_blocks, 1);
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_DONE);
 
     moq_sub_destroy(sub);
@@ -1638,6 +1681,12 @@ static void test_fetch_gap(void) {
     MOQ_TEST_CHECK(moq_sub_poll_fetch(sub, &item) == MOQ_OK);
     MOQ_TEST_CHECK(item.kind == MOQ_SUB_FETCH_COMPLETE);
     moq_sub_fetch_item_cleanup(&item);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.fetch_ok, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.fetch_gaps, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.fetch_complete, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.fetch_items_polled, 3);
 
     moq_sub_destroy(sub);
     { moq_event_t d;
@@ -2348,6 +2397,12 @@ static void test_streaming_chunk_received(void) {
     moq_rcbuf_decref(pay);
     moq_simpair_run_until_quiescent(sp, 16, NULL);
     MOQ_TEST_CHECK(moq_sub_tick(sub, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.chunks_received, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.chunks_polled, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.chunks_queued, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 5);
 
     moq_sub_chunk_t ck;
     MOQ_TEST_CHECK(moq_sub_poll_chunk(sub, &ck) == MOQ_OK);
@@ -2366,6 +2421,11 @@ static void test_streaming_chunk_received(void) {
     moq_sub_chunk_cleanup(&ck);
 
     MOQ_TEST_CHECK(moq_sub_poll_chunk(sub, &ck) == MOQ_DONE);
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.chunks_received, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.chunks_polled, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.chunks_queued, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.bytes_queued, 0);
 
     moq_sub_destroy(sub);
     moq_pub_destroy(pub);
@@ -3839,6 +3899,9 @@ static void test_s4_update_ok_callback(void) {
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     moq_sub_tick(sub, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 2);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.subscription_update_ok, 2);
 
     moq_sub_destroy(sub);
     moq_pub_destroy(pub);
@@ -3994,6 +4057,9 @@ static void test_s4_sub_cfg_canary(void) {
         moq_simpair_now_us(sp)) == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     MOQ_TEST_CHECK(moq_sub_tick(sub, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_sub_stats_t st;
+    MOQ_TEST_CHECK(moq_sub_get_stats(sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.subscription_update_ok, 1);
     /* A second update proves the first ack was consumed. */
     MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
         moq_simpair_now_us(sp)) == MOQ_OK);

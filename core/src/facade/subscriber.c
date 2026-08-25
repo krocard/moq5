@@ -113,6 +113,8 @@ struct moq_subscriber {
 
     bool                has_pending_chunk;
     moq_sub_chunk_t     pending_chunk;
+
+    moq_sub_stats_t     stats;
 };
 
 /* -- Helpers -------------------------------------------------------- */
@@ -181,6 +183,13 @@ static size_t rcbuf_pair_bytes(const moq_rcbuf_t *payload,
     if (properties)
         n = sub_sat_add(n, moq_rcbuf_len(properties));
     return n;
+}
+
+static uint64_t u64_sat_add_size(uint64_t a, size_t b)
+{
+    uint64_t ub = (uint64_t)b;
+    if (ub < b || UINT64_MAX - a < ub) return UINT64_MAX;
+    return a + ub;
 }
 
 static void sub_bytes_add(moq_subscriber_t *s, size_t n)
@@ -314,6 +323,33 @@ static void chunk_release_refs(moq_sub_chunk_t *c)
 {
     if (c->chunk) { moq_rcbuf_decref(c->chunk); c->chunk = NULL; }
     if (c->properties) { moq_rcbuf_decref(c->properties); c->properties = NULL; }
+}
+
+static uint64_t sub_retained_bytes(const moq_subscriber_t *s)
+{
+    uint64_t n = (uint64_t)s->queued_bytes;
+    if (n < s->queued_bytes) n = UINT64_MAX;
+    if (s->has_pending)
+        n = u64_sat_add_size(n, rcbuf_pair_bytes(s->pending.payload,
+                                                 s->pending.properties));
+    if (s->has_pending_fi &&
+        s->pending_fi.kind == MOQ_SUB_FETCH_OBJECT)
+        n = u64_sat_add_size(n, rcbuf_pair_bytes(
+            s->pending_fi.u.object.payload, s->pending_fi.u.object.properties));
+    for (size_t i = s->chunk_head; i < s->chunk_tail; i++) {
+        const moq_sub_chunk_t *c = &s->chunks[i % s->chunk_cap];
+        n = u64_sat_add_size(n, rcbuf_pair_bytes(c->chunk, c->properties));
+    }
+    if (s->has_pending_chunk)
+        n = u64_sat_add_size(n, rcbuf_pair_bytes(s->pending_chunk.chunk,
+                                                 s->pending_chunk.properties));
+    return n;
+}
+
+static moq_result_t sub_would_block(moq_subscriber_t *sub)
+{
+    sub->stats.tick_would_blocks++;
+    return MOQ_ERR_WOULD_BLOCK;
 }
 
 /* -- Public API ----------------------------------------------------- */
@@ -750,7 +786,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 
     if (sub->has_pending) {
         if (obj_queue_full(sub) || obj_bytes_over_budget(sub))
-            return MOQ_ERR_WOULD_BLOCK;
+            return sub_would_block(sub);
         moq_sub_object_t *o = obj_push(sub);
         *o = sub->pending;
         sub_bytes_add(sub, rcbuf_pair_bytes(o->payload, o->properties));
@@ -762,7 +798,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         bool fi_is_object = sub->pending_fi.kind == MOQ_SUB_FETCH_OBJECT;
         if (fi_queue_full(sub) ||
             (fi_is_object && obj_bytes_over_budget(sub)))
-            return MOQ_ERR_WOULD_BLOCK;
+            return sub_would_block(sub);
         moq_sub_fetch_item_t *f = fi_push(sub);
         *f = sub->pending_fi;
         if (fi_is_object)
@@ -773,7 +809,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
     }
 
     if (sub->has_pending_chunk) {
-        if (chunk_queue_full(sub)) return MOQ_ERR_WOULD_BLOCK;
+        if (chunk_queue_full(sub)) return sub_would_block(sub);
         moq_sub_chunk_t *c = chunk_push(sub);
         *c = sub->pending_chunk;
         memset(&sub->pending_chunk, 0, sizeof(sub->pending_chunk));
@@ -788,6 +824,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 ev.u.subscribe_ok.sub);
             if (t && t->state == SUB_TRACK_PENDING) {
                 t->state = SUB_TRACK_ACTIVE;
+                sub->stats.subscribe_ok++;
                 if (sub->callbacks.on_subscribed)
                     sub->callbacks.on_subscribed(sub->callbacks.ctx, t);
             }
@@ -800,6 +837,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             if (t && t->state == SUB_TRACK_PENDING) {
                 t->state = SUB_TRACK_ERROR;
                 t->error_code = ev.u.subscribe_error.error_code;
+                sub->stats.subscribe_errors++;
                 if (sub->callbacks.on_subscribe_error)
                     sub->callbacks.on_subscribe_error(
                         sub->callbacks.ctx, t,
@@ -813,13 +851,14 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_object_received_event_t *obj = &ev.u.object_received;
             moq_sub_track_t *t = find_track_by_handle(sub, obj->sub);
             if (t && t->state == SUB_TRACK_ACTIVE) {
+                sub->stats.objects_received++;
                 if (obj_queue_full(sub) || obj_bytes_over_budget(sub)) {
                     fill_sub_object(&sub->pending, t, obj);
                     sub->has_pending = true;
                     ev.u.object_received.payload = NULL;
                     ev.u.object_received.properties = NULL;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_object_t *o = obj_push(sub);
                 fill_sub_object(o, t, obj);
@@ -839,6 +878,9 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_object_chunk_event_t *ck = &ev.u.object_chunk;
             moq_sub_track_t *t = find_track_by_handle(sub, ck->sub);
             if (t && t->state == SUB_TRACK_ACTIVE) {
+                sub->stats.chunks_received++;
+                if (ck->end && ck->terminal == MOQ_OBJECT_TERMINAL_RESET)
+                    sub->stats.subgroup_resets++;
                 moq_sub_chunk_t sc;
                 memset(&sc, 0, sizeof(sc));
                 sc.track = t;
@@ -860,7 +902,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     ck->chunk = NULL;
                     ck->properties = NULL;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_chunk_t *dst = chunk_push(sub);
                 *dst = sc;
@@ -917,6 +959,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_ok.fetch);
             if (r && r->state == SUB_FETCH_PENDING) {
+                sub->stats.fetch_ok++;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_OK;
                     sub->pending_fi.request = r;
@@ -926,7 +969,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     sub->has_pending_fi = true;
                     r->state = SUB_FETCH_ACTIVE;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_fetch_item_t *f = fi_push(sub);
                 f->kind = MOQ_SUB_FETCH_OK;
@@ -943,6 +986,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_error.fetch);
             if (r) {
+                sub->stats.fetch_errors++;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_ERROR;
                     sub->pending_fi.request = r;
@@ -952,7 +996,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     sub->has_pending_fi = true;
                     r->state = SUB_FETCH_DONE;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_fetch_item_t *f = fi_push(sub);
                 f->kind = MOQ_SUB_FETCH_ERROR;
@@ -975,6 +1019,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
              * transition (we do NOT mark ACTIVE here). */
             if (r && (r->state == SUB_FETCH_PENDING ||
                       r->state == SUB_FETCH_ACTIVE)) {
+                sub->stats.fetch_objects++;
                 if (fi_queue_full(sub) || obj_bytes_over_budget(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_OBJECT;
                     sub->pending_fi.request = r;
@@ -987,7 +1032,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     ev.u.fetch_object.payload = NULL;
                     ev.u.fetch_object.properties = NULL;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_fetch_item_t *f = fi_push(sub);
                 f->kind = MOQ_SUB_FETCH_OBJECT;
@@ -1013,6 +1058,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
              * FETCH_OK. Queue it while PENDING; FETCH_OK owns the transition. */
             if (r && (r->state == SUB_FETCH_PENDING ||
                       r->state == SUB_FETCH_ACTIVE)) {
+                sub->stats.fetch_gaps++;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_GAP;
                     sub->pending_fi.request = r;
@@ -1021,7 +1067,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     sub->pending_fi.u.gap.object_id = ev.u.fetch_gap.object_id;
                     sub->has_pending_fi = true;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_fetch_item_t *f = fi_push(sub);
                 f->kind = MOQ_SUB_FETCH_GAP;
@@ -1037,13 +1083,14 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_complete.fetch);
             if (r && r->state == SUB_FETCH_ACTIVE) {
+                sub->stats.fetch_complete++;
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_COMPLETE;
                     sub->pending_fi.request = r;
                     sub->has_pending_fi = true;
                     r->state = SUB_FETCH_DONE;
                     moq_event_cleanup(&ev);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    return sub_would_block(sub);
                 }
                 moq_sub_fetch_item_t *f = fi_push(sub);
                 f->kind = MOQ_SUB_FETCH_COMPLETE;
@@ -1063,25 +1110,31 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
              * no callback is installed. */
             moq_sub_track_t *t = find_track_by_handle(sub,
                 ev.u.subscription_update_ok.sub);
-            if (t && sub->on_update_ok) {
-                moq_sub_update_result_t res;
-                memset(&res, 0, sizeof(res));
-                res.struct_size = (uint32_t)sizeof(res);
-                res.has_largest = ev.u.subscription_update_ok.has_largest;
-                res.largest_group =
-                    ev.u.subscription_update_ok.largest_group;
-                res.largest_object =
-                    ev.u.subscription_update_ok.largest_object;
-                res.has_expires = ev.u.subscription_update_ok.has_expires;
-                res.expires_ms = ev.u.subscription_update_ok.expires_ms;
-                sub->on_update_ok(sub->callbacks.ctx, t, &res);
+            if (t) {
+                sub->stats.subscription_update_ok++;
+                if (sub->on_update_ok) {
+                    moq_sub_update_result_t res;
+                    memset(&res, 0, sizeof(res));
+                    res.struct_size = (uint32_t)sizeof(res);
+                    res.has_largest = ev.u.subscription_update_ok.has_largest;
+                    res.largest_group =
+                        ev.u.subscription_update_ok.largest_group;
+                    res.largest_object =
+                        ev.u.subscription_update_ok.largest_object;
+                    res.has_expires = ev.u.subscription_update_ok.has_expires;
+                    res.expires_ms = ev.u.subscription_update_ok.expires_ms;
+                    sub->on_update_ok(sub->callbacks.ctx, t, &res);
+                }
             }
             break;
         }
         case MOQ_EVENT_UNSUBSCRIBED: {
             moq_sub_track_t *t = find_track_by_handle(sub,
                 ev.u.unsubscribed.sub);
-            if (t) t->state = SUB_TRACK_DONE;
+            if (t) {
+                t->state = SUB_TRACK_DONE;
+                sub->stats.unsubscribed++;
+            }
             break;
         }
 
@@ -1090,10 +1143,27 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 ev.u.subscribe_done.sub);
             if (t) {
                 t->state = SUB_TRACK_DONE;
+                sub->stats.subscribe_done++;
                 if (sub->on_subscribe_done)
                     sub->on_subscribe_done(sub->callbacks.ctx, t,
                                            ev.u.subscribe_done.status_code);
             }
+            break;
+        }
+
+        case MOQ_EVENT_SUBGROUP_FINISHED: {
+            moq_sub_track_t *t = find_track_by_handle(sub,
+                ev.u.subgroup_finished.sub);
+            if (t && t->state == SUB_TRACK_ACTIVE)
+                sub->stats.subgroup_finished++;
+            break;
+        }
+
+        case MOQ_EVENT_SUBGROUP_RESET: {
+            moq_sub_track_t *t = find_track_by_handle(sub,
+                ev.u.subgroup_reset.sub);
+            if (t && t->state == SUB_TRACK_ACTIVE)
+                sub->stats.subgroup_resets++;
             break;
         }
 
@@ -1144,6 +1214,7 @@ moq_result_t moq_sub_poll_object(moq_subscriber_t *sub,
     *out = sub->objects[sub->obj_head % sub->obj_cap];
     sub->obj_head++;
     sub_bytes_sub(sub, rcbuf_pair_bytes(out->payload, out->properties));
+    sub->stats.objects_polled++;
     return MOQ_OK;
 }
 
@@ -1206,6 +1277,35 @@ moq_result_t moq_sub_poll_status(moq_subscriber_t *sub,
     *out = sub->status_results[sub->sr_head % sub->sr_cap];
     if (out->request) out->request->state = SUB_STATUS_FREE;
     sub->sr_head++;
+    return MOQ_OK;
+}
+
+#define MOQ_SUB_STATS_V0_SIZE \
+    (offsetof(moq_sub_stats_t, closed) + sizeof(bool))
+
+moq_result_t moq_sub_get_stats(const moq_subscriber_t *sub,
+                               moq_sub_stats_t *out,
+                               size_t out_size)
+{
+    if (!sub || !out || out_size < MOQ_SUB_STATS_V0_SIZE)
+        return MOQ_ERR_INVAL;
+
+    moq_sub_stats_t snap = sub->stats;
+    snap.objects_queued =
+        (uint64_t)(sub->obj_tail - sub->obj_head + (sub->has_pending ? 1u : 0u));
+    snap.chunks_queued =
+        (uint64_t)(sub->chunk_tail - sub->chunk_head +
+                   (sub->has_pending_chunk ? 1u : 0u));
+    snap.fetch_items_queued =
+        (uint64_t)(sub->fi_tail - sub->fi_head +
+                   (sub->has_pending_fi ? 1u : 0u));
+    snap.bytes_queued = sub_retained_bytes(sub);
+    snap.draining = sub->draining;
+    snap.closed = sub->closed;
+
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    snap.struct_size = (uint32_t)n;
+    memcpy(out, &snap, n);
     return MOQ_OK;
 }
 
@@ -1375,6 +1475,7 @@ moq_result_t moq_sub_poll_fetch(moq_subscriber_t *sub,
     if (out->kind == MOQ_SUB_FETCH_OBJECT)
         sub_bytes_sub(sub, rcbuf_pair_bytes(out->u.object.payload,
                                             out->u.object.properties));
+    sub->stats.fetch_items_polled++;
 
     if (out->request &&
         (out->kind == MOQ_SUB_FETCH_ERROR ||
@@ -1402,6 +1503,7 @@ moq_result_t moq_sub_poll_chunk(moq_subscriber_t *sub,
     memset(&sub->chunks[sub->chunk_head % sub->chunk_cap], 0,
         sizeof(moq_sub_chunk_t));
     sub->chunk_head++;
+    sub->stats.chunks_polled++;
     return MOQ_OK;
 }
 

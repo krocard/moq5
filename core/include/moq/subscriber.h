@@ -252,6 +252,49 @@ MOQ_API moq_result_t moq_sub_poll_object(
 
 MOQ_API void moq_sub_object_cleanup(moq_sub_object_t *obj);
 
+/* -- Stats ----------------------------------------------------------- */
+
+typedef struct moq_sub_stats {
+    uint32_t struct_size;
+    uint64_t subscribe_ok;            /* SUBSCRIBE_OK accepted by the facade */
+    uint64_t subscribe_errors;        /* SUBSCRIBE_ERROR for this subscriber */
+    uint64_t subscribe_done;          /* SUBSCRIBE_DONE for this subscriber */
+    uint64_t subscription_update_ok;  /* SUBSCRIBE_UPDATE_OK acknowledgments */
+    uint64_t unsubscribed;            /* UNSUBSCRIBED events for live tracks */
+    uint64_t objects_received;        /* whole objects retained by facade */
+    uint64_t objects_polled;          /* whole objects returned to caller */
+    uint64_t chunks_received;         /* streaming chunks retained by facade */
+    uint64_t chunks_polled;           /* streaming chunks returned to caller */
+    uint64_t fetch_ok;
+    uint64_t fetch_errors;
+    uint64_t fetch_objects;
+    uint64_t fetch_gaps;
+    uint64_t fetch_complete;
+    uint64_t fetch_items_polled;      /* every item returned by poll_fetch */
+    uint64_t subgroup_finished;       /* graceful subgroup terminals */
+    uint64_t subgroup_resets;         /* reset terminals, both event surfaces */
+    uint64_t tick_would_blocks;       /* facade queue/budget backpressure */
+    uint64_t objects_queued;          /* retained whole objects incl pending */
+    uint64_t chunks_queued;           /* retained streaming chunks incl pending */
+    uint64_t fetch_items_queued;      /* retained fetch items incl pending */
+    uint64_t bytes_queued;            /* retained payload/properties bytes */
+    bool     draining;
+    bool     closed;
+} moq_sub_stats_t;
+
+/* Snapshot subscriber-facade counters. Pass `out_size = sizeof(*out)`.
+ * Retained queue gauges include the one-deep pending item that caused a prior
+ * MOQ_ERR_WOULD_BLOCK, even though that item is not pollable until the app
+ * drains and calls moq_sub_tick() again. bytes_queued counts retained
+ * payload/properties bytes across whole-object, fetch-object, and streaming
+ * chunk queues. Same ABI contract as other size-aware libmoq snapshots:
+ * requires the v0 stats size, writes min(out_size, current), and stamps
+ * out->struct_size with the bytes written. */
+MOQ_API moq_result_t moq_sub_get_stats(
+    const moq_subscriber_t *sub,
+    moq_sub_stats_t *out,
+    size_t out_size);
+
 /* -- Chunk poll (streaming mode) ---------------------------------- */
 
 typedef struct moq_sub_chunk {
