@@ -39,4 +39,23 @@ if(MOQ_BUILD_TESTS)
         tests/test_codec_signaling.c)
     target_link_libraries(test_codec_signaling PRIVATE moq::codec-signaling)
     add_test(NAME codec_signaling COMMAND test_codec_signaling)
+
+    # Conformance vectors constructed from the primary specifications rather
+    # than from producer samples, so a parser can be wrong in a band the
+    # samples never visit and still be caught. Kept as its own executable so
+    # the donor suite stays recognizable.
+    add_executable(test_codec_signaling_spec
+        tests/test_codec_signaling_spec.c)
+    target_link_libraries(test_codec_signaling_spec PRIVATE moq::codec-signaling)
+    add_test(NAME codec_signaling_spec COMMAND test_codec_signaling_spec)
+
+    # The tests are owned code and carry the same warning policy as the
+    # library they exercise.
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        foreach(t test_codec_signaling test_codec_signaling_spec)
+            target_compile_options(${t} PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endforeach()
+    endif()
 endif()

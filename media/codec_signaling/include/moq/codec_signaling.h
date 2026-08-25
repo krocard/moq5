@@ -9,11 +9,23 @@
  * "mp4a.40.2") from that same record.
  *
  * Pure, allocation-free, thread-safe. The caller always states the byte
- * format explicitly (no sniffing). Output goes to a caller-provided
- * buffer following a common protocol: call with buf == NULL (or a
- * too-small cap) to learn the required length in *out_len (returns
- * MOQ_ERR_BUFFER); no partial output is written on failure. The codec
- * string is raw ASCII, NOT NUL-terminated.
+ * format explicitly (no sniffing). The codec string is raw ASCII, NOT
+ * NUL-terminated.
+ *
+ * Output protocol, common to both functions and guaranteed on every path:
+ *
+ *   - MOQ_OK: *out_len is the number of bytes written to buf.
+ *   - MOQ_ERR_BUFFER: buf was NULL or cap was too small. *out_len is the
+ *     exact required output length, so the call doubles as a size query
+ *     (pass buf == NULL, cap == 0). Nothing is written to buf.
+ *   - any other failure (MOQ_ERR_INVAL, MOQ_ERR_PROTO, MOQ_ERR_UNSUPPORTED):
+ *     *out_len is set to 0. Nothing is written to buf.
+ *
+ * No partial output is ever written: on any failure the destination bytes
+ * are left exactly as the caller supplied them, and nothing outside
+ * [buf, buf + cap) is touched. *out_len is written whenever out_len is
+ * non-NULL, including on failure -- a caller may not rely on it retaining
+ * a prior value.
  */
 
 #include <moq/types.h>
@@ -75,13 +87,30 @@ MOQ_API void moq_codec_init_data_cfg_init(moq_codec_init_data_cfg_t *cfg);
  *     is then copied verbatim as the configOBUs. This is conformant but not
  *     byte-identical to muxers that re-serialize (normalize) the OBU.
  *
+ * Sources are validated for structural self-consistency: every count and
+ * length a record declares about its own bytes must be satisfiable from
+ * those bytes. Decoder semantics are deliberately NOT validated.
+ *
+ * CARRIAGE: the NAL-based builders currently assume OUT-OF-BAND parameter
+ * set carriage -- the 'avc1' / 'hvc1' sample entries -- and therefore refuse
+ * a source missing a required parameter set (AVC: SPS and PPS; HEVC: VPS,
+ * SPS and PPS) with MOQ_ERR_PROTO. In-band carriage ('avc3' / 'hev1'), where
+ * a record legitimately carries no parameter sets, is not expressible
+ * through this configuration yet; naming the target sample entry here is a
+ * planned API addition.
+ *
  * Returns MOQ_OK on success; MOQ_ERR_INVAL for bad arguments;
  * MOQ_ERR_BUFFER if buf/cap is too small (*out_len gets the required
  * length); MOQ_ERR_PROTO if the source is malformed for its format;
  * MOQ_ERR_UNSUPPORTED for a stream this build does not parse (an HEVC SPS
  * with sub-layer profile_tier_level, i.e. sps_max_sub_layers_minus1 > 0, or
- * an AV1 sequence header carrying timing_info / a decoder model) or an input
- * exceeding a fixed internal limit.
+ * an AV1 sequence header carrying timing_info / a decoder model), or for a
+ * valid source the destination record cannot represent (a parameter set
+ * longer than 65535 bytes, which the record's 16-bit length field cannot
+ * hold), or an input exceeding a fixed internal limit.
+ *
+ * On any failure other than MOQ_ERR_BUFFER, *out_len is 0 and buf is
+ * untouched.
  */
 MOQ_API moq_result_t moq_codec_init_data_build(const moq_codec_init_data_cfg_t *cfg,
                                                uint8_t *buf, size_t cap,
@@ -125,11 +154,24 @@ MOQ_API void moq_codec_string_cfg_init(moq_codec_string_cfg_t *cfg);
 /*
  * Format the codec string described by cfg into buf.
  *
+ * sample_entry must be exactly one of the four-character codes registered
+ * for the given config_format, matched by EXACT BYTE EQUALITY: RFC 6381
+ * section 3.3 defines these entries with explicit numeric octets and states
+ * that their values are case sensitive, so "Avc1" is not "avc1". Accepted
+ * pairs are avc1/avc3 with AVCC, hvc1/hev1 with HVCC, av01 with AV1C, mp4a
+ * with AAC_ASC, and opus with OPUS. Hexadecimal in the produced string is
+ * lowercase; RFC 6381's grammar is RFC 5234 ABNF, whose quoted strings are
+ * case-insensitive, so lowercase is conformant and is the canonical form
+ * emitted here.
+ *
  * Returns MOQ_OK on success; MOQ_ERR_INVAL for bad arguments or an
  * incoherent sample-entry / config-format pair; MOQ_ERR_BUFFER if
  * buf/cap is too small (*out_len gets the required length);
  * MOQ_ERR_PROTO if decoder_config is malformed for its format;
  * MOQ_ERR_UNSUPPORTED for an unimplemented config_format.
+ *
+ * On any failure other than MOQ_ERR_BUFFER, *out_len is 0 and buf is
+ * untouched.
  */
 MOQ_API moq_result_t moq_codec_string_format(const moq_codec_string_cfg_t *cfg,
                                              uint8_t *buf, size_t cap,

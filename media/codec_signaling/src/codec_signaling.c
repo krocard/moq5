@@ -7,6 +7,10 @@
 
 static const char hex_lower[] = "0123456789abcdef";
 
+/* Defined below, once the bit reader it uses is in scope. */
+static moq_result_t asc_leading_fields(const uint8_t *d, size_t len,
+                                       uint32_t *out_aot);
+
 /* Append one lowercase hex byte (two digits) at pos; returns new pos. */
 static size_t put_hex8(char *out, size_t pos, uint8_t v)
 {
@@ -28,6 +32,34 @@ static size_t put_u32(char *out, size_t pos, uint32_t v)
         out[pos++] = tmp[--n];
     }
     return pos;
+}
+
+/*
+ * Sample entry codes are matched by EXACT BYTE EQUALITY. RFC 6381 section 3.3
+ * states that these four-character values are case sensitive and defines them
+ * with explicit numeric octets, so "Avc1" is not the registered entry "avc1".
+ */
+static bool entry_is(moq_bytes_t e, const char *want)
+{
+    return e.len == 4 && memcmp(e.data, want, 4) == 0;
+}
+
+static bool entry_matches_format(moq_codec_config_format_t f, moq_bytes_t e)
+{
+    switch (f) {
+    case MOQ_CODEC_CONFIG_AVCC:
+        return entry_is(e, "avc1") || entry_is(e, "avc3");
+    case MOQ_CODEC_CONFIG_HVCC:
+        return entry_is(e, "hvc1") || entry_is(e, "hev1");
+    case MOQ_CODEC_CONFIG_AV1C:
+        return entry_is(e, "av01");
+    case MOQ_CODEC_CONFIG_AAC_ASC:
+        return entry_is(e, "mp4a");
+    case MOQ_CODEC_CONFIG_OPUS:
+        return entry_is(e, "opus");
+    default:
+        return false;
+    }
 }
 
 /* Append the 4-byte sample entry followed by '.'; returns new pos. */
@@ -56,27 +88,32 @@ static moq_result_t format_avcc(const moq_codec_string_cfg_t *cfg,
     return MOQ_OK;
 }
 
-/* Format an mp4a codec string from an AudioSpecificConfig. */
+/*
+ * Format an mp4a codec string from an AudioSpecificConfig.
+ *
+ * RFC 6381 section 3.3: iso-mpega := mp4a "." oti [ "." aud-oti ], and the
+ * third element is defined only for OTI 40 ("One of the OTI values for 'mp4a'
+ * is 40 ... For this value, the third element identifies the audio
+ * ObjectTypeIndication"). Any other OTI therefore has no third element.
+ */
+#define MP4_OTI_MPEG4_AUDIO 0x40
+
 static moq_result_t format_aac_asc(const moq_codec_string_cfg_t *cfg,
                                    char *scratch, size_t *produced)
 {
-    const uint8_t *p = cfg->decoder_config.data;
-    if (cfg->decoder_config.len < 2) {
-        return MOQ_ERR_PROTO;
-    }
-
-    uint32_t object_type = (uint32_t)((p[0] >> 3) & 0x1f);
-    if (object_type == 31) {
-        if (cfg->decoder_config.len < 3) {
-            return MOQ_ERR_PROTO;
-        }
-        object_type = 32u + (uint32_t)(((p[1] & 0x07) << 3) | ((p[2] >> 5) & 0x07));
+    uint32_t object_type;
+    moq_result_t rc = asc_leading_fields(cfg->decoder_config.data,
+                                         cfg->decoder_config.len, &object_type);
+    if (rc != MOQ_OK) {
+        return rc;
     }
 
     size_t pos = put_sample_entry(scratch, 0, cfg->sample_entry);
     pos = put_hex8(scratch, pos, cfg->mp4_object_type_indication);
-    scratch[pos++] = '.';
-    pos = put_u32(scratch, pos, object_type);
+    if (cfg->mp4_object_type_indication == MP4_OTI_MPEG4_AUDIO) {
+        scratch[pos++] = '.';
+        pos = put_u32(scratch, pos, object_type);
+    }
     *produced = pos;
     return MOQ_OK;
 }
@@ -228,9 +265,13 @@ typedef struct {
 } nal_ref_t;
 
 /*
- * Iterate the Annex B NAL units of d. On success yields the next NAL with
- * its start code stripped, advances *pos, and returns true; returns false
- * when no further NAL is found.
+ * Iterate the Annex B NAL units of d. On success yields the next NAL with its
+ * start code stripped, advances *pos, and returns true; returns false only
+ * when no further start code is present.
+ *
+ * A start code followed by no payload yields *nal_len == 0 rather than ending
+ * the walk: an empty NAL is malformed input the caller must reject, and
+ * treating it as end-of-stream would silently discard every NAL after it.
  */
 static bool next_nal(const uint8_t *d, size_t len, size_t *pos,
                      const uint8_t **nal, size_t *nal_len)
@@ -254,7 +295,7 @@ static bool next_nal(const uint8_t *d, size_t len, size_t *pos,
     *nal = d + start;
     *nal_len = end - start;
     *pos = (j + 3 <= len) ? j : len;
-    return *nal_len > 0;
+    return true;
 }
 
 /* Remove emulation-prevention bytes (00 00 03 -> 00 00) into dst, up to
@@ -314,6 +355,39 @@ static uint32_t br_ue(bitr_t *b)
     }
     uint32_t suffix = br_u(b, lz);
     return ((uint32_t)1 << lz) - 1 + suffix;
+}
+
+/*
+ * Validate AudioSpecificConfig's mandatory common leading fields and return
+ * the AudioObjectType (ISO/IEC 14496-3). GetAudioObjectType() is a 5-bit
+ * field; the value 31 escapes to 32 plus a 6-bit extension that IMMEDIATELY
+ * follows it. samplingFrequencyIndex is 4 bits, and the value 15 introduces
+ * an explicit 24-bit samplingFrequency. channelConfiguration is 4 bits.
+ *
+ * The object-type-specific payload that follows is deliberately NOT validated:
+ * this is what the codec string consumes, and its syntax differs per object
+ * type.
+ */
+static moq_result_t asc_leading_fields(const uint8_t *d, size_t len,
+                                       uint32_t *out_aot)
+{
+    bitr_t br = { d, len, 0, false };
+
+    uint32_t aot = br_u(&br, 5);
+    if (aot == 31) {
+        aot = 32u + br_u(&br, 6);
+    }
+    uint32_t freq_idx = br_u(&br, 4);
+    if (freq_idx == 15) {
+        br_u(&br, 24);                 /* explicit samplingFrequency */
+    }
+    br_u(&br, 4);                      /* channelConfiguration */
+
+    if (br.overrun) {
+        return MOQ_ERR_PROTO;
+    }
+    *out_aot = aot;
+    return MOQ_OK;
 }
 
 static bool avc_profile_has_ext(uint8_t profile_idc)
@@ -382,6 +456,9 @@ static moq_result_t build_avcc(const moq_codec_init_data_cfg_t *cfg,
     const uint8_t *nal;
     size_t nal_len;
     while (next_nal(cfg->source.data, cfg->source.len, &pos, &nal, &nal_len)) {
+        if (nal_len == 0) {
+            return MOQ_ERR_PROTO;      /* empty NAL between start codes */
+        }
         uint8_t type = (uint8_t)(nal[0] & 0x1f);
         if (type == AVC_NAL_SPS) {
             if (nsps >= AVC_MAX_PS) return MOQ_ERR_UNSUPPORTED;
@@ -396,11 +473,24 @@ static moq_result_t build_avcc(const moq_codec_init_data_cfg_t *cfg,
         }
     }
 
-    if (nsps == 0) {
+    /*
+     * Out-of-band carriage ('avc1'): a record with no SPS or no PPS configures
+     * no decoder. In-band carriage ('avc3') is not expressible yet -- see the
+     * CARRIAGE note in the public header.
+     */
+    if (nsps == 0 || npps == 0) {
         return MOQ_ERR_PROTO;
     }
     if (sps[0].len < 4) {
         return MOQ_ERR_PROTO;
+    }
+    /* ISO/IEC 14496-15 gives the parameter set length fields 16 bits. A valid
+     * but larger parameter set is a record limit, not malformed input. */
+    for (size_t i = 0; i < nsps; i++) {
+        if (sps[i].len > 0xffffu) return MOQ_ERR_UNSUPPORTED;
+    }
+    for (size_t i = 0; i < npps; i++) {
+        if (pps[i].len > 0xffffu) return MOQ_ERR_UNSUPPORTED;
     }
     uint8_t profile_idc = sps[0].p[1];
     uint8_t profile_compat = sps[0].p[2];
@@ -544,6 +634,9 @@ static moq_result_t build_hvcc(const moq_codec_init_data_cfg_t *cfg,
     const uint8_t *nal;
     size_t nal_len;
     while (next_nal(cfg->source.data, cfg->source.len, &pos, &nal, &nal_len)) {
+        if (nal_len == 0) {
+            return MOQ_ERR_PROTO;      /* empty NAL between start codes */
+        }
         uint8_t type = (uint8_t)((nal[0] >> 1) & 0x3f);
         if (type == HEVC_NAL_VPS) {
             if (nvps >= AVC_MAX_PS) return MOQ_ERR_UNSUPPORTED;
@@ -557,8 +650,18 @@ static moq_result_t build_hvcc(const moq_codec_init_data_cfg_t *cfg,
         }
     }
 
-    if (nsps == 0) {
+    /* Out-of-band carriage ('hvc1'); see the CARRIAGE note in the header. */
+    if (nvps == 0 || nsps == 0 || npps == 0) {
         return MOQ_ERR_PROTO;
+    }
+    for (size_t i = 0; i < nvps; i++) {
+        if (vps[i].len > 0xffffu) return MOQ_ERR_UNSUPPORTED;
+    }
+    for (size_t i = 0; i < nsps; i++) {
+        if (sps[i].len > 0xffffu) return MOQ_ERR_UNSUPPORTED;
+    }
+    for (size_t i = 0; i < npps; i++) {
+        if (pps[i].len > 0xffffu) return MOQ_ERR_UNSUPPORTED;
     }
 
     uint8_t ptl[12], num_tl, tid_nested, chroma, bd_luma, bd_chroma;
@@ -673,12 +776,20 @@ static moq_result_t parse_av1_seqhdr(const uint8_t *p, size_t len,
         mc = br_u(&br, 8);
     }
 
+    /*
+     * AV1 1.0.0 section 5.5.2 color_config(): the monochrome branch reads
+     * color_range, and the general else branch reads color_range BEFORE
+     * deciding subsampling. Only the CP_BT_709/TC_SRGB/MC_IDENTITY branch
+     * reads no flag (color_range is 1 by definition there).
+     */
     uint32_t ssx, ssy, csp = 0;
     if (mono) {
+        br_u(&br, 1);                      /* color_range                */
         ssx = 1; ssy = 1;
     } else if (cp == 1 && tc == 13 && mc == 0) {
         ssx = 0; ssy = 0;
     } else {
+        br_u(&br, 1);                      /* color_range                */
         if (seq_profile == 0) {
             ssx = 1; ssy = 1;
         } else if (seq_profile == 1) {
@@ -723,15 +834,30 @@ static moq_result_t build_av1c(const moq_codec_init_data_cfg_t *cfg,
         size_t hdr = (size_t)1 + (ext ? 1u : 0u);
         if (i + hdr > len) return MOQ_ERR_PROTO;
 
+        /*
+         * The AV1 ISOBMFF binding requires every OBU carried in configOBUs to
+         * set obu_has_size_field, so a source OBU without one cannot be copied
+         * into a conformant record.
+         */
+        if (!has_size) {
+            return MOQ_ERR_PROTO;
+        }
+
         size_t j = i + hdr;
         size_t payload_size;
         if (has_size) {
             uint64_t val = 0;
+            bool terminated = false;
             for (int k = 0; k < 8; k++) {
                 if (j >= len) return MOQ_ERR_PROTO;
                 uint8_t b = d[j++];
                 val |= (uint64_t)(b & 0x7f) << (7 * k);
-                if (!(b & 0x80)) break;
+                if (!(b & 0x80)) { terminated = true; break; }
+            }
+            /* Every byte carried a continuation bit: the size field never
+             * ended, so its assembled value must not be used. */
+            if (!terminated) {
+                return MOQ_ERR_PROTO;
             }
             payload_size = (size_t)val;
         } else {
@@ -769,6 +895,112 @@ static moq_result_t build_av1c(const moq_codec_init_data_cfg_t *cfg,
     buf[2] = cfg2;
     buf[3] = 0x00;   /* no initial_presentation_delay */
     memcpy(buf + 4, sh, sh_total);
+    return MOQ_OK;
+}
+
+/*
+ * Structural validation for the records copied through unchanged. The boundary
+ * is self-consistency: every count and length a record declares about its own
+ * bytes must be satisfiable from those bytes. Decoder semantics are not
+ * checked. Each walk uses subtraction against the remaining length so no
+ * offset arithmetic can overflow.
+ */
+
+/* AVCDecoderConfigurationRecord (ISO/IEC 14496-15). */
+static moq_result_t validate_avcc(const uint8_t *d, size_t len)
+{
+    if (len < 7 || d[0] != 1) {
+        return MOQ_ERR_PROTO;
+    }
+    size_t o = 5;
+    size_t nsps = d[o++] & 0x1fu;
+    for (size_t i = 0; i < nsps; i++) {
+        if (len - o < 2) return MOQ_ERR_PROTO;
+        size_t l = ((size_t)d[o] << 8) | d[o + 1];
+        o += 2;
+        if (l > len - o) return MOQ_ERR_PROTO;
+        o += l;
+    }
+    if (o >= len) return MOQ_ERR_PROTO;
+    size_t npps = d[o++];
+    for (size_t i = 0; i < npps; i++) {
+        if (len - o < 2) return MOQ_ERR_PROTO;
+        size_t l = ((size_t)d[o] << 8) | d[o + 1];
+        o += 2;
+        if (l > len - o) return MOQ_ERR_PROTO;
+        o += l;
+    }
+    /* Trailing profile-extension bytes, when present, are not walked. */
+    return MOQ_OK;
+}
+
+/* HEVCDecoderConfigurationRecord (ISO/IEC 14496-15). */
+static moq_result_t validate_hvcc(const uint8_t *d, size_t len)
+{
+    if (len < 23 || d[0] != 1) {
+        return MOQ_ERR_PROTO;
+    }
+    size_t o = 22;
+    size_t narr = d[o++];
+    for (size_t a = 0; a < narr; a++) {
+        if (len - o < 3) return MOQ_ERR_PROTO;
+        o += 1;                            /* array_completeness / NAL type */
+        size_t num = ((size_t)d[o] << 8) | d[o + 1];
+        o += 2;
+        for (size_t i = 0; i < num; i++) {
+            if (len - o < 2) return MOQ_ERR_PROTO;
+            size_t l = ((size_t)d[o] << 8) | d[o + 1];
+            o += 2;
+            if (l > len - o) return MOQ_ERR_PROTO;
+            o += l;
+        }
+    }
+    return MOQ_OK;
+}
+
+/* AV1CodecConfigurationRecord: four header bytes then the configOBUs. */
+static moq_result_t validate_av1c(const uint8_t *d, size_t len)
+{
+    if (len < 4 || (d[0] & 0x7fu) != 1) {
+        return MOQ_ERR_PROTO;
+    }
+    size_t i = 4;
+    while (i < len) {
+        uint8_t h = d[i];
+        if ((h & 0x02u) == 0) {
+            return MOQ_ERR_PROTO;          /* obu_has_size_field required */
+        }
+        size_t hdr = (size_t)1 + (((h >> 2) & 1u) ? 1u : 0u);
+        if (len - i < hdr) return MOQ_ERR_PROTO;
+        size_t j = i + hdr;
+
+        uint64_t v = 0;
+        int k = 0;
+        bool terminated = false;
+        for (; k < 8; k++) {
+            if (j >= len) return MOQ_ERR_PROTO;
+            uint8_t b = d[j++];
+            v |= (uint64_t)(b & 0x7fu) << (7 * k);
+            if (!(b & 0x80u)) { terminated = true; break; }
+        }
+        if (!terminated) return MOQ_ERR_PROTO;
+        if (v > (uint64_t)(len - j)) return MOQ_ERR_PROTO;
+        i = j + (size_t)v;
+    }
+    return MOQ_OK;
+}
+
+/* OpusSpecificBox (dOps). */
+static moq_result_t validate_dops(const uint8_t *d, size_t len)
+{
+    if (len < 11 || d[0] != 0) {
+        return MOQ_ERR_PROTO;
+    }
+    if (d[10] != 0) {
+        /* ChannelMappingTable: StreamCount, CoupledCount, mapping[channels]. */
+        size_t need = (size_t)11 + 2 + d[1];
+        if (len < need) return MOQ_ERR_PROTO;
+    }
     return MOQ_OK;
 }
 
@@ -843,6 +1075,13 @@ moq_result_t moq_codec_init_data_build(const moq_codec_init_data_cfg_t *cfg,
     if (!cfg || !out_len) {
         return MOQ_ERR_INVAL;
     }
+    /*
+     * The documented contract: *out_len is 0 on every failure other than
+     * MOQ_ERR_BUFFER. Clearing it here means every error return below
+     * satisfies that without repeating itself, and the paths that do report a
+     * required length set it explicitly.
+     */
+    *out_len = 0;
     if (cfg->struct_size <
         offsetof(moq_codec_init_data_cfg_t, nal) + sizeof(cfg->nal)) {
         return MOQ_ERR_INVAL;
@@ -854,30 +1093,35 @@ moq_result_t moq_codec_init_data_build(const moq_codec_init_data_cfg_t *cfg,
     switch (cfg->source_format) {
     case MOQ_CODEC_SOURCE_AVC_ANNEXB:
         return build_avcc(cfg, buf, cap, out_len);
-    case MOQ_CODEC_SOURCE_AVC_AVCC:
-        if (cfg->source.len < 7 || cfg->source.data[0] != 1) {
-            return MOQ_ERR_PROTO;
-        }
+    case MOQ_CODEC_SOURCE_AVC_AVCC: {
+        moq_result_t rc = validate_avcc(cfg->source.data, cfg->source.len);
+        if (rc != MOQ_OK) return rc;
         return passthrough(cfg->source, 7, buf, cap, out_len);
-    case MOQ_CODEC_SOURCE_HEVC_HVCC:
-        if (cfg->source.len < 23 || cfg->source.data[0] != 1) {
-            return MOQ_ERR_PROTO;
-        }
+    }
+    case MOQ_CODEC_SOURCE_HEVC_HVCC: {
+        moq_result_t rc = validate_hvcc(cfg->source.data, cfg->source.len);
+        if (rc != MOQ_OK) return rc;
         return passthrough(cfg->source, 23, buf, cap, out_len);
-    case MOQ_CODEC_SOURCE_AV1_AV1C:
-        if (cfg->source.len < 4 || (cfg->source.data[0] & 0x7f) != 1) {
-            return MOQ_ERR_PROTO;
-        }
+    }
+    case MOQ_CODEC_SOURCE_AV1_AV1C: {
+        moq_result_t rc = validate_av1c(cfg->source.data, cfg->source.len);
+        if (rc != MOQ_OK) return rc;
         return passthrough(cfg->source, 4, buf, cap, out_len);
-    case MOQ_CODEC_SOURCE_AAC_ASC:
+    }
+    case MOQ_CODEC_SOURCE_AAC_ASC: {
+        uint32_t aot;
+        moq_result_t rc = asc_leading_fields(cfg->source.data, cfg->source.len,
+                                             &aot);
+        if (rc != MOQ_OK) return rc;
         return passthrough(cfg->source, 2, buf, cap, out_len);
+    }
     case MOQ_CODEC_SOURCE_OPUS_HEAD:
         return build_dops(cfg->source, buf, cap, out_len);
-    case MOQ_CODEC_SOURCE_OPUS_DOPS:
-        if (cfg->source.len < 11 || cfg->source.data[0] != 0) {
-            return MOQ_ERR_PROTO;
-        }
+    case MOQ_CODEC_SOURCE_OPUS_DOPS: {
+        moq_result_t rc = validate_dops(cfg->source.data, cfg->source.len);
+        if (rc != MOQ_OK) return rc;
         return passthrough(cfg->source, 11, buf, cap, out_len);
+    }
     case MOQ_CODEC_SOURCE_HEVC_ANNEXB:
         return build_hvcc(cfg, buf, cap, out_len);
     case MOQ_CODEC_SOURCE_AV1_OBU:
@@ -900,6 +1144,7 @@ moq_result_t moq_codec_string_format(const moq_codec_string_cfg_t *cfg,
     if (!cfg || !out_len) {
         return MOQ_ERR_INVAL;
     }
+    *out_len = 0;
     if (cfg->struct_size <
         offsetof(moq_codec_string_cfg_t, decoder_config) +
             sizeof(cfg->decoder_config)) {
@@ -924,6 +1169,10 @@ moq_result_t moq_codec_string_format(const moq_codec_string_cfg_t *cfg,
         break;
     default:
         return MOQ_ERR_UNSUPPORTED;
+    }
+
+    if (!entry_matches_format(cfg->config_format, cfg->sample_entry)) {
+        return MOQ_ERR_INVAL;
     }
 
     char scratch[CODEC_STRING_SCRATCH];

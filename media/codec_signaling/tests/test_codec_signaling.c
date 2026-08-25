@@ -609,7 +609,10 @@ int main(void)
 
     /* -- av1C passthrough ------------------------------------------- */
     {
-        const uint8_t av1c[] = { 0x81, 0x04, 0x00, 0x00, 0x0a, 0x0b };
+        /* Four record bytes, then one configOBU: header 0x0a is a
+         * sequence header with obu_has_size_field set, and the LEB128
+         * size 0x00 gives it a zero-length payload. */
+        const uint8_t av1c[] = { 0x81, 0x04, 0x00, 0x00, 0x0a, 0x00 };
         moq_codec_init_data_cfg_t cfg;
         moq_codec_init_data_cfg_init(&cfg);
         cfg.source_format = MOQ_CODEC_SOURCE_AV1_AV1C;
