@@ -871,17 +871,24 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
     moq_send_data_action_t *sd = &p->act.u.send_data;
     uint64_t sid = p->stream_id;
 
+    /* Every SEND_DATA shape belongs to the stream's ordering domain. Check
+     * before selecting a phase: a payload-only continuation or bare FIN must
+     * not bypass an older retained header/payload action on the same stream. */
+    if (bridge_domain_blocked(b, p->stream_ref, sid, p->has_stream_id)) {
+        if (!bridge_enqueue_pending(b, p))
+            return bridge_retention_failed(b, p);
+        memset(p, 0, sizeof(*p));
+        return MOQ_OK;
+    }
+
     /* Phase 1: send header (if any) */
     if (p->kind == PENDING_HEADER_PAYLOAD && sd->header_len > 0) {
         size_t pay_len = sd->payload ? moq_rcbuf_len(sd->payload) : 0;
         bool fin_on_hdr = (pay_len == 0) && sd->fin;
 
-        moq_transport_result_t wr =
-            bridge_domain_blocked(b, p->stream_ref, sid, p->has_stream_id)
-                ? MOQ_TRANSPORT_WOULD_BLOCK
-                : sanitize_stream_result(
-                      b->ops->write(b->endpoint_ctx, sid,
-                                     sd->header, sd->header_len, fin_on_hdr));
+        moq_transport_result_t wr = sanitize_stream_result(
+            b->ops->write(b->endpoint_ctx, sid,
+                          sd->header, sd->header_len, fin_on_hdr));
 
         if (wr == MOQ_TRANSPORT_WOULD_BLOCK) {
             if (!bridge_enqueue_pending(b, p))

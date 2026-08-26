@@ -9,6 +9,7 @@
 #include <moq/session.h>
 #include <moq/rcbuf.h>
 #include "../common/moq_pq_send_queue.h"
+#include "picoquic_endpoint.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1104,7 +1105,8 @@ int main(void)
      * whole object still arrives exactly once. */
     {
         setenv("MOQ_PQ_STREAM_QUEUE_BYTES", "8", 1);
-        g_add_count = 0; g_send_fail = false;
+        g_add_count = 0; g_active_flag = -1; g_active_sid = 0;
+        g_send_fail = false;
         moq_alloc_t a = talloc();
         moq_session_t *c = NULL, *s = NULL;
         moq_subscription_t ss = setup(&a, &c, &s, 0, 0);
@@ -1113,31 +1115,83 @@ int main(void)
         moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
         moq_subgroup_handle_t sgh;
         moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
-        uint8_t big[40]; memset(big, 'Q', sizeof(big));
+        uint8_t big[40];
+        for (size_t i = 0; i < sizeof(big); i++)
+            big[i] = (uint8_t)(0x80u + i);
         moq_rcbuf_t *p = NULL;
         moq_rcbuf_create(&a, big, sizeof(big), &p);
         moq_session_write_object(s, sgh, 0, p, 0);
         moq_rcbuf_decref(p);
         moq_session_close_subgroup(s, sgh, 0);
 
-        uint64_t sid = 0; size_t total = 0; bool saw_fin = false;
+        uint64_t sid = 0;
+        bool have_sid = false, saw_fin = false, quiet_after_fin = false;
+        bool output_after_fin = false, capture_overflow = false;
+        unsigned fin_count = 0;
+        uint8_t got[128];
+        size_t total = 0;
         int guard = 0;
         /* Alternate service (fills queue to cap, WOULD_BLOCK retains rest) and
-         * prepare drains (frees cap), until the whole object + FIN drains. */
-        while (guard++ < 200 && !saw_fin) {
+         * prepare drains (frees cap), until the whole object + FIN drains and a
+         * final prepare proves no retained byte escaped after that FIN. */
+        while (guard++ < 200 && !quiet_after_fin) {
             moq_pq_service(ad, g_time);
-            if (g_active_flag == 1) sid = g_active_sid;
-            if (sid == 0) continue;
+            if (g_active_flag == 1) {
+                if (!have_sid) {
+                    sid = g_active_sid;
+                    have_sid = true;
+                } else {
+                    CHECK(g_active_sid == sid);
+                }
+            }
+            if (!have_sid) continue;
             g_provide_nb = 999; g_provide_fin = -1;
             moq_pq_callback(NULL, sid, (uint8_t *)(uintptr_t)0xABC, 100,
                             picoquic_callback_prepare_to_send, ad, NULL);
-            total += g_provide_nb;
-            if (g_provide_fin) saw_fin = true;
+            CHECK(g_provide_nb <= 100);
+            if (saw_fin && (g_provide_nb != 0 || g_provide_fin != 0))
+                output_after_fin = true;
+            if (g_provide_nb > sizeof(got) - total) {
+                capture_overflow = true;
+            } else {
+                memcpy(got + total, g_provide_buf, g_provide_nb);
+                total += g_provide_nb;
+            }
+            if (g_provide_fin) {
+                fin_count++;
+                saw_fin = true;
+                CHECK(g_provide_still == 0);
+            } else if (saw_fin && g_provide_nb == 0) {
+                quiet_after_fin = true;
+            }
         }
+        CHECK(have_sid);
         CHECK(saw_fin);
+        CHECK(quiet_after_fin);
+        CHECK(fin_count == 1);
+        CHECK(!output_after_fin);
+        CHECK(!capture_overflow);
         CHECK(g_add_count == 0);
-        /* header bytes + exactly the 40 payload bytes, once. */
-        CHECK(total >= 40);
+        /* The exact non-default payload occurs once and is the stream tail;
+         * therefore the sole FIN followed the complete object, not its header. */
+        size_t matches = 0, match_end = 0;
+        if (total >= sizeof(big)) {
+            for (size_t i = 0; i <= total - sizeof(big); i++) {
+                if (memcmp(got + i, big, sizeof(big)) == 0) {
+                    matches++;
+                    match_end = i + sizeof(big);
+                }
+            }
+        }
+        CHECK(matches == 1);
+        CHECK(match_end == total);
+        {
+            moq_pq_send_stats_t st;
+            moq_pq_conn_get_send_stats(ad, &st);
+            CHECK(st.queue_would_block == 1);
+            CHECK(st.queue_high_water == sizeof(big));
+            CHECK(st.provided_bytes == total);
+        }
         CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
         unsetenv("MOQ_PQ_STREAM_QUEUE_BYTES");
 
