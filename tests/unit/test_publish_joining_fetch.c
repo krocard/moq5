@@ -1322,7 +1322,7 @@ static void expect_sole_fetch_request(moq_session_t *s,
                                       const char *what)
 {
     int events = 0, reqs = 0, foreign = 0;
-    moq_fetch_request_event_t got;
+    moq_fetch_request_event_t got = {0};
     bool have = false;
     /* Token values borrow output scratch and are valid only until the next
      * poll, so they are compared inside the loop; everything else is copied. */
