@@ -9,6 +9,7 @@
 
 #include <moq/transport_bridge.h>
 #include <picoquic.h>
+#include <stdbool.h>
 #include "../common/moq_pq_send_queue.h"
 
 #ifdef __cplusplus
@@ -43,6 +44,23 @@ void pq_endpoint_get_stats(const pq_endpoint_ctx_t *ep_ctx,
  * declared here so the threaded adapter can aggregate across connections). */
 void moq_pq_conn_get_send_stats(const moq_pq_conn_t *conn,
                                 moq_pq_send_stats_t *out);
+
+/*
+ * True once picoquic has handed this connection's picoquic_cnx_t back and the
+ * adapter has dropped every copy of the pointer (implemented in
+ * moq_picoquic.c). PRIVATE: deliberately not in <moq/picoquic.h>, because it
+ * describes an internal ownership fact, not application API.
+ *
+ * This is NOT moq_pq_conn_is_closed(), which reports MoQ session/bridge
+ * terminal state. The two are independent: a session can be closed while the
+ * cnx is alive (a ready-state APPLICATION_CLOSE leaves picoquic in
+ * picoquic_state_closing_received), and a released cnx is one that no longer
+ * exists at all.
+ *
+ * The threaded adapter keeps its own duplicate cnx pointer in step with this
+ * fact via moq_pq_conn_cfg_t.after_callback. A NULL conn reports true.
+ */
+bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn);
 
 /* Returns 0 on success, -1 on allocation failure (queue create). */
 int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,

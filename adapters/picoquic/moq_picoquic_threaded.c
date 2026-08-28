@@ -290,6 +290,35 @@ static void server_conn_free(moq_pq_threaded_t *t,
     t->alloc.free(c, sizeof(*c), t->alloc.ctx);
 }
 
+/* Keep this record's duplicate cnx pointer in step with the raw adapter's
+ * single ownership fact.
+ *
+ * The raw adapter releases the pointer inside the terminal picoquic callback,
+ * which is the last moment it is valid. That callback routes STRAIGHT to
+ * moq_pq_callback once moq_pq_conn_create has rebound it, so server_callback
+ * below never sees it -- the after_callback hook is the only reliable place to
+ * learn about the release. Signal-only, per the hook contract: it reads one
+ * private accessor and writes this record.
+ *
+ * `conn` is used rather than `c->conn` so the hook is correct even for a
+ * callback that lands before server_accept has finished wiring the record. */
+static void server_conn_after_callback(moq_pq_conn_t *conn, void *user_ctx)
+{
+    struct moq_pq_threaded_conn *c = (struct moq_pq_threaded_conn *)user_ctx;
+    if (!c || !c->cnx) return;
+    if (!moq_pq_conn_cnx_released(conn)) return;
+
+    c->cnx = NULL;
+    /* t->active_cnx is a published copy of conns[0]->cnx read under the mutex
+     * by the legacy single-connection accessors. Recompute it now, or it stays
+     * a stale pointer until the next append/prune. */
+    if (c->parent) {
+        pthread_mutex_lock(&c->parent->mutex);
+        server_publish_first_locked(c->parent);
+        pthread_mutex_unlock(&c->parent->mutex);
+    }
+}
+
 /* Accept one new server connection: create its session + adapter at the
  * negotiated ALPN version, start it, and append a heap-owned record. Returns
  * the record or NULL (caller returns -1 so picoquic closes the cnx). Network
@@ -312,34 +341,13 @@ static struct moq_pq_threaded_conn *server_accept(moq_pq_threaded_t *t,
     if (moq_session_create(&scfg, now, &session) != MOQ_OK)
         return NULL;
 
-    moq_pq_conn_cfg_t acfg;
-    moq_pq_conn_cfg_init_sized(&acfg, sizeof(acfg));
-    acfg.session = session;
-    acfg.cnx = cnx;
-    acfg.alloc = &t->alloc;
-    moq_pq_conn_t *conn = NULL;
-    if (moq_pq_conn_create(&acfg, &conn) != 0) {
-        moq_session_destroy(session);
-        return NULL;
-    }
-
-    /* Start the server session (draft-18 sends its own SETUP; draft-16 is a
-     * WRONG_STATE no-op). */
-    moq_result_t src = moq_session_start(session, now);
-    if (src != MOQ_OK && src != MOQ_ERR_WRONG_STATE) {
-        moq_pq_conn_destroy(conn);
-        moq_session_destroy(session);
-        return NULL;
-    }
-    if (src == MOQ_OK && moq_pq_service(conn, now) < 0) {
-        moq_pq_conn_destroy(conn);
-        moq_session_destroy(session);
-        return NULL;
-    }
-
+    /* The record is allocated BEFORE the adapter, so the adapter's
+     * after_callback hook has a valid ctx from its very first invocation --
+     * moq_pq_service() below can already fire it. It is published to conns[]
+     * only after start succeeds, so the existing failed-accept cleanup path is
+     * unchanged. */
     struct moq_pq_threaded_conn *c = t->alloc.alloc(sizeof(*c), t->alloc.ctx);
     if (!c) {
-        moq_pq_conn_destroy(conn);
         moq_session_destroy(session);
         return NULL;
     }
@@ -347,7 +355,38 @@ static struct moq_pq_threaded_conn *server_accept(moq_pq_threaded_t *t,
     c->parent = t;
     c->cnx = cnx;
     c->session = session;
+
+    moq_pq_conn_cfg_t acfg;
+    moq_pq_conn_cfg_init_sized(&acfg, sizeof(acfg));
+    acfg.session = session;
+    acfg.cnx = cnx;
+    acfg.alloc = &t->alloc;
+    acfg.user_ctx = c;
+    acfg.after_callback = server_conn_after_callback;
+    moq_pq_conn_t *conn = NULL;
+    if (moq_pq_conn_create(&acfg, &conn) != 0) {
+        moq_session_destroy(session);
+        t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+        return NULL;
+    }
     c->conn = conn;
+
+    /* Start the server session (draft-18 sends its own SETUP; draft-16 is a
+     * WRONG_STATE no-op). */
+    moq_result_t src = moq_session_start(session, now);
+    if (src != MOQ_OK && src != MOQ_ERR_WRONG_STATE) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+        return NULL;
+    }
+    if (src == MOQ_OK && moq_pq_service(conn, now) < 0) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+        return NULL;
+    }
+
     c->negotiated = scfg.version ? scfg.version : MOQ_VERSION_DRAFT_16;
 
     pthread_mutex_lock(&t->mutex);
@@ -896,6 +935,11 @@ static int loop_callback(picoquic_quic_t *quic,
         bool all_drained = true;
         for (size_t i = 0; i < t->conn_count; i++) {
             struct moq_pq_threaded_conn *c = t->conns[i];
+            /* Released by picoquic: nothing to wake and nothing left to flush.
+             * This loop runs AFTER server_prune, so it is reached by exactly
+             * the dead-but-unobserved records prune deliberately keeps. */
+            if (!c->cnx)
+                continue;
             moq_session_t *sess = moq_pq_conn_session(c->conn);
             if (sess) {
                 uint64_t dl = moq_session_next_deadline_us(sess);

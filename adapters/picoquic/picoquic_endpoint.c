@@ -24,6 +24,7 @@
 static moq_transport_result_t pq_open_uni(void *ctx, uint64_t *out_id)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    if (!ep->cnx) return MOQ_TRANSPORT_ERROR;   /* cnx released; see the header */
     *out_id = picoquic_get_next_local_stream_id(ep->cnx, 1);
     return MOQ_TRANSPORT_OK;
 }
@@ -31,6 +32,7 @@ static moq_transport_result_t pq_open_uni(void *ctx, uint64_t *out_id)
 static moq_transport_result_t pq_open_bidi(void *ctx, uint64_t *out_id)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    if (!ep->cnx) return MOQ_TRANSPORT_ERROR;
     *out_id = picoquic_get_next_local_stream_id(ep->cnx, 0);
     return MOQ_TRANSPORT_OK;
 }
@@ -39,6 +41,7 @@ static moq_transport_result_t pq_open_bidi(void *ctx, uint64_t *out_id)
 static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
                                               uint64_t stream_id, int r)
 {
+    if (!ep->cnx) return MOQ_TRANSPORT_ERROR;    /* cnx released */
     if (r < 0) return MOQ_TRANSPORT_ERROR;       /* allocation failure: fatal */
     if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* queue cap: retain + retry */
     /* Bytes are queued; picoquic must poll the stream to pull them. A failure
@@ -72,6 +75,7 @@ static moq_transport_result_t pq_reset(void *ctx, uint64_t stream_id,
     /* Abandon anything still queued for this stream and clear the active mark
      * before resetting, so no prepare_to_send lands for a reset stream. */
     moq_pq_send_queue_drop(ep->queue, stream_id);
+    if (!ep->cnx) return MOQ_TRANSPORT_ERROR;
     picoquic_mark_active_stream(ep->cnx, stream_id, 0, NULL);
     int rc = picoquic_reset_stream(ep->cnx, stream_id, error_code);
     return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
@@ -111,6 +115,7 @@ static moq_transport_result_t pq_stop_sending(void *ctx, uint64_t stream_id,
                                                uint64_t error_code)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    if (!ep->cnx) return MOQ_TRANSPORT_ERROR;
     int rc = picoquic_stop_sending(ep->cnx, stream_id, error_code);
     return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
 }
@@ -125,6 +130,7 @@ static moq_transport_result_t pq_stop_sending(void *ctx, uint64_t stream_id,
 static size_t pq_max_datagram_size(void *ctx)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    if (!ep->cnx) return 0;             /* cnx released: no capacity */
     picoquic_tp_t const *remote =
         picoquic_get_transport_parameters(ep->cnx, 0 /* remote */);
     if (!remote) return 0;
@@ -136,6 +142,7 @@ static moq_transport_result_t pq_send_datagram(void *ctx,
                                                 size_t len)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    if (!ep->cnx) return MOQ_TRANSPORT_DROPPED;  /* cnx released */
 
     /* Honesty gate: picoquic only enforces the negotiated limit for datagrams
      * above its "cautious length", so a small datagram queued on a connection
@@ -167,6 +174,10 @@ static moq_transport_result_t pq_close(void *ctx, uint64_t code,
                                         size_t reason_len)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    /* A released cnx no longer exists, so the close it asked for is already
+     * satisfied. Reporting an error here would fatalize a bridge that is only
+     * tidying up after a connection picoquic already reclaimed. */
+    if (!ep->cnx) return MOQ_TRANSPORT_OK;
     int rc;
     if (reason && reason_len > 0) {
         char buf[256];

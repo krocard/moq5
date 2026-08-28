@@ -60,7 +60,8 @@ static void on_error(void *ctx, moq_sub_track_t *track,
                       moq_request_error_t code, moq_bytes_t reason) {
     (void)ctx; (void)track;
     /* reason is PEER-CONTROLLED: escape before printing. */
-    fprintf(stderr, "  subscribe error: code=%u reason=\"", code);
+    fprintf(stderr, "  subscribe error: code=%llu reason=\"",
+            (unsigned long long)code);
     moq_example_term_fprint(stderr, reason.data, reason.len);
     fputs("\"\n", stderr);
 }

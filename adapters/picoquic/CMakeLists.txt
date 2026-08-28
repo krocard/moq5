@@ -329,6 +329,75 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_compile COMMAND test_threaded_compile)
 
+    # Focused RED row for the raw threaded SERVER terminal ownership defect:
+    # the same scenario as threaded_compile's
+    # server_terminal_conn_observed_before_prune, on its own, so the ASan
+    # abort is attributable without running the scenarios that precede it.
+    add_executable(test_threaded_server_terminal_uaf
+        tests/test_threaded_server_terminal_uaf.c)
+    target_link_libraries(test_threaded_server_terminal_uaf
+        PRIVATE moq::adapter-picoquic-threaded)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_server_terminal_uaf PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_server_terminal_uaf PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    # Two rows, registered separately so each terminal shape is attributable:
+    #   peer_terminal -- RED: picoquic_callback_close at
+    #                    picoquic_state_disconnected, cnx already deleted
+    #   app_close     -- CONTROL (passes today): APPLICATION_CLOSE at
+    #                    picoquic_state_closing_received, cnx still live
+    add_test(NAME threaded_server_terminal_uaf
+             COMMAND test_threaded_server_terminal_uaf peer_terminal)
+    set_tests_properties(threaded_server_terminal_uaf
+        PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_app_close
+             COMMAND test_threaded_server_terminal_uaf app_close)
+    set_tests_properties(threaded_terminal_control_app_close
+        PROPERTIES TIMEOUT 120)
+
+    # Same binary, same row, characterization telemetry ON. The stats path has
+    # its own picoquic_cnx_t consumers -- pq_sum_pkts_sent on every after_send
+    # turn, and the stop-time aggregation -- which the destructor fix alone
+    # does not cover. This row passes only if the THREADED duplicate cnx
+    # pointer is synchronized to NULL when the raw adapter releases it.
+    add_test(NAME threaded_server_terminal_stats
+             COMMAND test_threaded_server_terminal_uaf peer_terminal)
+    set_tests_properties(threaded_server_terminal_stats PROPERTIES
+        TIMEOUT 120
+        ENVIRONMENT "MOQ_PQ_THREADED_STATS=1")
+
+    # Terminal-ownership controls: these pass today and must keep passing, so
+    # the eventual fix cannot be obtained by unbinding a live caller-owned cnx
+    # too late, or by never unbinding at all.
+    add_executable(test_threaded_terminal_controls
+        tests/test_threaded_terminal_controls.c)
+    target_link_libraries(test_threaded_terminal_controls
+        PRIVATE moq::adapter-picoquic-threaded moq::adapter-picoquic)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_terminal_controls PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_terminal_controls PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_terminal_control_client_unbind
+             COMMAND test_threaded_terminal_controls client_unbind)
+    set_tests_properties(threaded_terminal_control_client_unbind
+        PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_local_close
+             COMMAND test_threaded_terminal_controls local_close)
+    set_tests_properties(threaded_terminal_control_local_close
+        PROPERTIES TIMEOUT 120)
+
     # White-box internals variant (test-only, never installed): the threaded
     # adapter compiled with MOQ_PQ_THREADED_TESTING so the lifecycle test can
     # inject a post-on_lane_pump service-pass failure -- the terminal-conn

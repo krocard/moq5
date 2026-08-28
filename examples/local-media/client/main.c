@@ -81,7 +81,7 @@ static void on_error(void *ctx, moq_sub_track_t *track,
                       moq_request_error_t code, moq_bytes_t reason) {
     (void)ctx; (void)track;
     /* reason is PEER-CONTROLLED: escape before printing. */
-    fprintf(stderr, "  subscribe error: %u \"", code);
+    fprintf(stderr, "  subscribe error: %llu \"", (unsigned long long)code);
     moq_example_term_fprint(stderr, reason.data, reason.len);
     fputs("\"\n", stderr);
     running = 0;

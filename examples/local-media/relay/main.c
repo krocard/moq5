@@ -574,8 +574,8 @@ static void pump_upstream(relay_ctx_t *ctx, uint64_t now)
             relay_track_t *t =
                 find_track_by_up_fetch(ctx, ev.u.fetch_error.fetch);
             if (t)
-                fprintf(stderr, "  relay: upstream fetch error: %u\n",
-                    ev.u.fetch_error.error_code);
+                fprintf(stderr, "  relay: upstream fetch error: %llu\n",
+                    (unsigned long long)ev.u.fetch_error.error_code);
             break;
         }
 

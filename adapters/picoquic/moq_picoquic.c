@@ -156,6 +156,9 @@ static pq_rx_stream_t *pq_rx_find(moq_pq_conn_t *c, uint64_t stream_id)
 static bool pq_rx_budget_for(moq_pq_conn_t *c, uint64_t stream_id,
                              uint64_t *out)
 {
+    /* A released cnx has no transport parameters to read: fail closed, as the
+     * unreadable-parameters case above already requires. */
+    if (!c->cnx) return false;
     const picoquic_tp_t *tp = picoquic_get_transport_parameters(c->cnx, 1);
     if (tp == NULL) return false;
     if (!PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)) {
@@ -337,8 +340,9 @@ static int pq_rx_refresh_credit(moq_pq_conn_t *c, pq_rx_stream_t *st)
      * pre-ready grant would be recorded but never sent. Leave the grant OWED
      * (granted unchanged -- target keeps exceeding it) and let the post-service
      * sweep issue it once the connection is READY. */
-    if (picoquic_get_cnx_state(c->cnx) != picoquic_state_ready)
-        return 0;
+    if (!c->cnx ||
+        picoquic_get_cnx_state(c->cnx) != picoquic_state_ready)
+        return 0;                               /* released, or not yet READY */
     if (picoquic_open_flow_control(c->cnx, st->stream_id, headroom) != 0)
         return -1;
     st->granted = target;
@@ -365,7 +369,7 @@ static int pq_rx_on_data(moq_pq_conn_t *c, uint64_t sid, pq_rx_kind_t kind,
         return -1;
     }
     if (!st->app_fc) {                       /* first sight: take the window */
-        if (picoquic_set_app_flow_control(c->cnx, sid, 1) != 0) {
+        if (!c->cnx || picoquic_set_app_flow_control(c->cnx, sid, 1) != 0) {
             /* The window is NOT ours: the backpressure invariant cannot hold.
              * Fatal, and app_fc stays false (no bookkeeping published). */
             moq_transport_bridge_on_transport_error(c->bridge, 0, now);
@@ -559,7 +563,13 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
 void moq_pq_conn_destroy(moq_pq_conn_t *conn)
 {
     if (!conn) return;
-    picoquic_set_callback(conn->cnx, NULL, NULL);
+    /* Unbind a cnx this adapter still owns. A cnx picoquic already reclaimed
+     * was unbound at its terminal callback and the pointer dropped there, so
+     * touching it here would be a use-after-free. The live case is the raw
+     * facade's contract and must not regress: a caller-owned client cnx
+     * outlives its adapter and MUST be unbound on destroy. */
+    if (conn->cnx)
+        picoquic_set_callback(conn->cnx, NULL, NULL);
     pq_rx_free_all(conn);
     moq_transport_bridge_destroy(conn->bridge);
     pq_endpoint_cleanup(&conn->endpoint_ctx);
@@ -622,6 +632,36 @@ void moq_pq_conn_get_send_stats(const moq_pq_conn_t *c,
     pq_endpoint_get_stats(&c->endpoint_ctx, out);
 }
 
+/* -- Connection ownership -------------------------------------------- *
+ *
+ * picoquic's lifetime policy is asymmetric: picoquic_prepare_next_packet_ex
+ * DELETES a server picoquic_cnx_t once it reaches PICOQUIC_ERROR_DISCONNECTED,
+ * while a client cnx is retained for the application. So for a server
+ * connection there is exactly one moment at which this adapter can still touch
+ * the pointer: inside the terminal callback, whose `cnx` argument is valid
+ * because picoquic_connection_disconnect() invokes the callback BEFORE
+ * picoquic_delete_cnx() frees anything (quicctx.c).
+ *
+ * Releasing here -- unbinding while live, then dropping every copy of the
+ * pointer -- is what makes the later prune safe. It is deliberately NOT
+ * derived from bridge/session terminal state: moq_pq_conn_is_closed() answers
+ * "the MoQ session is closed", which is a different fact and is true on paths
+ * where the cnx is still very much alive.
+ */
+static void pq_release_cnx(moq_pq_conn_t *c, picoquic_cnx_t *cnx)
+{
+    if (!c || !c->cnx) return;          /* idempotent */
+    picoquic_set_callback(cnx, NULL, NULL);
+    c->cnx = NULL;
+    c->endpoint_ctx.cnx = NULL;         /* every endpoint op dereferences this */
+}
+
+bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn)
+{
+    /* A NULL conn holds no cnx, so it is trivially released. */
+    return !conn || conn->cnx == NULL;
+}
+
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
 int moq_pq_callback(picoquic_cnx_t *cnx,
@@ -646,9 +686,36 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
         return 0;
     }
 
+    /* Does picoquic hand the cnx back on THIS callback? Decided before the
+     * terminal short-circuit below: a bridge that is already terminal (a local
+     * close, a service fatal) would otherwise skip the release entirely and
+     * leave every copy of the pointer dangling.
+     *
+     * picoquic_callback_close arrives with cnx_state already
+     * picoquic_state_disconnected (picoquic_connection_disconnect sets it),
+     * so for a server that is the deletion point.
+     *
+     * picoquic_callback_application_close is NOT: frames.c puts a connection
+     * that is at or past picoquic_state_client_ready_start into
+     * picoquic_state_closing_received and delivers the callback with the cnx
+     * STILL LIVE -- its own picoquic_callback_close follows later. Only the
+     * handshake-state branch, which sets picoquic_state_disconnected, is a
+     * release point. Discriminating on the callback KIND alone would unbind a
+     * live connection and leave picoquic calling into freed adapter memory. */
+    bool release_cnx = false;
+    if (event == picoquic_callback_close) {
+        release_cnx = !picoquic_is_client(cnx);
+    } else if (event == picoquic_callback_application_close) {
+        release_cnx = !picoquic_is_client(cnx) &&
+                      picoquic_get_cnx_state(cnx) ==
+                          picoquic_state_disconnected;
+    }
+
     if (moq_transport_bridge_is_terminal(c->bridge)) {
         /* No processing on a terminal adapter, but the hook contract is
          * state-independent: it fires on ALL callback exits. */
+        if (release_cnx)
+            pq_release_cnx(c, cnx);
         if (c->after_callback)
             c->after_callback(c, c->user_ctx);
         return 0;
@@ -743,6 +810,11 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
     default:
         break;
     }
+
+    /* After the bridge has been told, so on_transport_close ran with a live
+     * endpoint, and before the hook, so the hook observes the final state. */
+    if (release_cnx)
+        pq_release_cnx(c, cnx);
 
     if (c->after_callback)
         c->after_callback(c, c->user_ctx);
