@@ -32,7 +32,7 @@
  *     "name_intern_bytes": 65536,
  *     "log": { "max_groups": 8, "max_bytes": 8388608, "max_age_us": 0 },
  *     "log_max_subgroups": 16, "log_max_objects": 4096,
- *     "log_max_cursors": 64,
+ *     "log_max_cursors": 64, "log_max_chunk_nodes": 8192,
  *     "cross_shard": {                  // optional; the lanes>1 pool bounds
  *                                       // (accepted but structurally inert
  *                                       // at lanes == 1); 0 = library

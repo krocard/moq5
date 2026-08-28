@@ -232,6 +232,11 @@ typedef struct moqr_core_relay_cfg {
      * into moqr_core_peek_revoked_grants). A full queue is transient backpressure
      * (WOULD_BLOCK), not a refusal. 0 = default (max_bindings). */
     uint32_t max_cancels;              /* def max_bindings                 */
+
+    /* OPEN-record chunk-node pool for every per-track log. 0 = log default
+     * (8192). This bounds chunk-through retained records and the relay's
+     * per-binding chunk-pin array without changing retention semantics. */
+    uint32_t log_max_chunk_nodes;       /* def 8192                         */
 } moqr_core_relay_cfg_t;
 
 void moqr_core_relay_cfg_init_sized(moqr_core_relay_cfg_t *cfg,

@@ -946,6 +946,43 @@ main(void)
     MOQ_TEST_CHECK_EQ_U64(cap.total_bytes,
                           cap.structure_bytes + cap.payload_bytes);
 
+    /* log_max_chunk_nodes is a public capacity knob like the neighbouring
+     * per-track log limits: it parses, reaches core capacity, and zero keeps
+     * the default. */
+    {
+        moqr_cli_config_t dflt, tuned, zero;
+        MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},\"budgets\":{"
+                             "\"max_tracks\":1,\"max_bindings\":2,"
+                             "\"log_max_chunk_nodes\":0}}",
+                             &zero, err, sizeof(err)) == MOQR_OK);
+        MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},\"budgets\":{"
+                             "\"max_tracks\":1,\"max_bindings\":2}}",
+                             &dflt, err, sizeof(err)) == MOQR_OK);
+        MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},\"budgets\":{"
+                             "\"max_tracks\":1,\"max_bindings\":2,"
+                             "\"log_max_chunk_nodes\":7}}",
+                             &tuned, err, sizeof(err)) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(tuned.core.log_max_chunk_nodes, 7);
+        moqr_core_capacity_t cd, ct, cz;
+        MOQ_TEST_CHECK(moqr_core_capacity_describe(&dflt.core, &cd) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_capacity_describe(&tuned.core, &ct) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_capacity_describe(&zero.core, &cz) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(cd.total_bytes, cz.total_bytes);
+        MOQ_TEST_CHECK(ct.total_bytes < cd.total_bytes);
+
+        MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},\"budgets\":{"
+                             "\"log_max_chunk_nodes\":-1}}",
+                             &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(strstr(err, "log_max_chunk_nodes") != NULL);
+        MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},\"budgets\":{"
+                             "\"log_max_chunk_nodes\":4294967296}}",
+                             &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(strstr(err, "log_max_chunk_nodes") != NULL);
+    }
+
     /* The telemetry knob is real, not just parsed: build_core attaches a
      * trace ring that records actual core transitions, and the configured
      * depth takes effect (a 4-record ring caps the retained tail while the

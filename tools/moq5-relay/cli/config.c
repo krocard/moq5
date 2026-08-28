@@ -229,6 +229,9 @@ parse_budgets(struct json_object_s *o, moqr_cli_config_t *out,
         } else if (strcmp(k, "log_max_cursors") == 0) {
             rc = budget_entry_u32(e->value, &out->core.log_max_cursors, k,
                                   err, err_len);
+        } else if (strcmp(k, "log_max_chunk_nodes") == 0) {
+            rc = budget_entry_u32(e->value, &out->core.log_max_chunk_nodes, k,
+                                  err, err_len);
         } else if (strcmp(k, "log") == 0) {
             struct json_object_s *lo = json_value_as_object(e->value);
             if (lo == NULL) {

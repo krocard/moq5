@@ -530,6 +530,7 @@ struct moqr_core {
 
     moqr_log_budget_t log_budget;
     uint32_t log_max_subgroups, log_max_objects, log_max_cursors;
+    uint32_t log_max_chunk_nodes;
     uint64_t linger_us;
 
     r_binding_t   *bindings;
@@ -1057,6 +1058,8 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
                              : 0;
     c->log_max_cursors =
         RELAY_CFG_HAS(cfg, log_max_cursors) ? cfg->log_max_cursors : 0;
+    c->log_max_chunk_nodes =
+        RELAY_CFG_HAS(cfg, log_max_chunk_nodes) ? cfg->log_max_chunk_nodes : 0;
     /* gpos layout representability: lists = subgroups + the datagram list,
      * and the per-(sub, group) stride, must both fit the runtime's 32-bit
      * fields. Same formula the capacity describe checks. */
@@ -1090,6 +1093,7 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
         lc.max_subgroups_per_group = c->log_max_subgroups;
         lc.max_objects_per_group = c->log_max_objects;
         lc.max_cursors = c->log_max_cursors;
+        lc.max_chunk_nodes = c->log_max_chunk_nodes;
         moqr_log_capacity_t logc;
         if (moqr_log_capacity_describe(&lc, &logc) != MOQR_OK) {
             /* Create/describe parity: a config whose per-track log model
@@ -1526,6 +1530,7 @@ track_create(moqr_core_t *c, r_key_t *key /* adopted on OK */, uint64_t hash,
     lc.max_subgroups_per_group = c->log_max_subgroups;
     lc.max_objects_per_group = c->log_max_objects;
     lc.max_cursors = c->log_max_cursors;
+    lc.max_chunk_nodes = c->log_max_chunk_nodes;
     lc.trace = c->trace;
     lc.trace_id = slot;
     moqr_log_t *log = NULL;
@@ -5886,6 +5891,8 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
                                    : 0;
     lc.max_cursors =
         RELAY_CFG_HAS(cfg, log_max_cursors) ? cfg->log_max_cursors : 0;
+    lc.max_chunk_nodes =
+        RELAY_CFG_HAS(cfg, log_max_chunk_nodes) ? cfg->log_max_chunk_nodes : 0;
     moqr_log_capacity_t logc;
     if (moqr_log_capacity_describe(&lc, &logc) != MOQR_OK) {
         return MOQR_ERR_INVAL;   /* the per-track log term wrapped */
@@ -5914,8 +5921,8 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
      * chunk of the in-flight record (ref + length) so eviction cannot truncate
      * a multi-pump delivery. A record can hold no more chunks than the log's
      * chunk-node pool, so each binding's reusable array is bounded by
-     * max_chunk_nodes; derived here (no new user knob) so the ceiling is
-     * visible rather than invisible heap growth. */
+     * max_chunk_nodes; the core-level log_max_chunk_nodes knob feeds the same
+     * per-track log capacity path as live log creation. */
     s = moqr_cap_add(s, moqr_cap_mul(moqr_cap_mul(bindings, logc.max_chunk_nodes), sizeof(r_pin_chunk_t)));
 
     /* The fetch pin budget is floored to the per-track payload budget (create

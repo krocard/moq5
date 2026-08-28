@@ -27,6 +27,24 @@ typedef struct ca {
     long        live, peak;
 } ca_t;
 
+typedef struct test_pin_chunk_shape {
+    moq_rcbuf_t *buf;
+    uint64_t     len;
+} test_pin_chunk_shape_t;
+
+#define TEST_LOG_DEF_MAX_CHUNK_NODES 8192u
+
+static moqr_reset_desc_t
+rd_wire(uint64_t code)
+{
+    moqr_reset_desc_t d;
+
+    if (moqr_reset_desc_wire(MOQ_VERSION_DRAFT_16, code, &d) != MOQR_OK) {
+        return moqr_reset_desc_none();
+    }
+    return d;
+}
+
 static void *ca_a(size_t n, void *c)
 {
     ca_t *a = c;
@@ -373,6 +391,152 @@ cap_core_poisoned_prefix(void)
     return failures;
 }
 
+static int
+cap_core_log_max_chunk_nodes_knob(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+
+    moqr_core_relay_cfg_t def_cfg, small_cfg, zero_cfg;
+    tiny_cfg(&def_cfg, &a);
+    tiny_cfg(&small_cfg, &a);
+    tiny_cfg(&zero_cfg, &a);
+    small_cfg.log_max_chunk_nodes = 7;
+    zero_cfg.log_max_chunk_nodes = 0;
+
+    moqr_core_capacity_t def_cap, small_cap, zero_cap;
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&def_cfg, &def_cap) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&small_cfg, &small_cap) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&zero_cfg, &zero_cap) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(zero_cap.total_bytes, def_cap.total_bytes);
+
+    moqr_log_cfg_t def_lc, small_lc;
+    moqr_log_cfg_init_sized(&def_lc, sizeof(def_lc), &a.vt);
+    moqr_log_cfg_init_sized(&small_lc, sizeof(small_lc), &a.vt);
+    def_lc.budget = def_cfg.log_budget;
+    def_lc.max_subgroups_per_group = def_cfg.log_max_subgroups;
+    def_lc.max_objects_per_group = def_cfg.log_max_objects_per_group;
+    def_lc.max_cursors = def_cfg.log_max_cursors;
+    small_lc = def_lc;
+    small_lc.max_chunk_nodes = small_cfg.log_max_chunk_nodes;
+
+    moqr_log_capacity_t def_logc, small_logc;
+    MOQ_TEST_CHECK(moqr_log_capacity_describe(&def_lc, &def_logc) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_capacity_describe(&small_lc, &small_logc) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(def_logc.max_chunk_nodes,
+                          TEST_LOG_DEF_MAX_CHUNK_NODES);
+    MOQ_TEST_CHECK_EQ_U64(small_logc.max_chunk_nodes, 7);
+
+    size_t rc_hdr = 0;
+    MOQ_TEST_CHECK(moq_rcbuf_allocation_size(0, &rc_hdr) == MOQ_OK);
+    const uint64_t delta_nodes =
+        (uint64_t)def_logc.max_chunk_nodes - small_logc.max_chunk_nodes;
+    MOQ_TEST_CHECK_EQ_U64(def_logc.header_bytes - small_logc.header_bytes,
+                          delta_nodes * rc_hdr);
+    const uint64_t expected_delta =
+        (uint64_t)def_cfg.max_tracks *
+            ((def_logc.structure_bytes - small_logc.structure_bytes) +
+             (def_logc.header_bytes - small_logc.header_bytes)) +
+        delta_nodes * (uint64_t)def_cfg.max_bindings *
+            sizeof(test_pin_chunk_shape_t);
+    MOQ_TEST_CHECK_EQ_U64(def_cap.structure_bytes - small_cap.structure_bytes,
+                          expected_delta);
+    MOQ_TEST_CHECK_EQ_U64(def_cap.payload_bytes, small_cap.payload_bytes);
+    MOQ_TEST_CHECK_EQ_U64(def_cap.total_bytes - small_cap.total_bytes,
+                          expected_delta);
+
+    ca_t ca_small;
+    ca_init(&ca_small);
+    moqr_core_relay_cfg_t live_cfg = small_cfg;
+    live_cfg.alloc = &ca_small.vt;
+    moqr_core_t *core = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&live_cfg, &core) == MOQR_OK);
+    MOQ_TEST_CHECK(core != NULL);
+    MOQ_TEST_CHECK((uint64_t)ca_small.peak <= small_cap.total_bytes);
+    moqr_core_destroy(core);
+    MOQ_TEST_CHECK_EQ_INT((int)ca_small.live, 0);
+
+    union {
+        moqr_core_relay_cfg_t c;
+        unsigned char raw[sizeof(moqr_core_relay_cfg_t)];
+    } poisoned, clean_prefix;
+    memset(&poisoned, 0xA5, sizeof(poisoned));
+    memset(&clean_prefix, 0, sizeof(clean_prefix));
+    moqr_core_relay_cfg_init_sized(&poisoned.c,
+                                   offsetof(moqr_core_relay_cfg_t,
+                                            log_max_chunk_nodes),
+                                   &a.vt);
+    moqr_core_relay_cfg_init_sized(&clean_prefix.c,
+                                   offsetof(moqr_core_relay_cfg_t,
+                                            log_max_chunk_nodes),
+                                   &a.vt);
+    poisoned.c.max_tracks = def_cfg.max_tracks;
+    poisoned.c.max_bindings = def_cfg.max_bindings;
+    poisoned.c.log_budget = def_cfg.log_budget;
+    poisoned.c.log_max_subgroups = def_cfg.log_max_subgroups;
+    poisoned.c.log_max_objects_per_group = def_cfg.log_max_objects_per_group;
+    poisoned.c.log_max_cursors = def_cfg.log_max_cursors;
+    clean_prefix.c.max_tracks = poisoned.c.max_tracks;
+    clean_prefix.c.max_bindings = poisoned.c.max_bindings;
+    clean_prefix.c.log_budget = poisoned.c.log_budget;
+    clean_prefix.c.log_max_subgroups = poisoned.c.log_max_subgroups;
+    clean_prefix.c.log_max_objects_per_group =
+        poisoned.c.log_max_objects_per_group;
+    clean_prefix.c.log_max_cursors = poisoned.c.log_max_cursors;
+    moqr_core_capacity_t prefix_cap, clean_prefix_cap;
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&poisoned.c, &prefix_cap) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&clean_prefix.c,
+                                               &clean_prefix_cap) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(prefix_cap.total_bytes, clean_prefix_cap.total_bytes);
+
+    ca_t op_a;
+    ca_init(&op_a);
+    moqr_core_relay_cfg_t one_cfg;
+    tiny_cfg(&one_cfg, &op_a);
+    one_cfg.log_max_chunk_nodes = 1;
+    one_cfg.log_budget.max_bytes = 64;
+    moqr_core_t *op_core = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&one_cfg, &op_core) == MOQR_OK);
+    moqr_binding_t pub = open_pub(op_core, 77);
+    moqr_track_t tr = open_track(op_core, pub, "chnk");
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = 0;
+    d.subgroup_id = 0;
+    d.object_id = 0;
+    d.publisher_priority = 100;
+    d.obj_state = MOQR_OBJ_OPEN;
+    d.declared_len = 20;
+    d.now_us = 1;
+    MOQ_TEST_CHECK(moqr_core_ingest(op_core, tr, &d) == MOQR_OK);
+    uint8_t bytes[10] = { 0 };
+    moq_rcbuf_t *chunk = NULL;
+    MOQ_TEST_CHECK(moq_rcbuf_create(&op_a.vt, bytes, sizeof(bytes),
+                                    &chunk) == MOQ_OK);
+    MOQ_TEST_CHECK(moqr_core_append_chunk(op_core, tr, 0, 0, 0, chunk) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_append_chunk(op_core, tr, 0, 0, 0, chunk) ==
+                   MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(moqr_core_abandon_record(op_core, tr, 0, 0, 0,
+                                            rd_wire(0)) == MOQR_OK);
+    d.object_id = 1;
+    MOQ_TEST_CHECK(moqr_core_ingest(op_core, tr, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_append_chunk(op_core, tr, 0, 0, 1, chunk) ==
+                   MOQR_OK);
+    moq_rcbuf_decref(chunk);
+    moqr_core_destroy(op_core);
+    MOQ_TEST_CHECK_EQ_INT((int)op_a.live, 0);
+
+    MOQ_TEST_PASS("cap_core_log_max_chunk_nodes_knob");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -381,6 +545,7 @@ main(void)
     failures += cap_zero_byte_fetches();
     failures += cap_overflow_refused();
     failures += cap_core_poisoned_prefix();
+    failures += cap_core_log_max_chunk_nodes_knob();
     if (failures == 0) {
         printf("ALL PASS\n");
     }
